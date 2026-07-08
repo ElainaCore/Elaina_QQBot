@@ -7,6 +7,7 @@ import zipfile
 
 from aiohttp import web
 
+from core.base.zipsafe import is_within
 from web.tools._market.fetch import (
     _download_file,
 )
@@ -261,6 +262,9 @@ def _extract_zip_subset(content, plugin_name, subdir_path=''):
                 if not rel:
                     continue
                 dest = os.path.join(dest_dir, rel)
+                if not is_within(dest_dir, dest):
+                    log.warning(f'跳过越界成员 (疑似路径穿越): {fp!r}')
+                    continue
                 os.makedirs(os.path.dirname(dest) or dest_dir, exist_ok=True)
                 with zf.open(fp) as src, open(dest, 'wb') as dst:
                     dst.write(src.read())
@@ -355,6 +359,9 @@ async def _install_module(github_url, module_name, branch='main', mirror=None):
                     if os.path.exists(dest):
                         continue
                 dest = os.path.join(dest_dir, rel)
+                if not is_within(dest_dir, dest):
+                    log.warning(f'跳过越界成员 (疑似路径穿越): {fp!r}')
+                    continue
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 with zf.open(fp) as src, open(dest, 'wb') as dst:
                     dst.write(src.read())

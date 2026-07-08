@@ -140,6 +140,8 @@ def _cache_headers(path: str) -> dict:
 
 
 def _make_spa_handler(dist_dir: str):
+    dist_root = os.path.realpath(dist_dir)
+
     def _serve(file_path: str, path: str, request: web.Request):
         ext = os.path.splitext(file_path)[1].lower()
         headers = _cache_headers(path)
@@ -163,12 +165,11 @@ def _make_spa_handler(dist_dir: str):
         if not path or path == '/':
             path = 'index.html'
 
-        file_path = os.path.join(dist_dir, path.replace('/', os.sep))
-
-        if os.path.isfile(file_path):
+        file_path = os.path.realpath(os.path.join(dist_root, path.replace('/', os.sep)))
+        if (file_path == dist_root or file_path.startswith(dist_root + os.sep)) and os.path.isfile(file_path):
             return _serve(file_path, path, request)
 
-        index = os.path.join(dist_dir, 'index.html')
+        index = os.path.join(dist_root, 'index.html')
         if os.path.isfile(index):
             return _serve(index, 'index.html', request)
 
