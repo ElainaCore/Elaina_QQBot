@@ -15,6 +15,8 @@ from typing import cast
 import yaml
 from aiohttp import BodyPartReader, web
 
+from core.base.zipsafe import safe_extractall
+
 log = logging.getLogger('ElainaBot.web.plugin_mgr')
 
 _app = None
@@ -412,7 +414,7 @@ async def handle_upload_plugin(request: web.Request):
                         shutil.rmtree(backup)
                     shutil.move(target_dir, backup)
                 extract_tmp = tempfile.mkdtemp()
-                zf.extractall(extract_tmp)
+                safe_extractall(zf, extract_tmp)
                 shutil.move(os.path.join(extract_tmp, folder_name), target_dir)
                 shutil.rmtree(extract_tmp, ignore_errors=True)
             else:
@@ -424,7 +426,7 @@ async def handle_upload_plugin(request: web.Request):
                         shutil.rmtree(backup)
                     shutil.move(target_dir, backup)
                 os.makedirs(target_dir, exist_ok=True)
-                zf.extractall(target_dir)
+                safe_extractall(zf, target_dir)
             plugin_name = os.path.basename(target_dir)
         return web.json_response({'success': True, 'message': f'插件 {plugin_name} 上传成功', 'plugin_name': plugin_name})
     except Exception as e:
@@ -572,12 +574,12 @@ async def handle_module_upload(request: web.Request):
                 shutil.move(target_dir, backup)
             if len(top_dirs) == 1:
                 extract_tmp = tempfile.mkdtemp()
-                zf.extractall(extract_tmp)
+                safe_extractall(zf, extract_tmp)
                 shutil.move(os.path.join(extract_tmp, list(top_dirs)[0]), target_dir)
                 shutil.rmtree(extract_tmp, ignore_errors=True)
             else:
                 os.makedirs(target_dir, exist_ok=True)
-                zf.extractall(target_dir)
+                safe_extractall(zf, target_dir)
         if not os.path.isfile(os.path.join(target_dir, 'main.py')):
             shutil.rmtree(target_dir, ignore_errors=True)
             return web.json_response({'success': False, 'message': '解压后未找到 main.py'}, status=400)

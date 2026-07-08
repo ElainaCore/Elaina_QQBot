@@ -10,6 +10,7 @@ from pathlib import Path
 
 import aiohttp as _aiohttp
 
+from core.base.zipsafe import safe_extractall
 from web.tools._updater.mirror import detect_environment
 from web.tools._updater.shared import (
     DEFAULT_SKIP,
@@ -356,7 +357,7 @@ class FrameworkUpdater:
             temp.mkdir(parents=True)
 
             with zipfile.ZipFile(zip_file, 'r') as zf:
-                zf.extractall(temp)
+                safe_extractall(zf, str(temp))
 
             items = list(temp.iterdir())
             source = items[0] if len(items) == 1 and items[0].is_dir() else temp
