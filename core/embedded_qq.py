@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ctypes
+import inspect
 import itertools
 import json
 import logging
@@ -26,6 +27,7 @@ from aiohttp import web
 
 from core.base.branding import public_text
 from core.base.config import cfg
+from core.onebot.api import api_call_source, get_supported_actions
 from core.qq_catalog import QQ_VERSIONS
 from core.qq_installer import QQInstaller
 from core.qq_launcher import QQLauncher
@@ -81,6 +83,8 @@ class EmbeddedQQManager:
         self._memory_cache: dict[str, tuple[float, int, dict[str, Any]]] = {}
         self._control_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
         self._control_futures: dict[str, tuple[str, asyncio.Future[dict[str, Any]]]] = {}
+        self._red_packet_listeners: dict[str, Any] = {}
+        self._red_packet_tasks: dict[str, set[asyncio.Task]] = {}
         self._bridge_runners: dict[str, web.AppRunner] = {}
         self._base_dir = Path(app._base_dir)
         self._accounts_file = self._base_dir / 'data' / 'embedded_qq' / 'accounts.json'
@@ -482,6 +486,7 @@ class EmbeddedQQManager:
                 'ELAINAQQ_MANAGER_URL': manager_url,
                 'ELAINAQQ_DATA_DIR': str(data_dir),
                 'ELAINAQQ_BOT_UIN': bot.uin,
+                'ELAINAQQ_ONEBOT_ACTIONS': json.dumps(get_supported_actions(), ensure_ascii=True),
                 'HOME': str(data_dir),
                 'ELAINAQQ_HEADLESS': '1' if self.headless else '0',
             }
@@ -550,6 +555,12 @@ class EmbeddedQQManager:
                 raise web.HTTPServiceUnavailable(text='内置 QQ 未初始化')
             return web.json_response({'success': True})
 
+        async def handle_red_packet(request: web.Request) -> web.Response:
+            handled = self.handle_red_packet(await read_payload(request))
+            if not handled:
+                raise web.HTTPServiceUnavailable(text='内置 QQ 红包接口未初始化')
+            return web.json_response({'success': True})
+
         async def poll_control(request: web.Request) -> web.Response:
             requested = str(request.query.get('bot_id') or '')
             if requested and requested != bot.bot_id:
@@ -569,6 +580,7 @@ class EmbeddedQQManager:
         bridge_app.add_routes(
             [
                 web.post('/api/embedded/events', handle_event),
+                web.post('/api/embedded/red-packets', handle_red_packet),
                 web.get('/api/embedded/control/poll', poll_control),
                 web.post('/api/embedded/control/result', resolve_control),
             ]
@@ -602,7 +614,7 @@ class EmbeddedQQManager:
             bot.bridge_port = port
             self._bridge_runners[bot.bot_id] = runner
             self._save_accounts()
-            log.info('内置 QQ 桥接服务已启动: 127.0.0.1:%s [%s]', port, bot.bot_id)
+            log.debug('内置 QQ 桥接服务已启动: 127.0.0.1:%s [%s]', port, bot.bot_id)
             return
 
         await runner.cleanup()
@@ -732,7 +744,7 @@ class EmbeddedQQManager:
                         name=f'qq-reclaim-{bot.bot_id}',
                     )
                 self._save_accounts()
-                log.info(
+                log.debug(
                     '内置 QQ 已启动: %s (PID=%s, mode=%s, bridge=127.0.0.1:%s)',
                     bot.bot_id,
                     bot.process.pid,
@@ -967,10 +979,116 @@ class EmbeddedQQManager:
             self._control_futures.pop(request_id, None)
 
     async def action(self, bot_id: str, action: str, params: dict | None = None) -> dict:
-        return await self._control_call(
+        action_params = params or {}
+        result = await self._control_call(
             bot_id,
-            {'type': 'action', 'action': action, 'params': params or {}},
+            {'type': 'action', 'action': action, 'params': action_params},
         )
+        recorder = getattr(self.app, 'log_sent_message', None)
+        if recorder is not None:
+            bot = self.bots.get(bot_id)
+            self_id = bot.uin or bot.bot_id if bot else bot_id
+            try:
+                await recorder(str(self_id), action, action_params, result)
+            except Exception:
+                log.exception('内置 QQ 发送日志写入失败: %s [%s]', action, self_id)
+        return result
+
+    def register_red_packet_listener(self, owner: str, callback) -> None:
+        """注册内置 QQ 原生红包回调；同一 owner 热重载时自动替换。"""
+        owner = str(owner or '').strip()
+        if not owner or not callable(callback):
+            raise ValueError('红包监听需要有效的 owner 和回调方法')
+        self.unregister_red_packet_listener(owner)
+        self._red_packet_listeners[owner] = callback
+
+    def unregister_red_packet_listener(self, owner: str) -> None:
+        owner = str(owner or '').strip()
+        self._red_packet_listeners.pop(owner, None)
+        for task in self._red_packet_tasks.pop(owner, set()):
+            if not task.done():
+                task.cancel()
+
+    async def _run_red_packet_listener(
+        self,
+        owner: str,
+        callback,
+        self_id: str,
+        packet: dict[str, Any],
+    ) -> None:
+        try:
+            with api_call_source(owner):
+                result = callback(self_id, packet)
+                if inspect.isawaitable(result):
+                    await result
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception('内置 QQ 红包监听异常: %s [%s]', owner, self_id)
+
+    def handle_red_packet(self, payload: dict[str, Any]) -> bool:
+        """接收运行时红包数据并直接分发给已注册插件，不进入 OneBot 事件链。"""
+        bot_id = str(payload.get('bot_id') or '').strip()
+        bot = self.bots.get(bot_id)
+        packet = payload.get('red_packet')
+        if bot is None or not isinstance(packet, dict):
+            return False
+        bot.last_seen = time.time()
+        self_id = str(payload.get('self_id') or bot.uin or bot_id)
+        for owner, callback in tuple(self._red_packet_listeners.items()):
+            task = asyncio.create_task(
+                self._run_red_packet_listener(
+                    owner, callback, self_id, dict(packet),
+                ),
+                name=f'red-packet-{owner}-{self_id}',
+            )
+            tasks = self._red_packet_tasks.setdefault(owner, set())
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+        return True
+
+    def _red_packet_bot_id(self, self_id: str) -> str:
+        self_id = str(self_id or '').strip()
+        if self_id in self.bots:
+            return self_id
+        for bot_id, bot in self.bots.items():
+            if str(bot.uin or '') == self_id:
+                return bot_id
+        return ''
+
+    async def grab_red_packet(self, self_id: str, bill_no: str) -> dict[str, Any]:
+        """通过指定内置 QQ 账号直接调用原生 grabRedBag。"""
+        bot_id = self._red_packet_bot_id(self_id)
+        bill_no = str(bill_no or '').strip()
+        if not bot_id:
+            return {
+                'ok': False, 'amount': 0, 'err_code': -5,
+                'err_msg': '内置 QQ 账号不存在',
+            }
+        if not bill_no:
+            return {
+                'ok': False, 'amount': 0, 'err_code': -6,
+                'err_msg': '缺少红包 bill_no',
+            }
+        response = await self._control_call(
+            bot_id,
+            {'type': 'grab_red_packet', 'bill_no': bill_no},
+            timeout=5,
+        )
+        if response.get('status') == 'failed':
+            return {
+                'ok': False,
+                'amount': 0,
+                'err_code': int(response.get('retcode') or -7),
+                'err_msg': str(response.get('message') or '红包领取接口失败'),
+            }
+        result = response.get('data')
+        if isinstance(result, dict):
+            return result
+        return {
+            'ok': False, 'amount': 0, 'err_code': -8,
+            'err_msg': '红包领取接口返回格式错误',
+        }
 
     async def refresh_qr(self, bot_id: str) -> dict:
         bot = self.bots.get(bot_id)
@@ -1352,6 +1470,23 @@ class EmbeddedQQManager:
         )
 
     @staticmethod
+    def _qq_output_level(line: str) -> int:
+        """为 QQ 子进程输出分配日志等级，正常登录链路仅在调试模式显示。"""
+        lowered = line.casefold()
+        warning_markers = (
+            'error',
+            'failed',
+            'exception',
+            'fatal',
+            '启动失败',
+            '登录失败',
+            '加载失败',
+            '初始化失败',
+            '崩溃',
+        )
+        return logging.WARNING if any(marker in lowered for marker in warning_markers) else logging.DEBUG
+
+    @staticmethod
     def _crash_dump_start(line: str) -> bool:
         return any(
             pattern in line
@@ -1416,19 +1551,9 @@ class EmbeddedQQManager:
                         suppress_crash_dump = False
                     continue
                 if not self._is_qq_noise(line):
-                    log.info('[QQ %s] %s', bot.bot_id, line)
-                    lowered = line.lower()
-                    if any(
-                        marker in lowered
-                        for marker in (
-                            'error',
-                            'failed',
-                            'exception',
-                            'fatal',
-                            '启动失败',
-                            '退出',
-                        )
-                    ):
+                    level = self._qq_output_level(line)
+                    log.log(level, '[QQ %s] %s', bot.bot_id, line)
+                    if level >= logging.WARNING:
                         error_summary.append(line[-240:])
                         del error_summary[:-4]
         finally:

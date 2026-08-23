@@ -1,0 +1,85 @@
+"""OneBot 事件名称的统一中文翻译。"""
+
+_EVENT_LABELS = {
+    'group_add': '机器人入群',
+    'group_del': '机器人退群',
+    'group_member_add': '群成员增加',
+    'group_member_del': '群成员减少',
+    'group_join_request': '加群申请',
+    'group_upload': '群文件上传',
+    'group_admin': '群管理员变动',
+    'group_decrease': '群成员减少',
+    'group_increase': '群成员增加',
+    'group_ban': '群禁言变动',
+    'friend_add': '好友新增',
+    'friend_del': '好友删除',
+    'group_recall': '群消息撤回',
+    'friend_recall': '好友消息撤回',
+    'notify': '群内提醒',
+    'group_card': '群名片变更',
+    'offline_file': '离线文件',
+    'client_status': '客户端状态变更',
+    'essence': '精华消息变更',
+    'group_name': '群名称变更',
+    'group_msg_emoji_like': '消息表情回应',
+    'group_gray_tip': '群灰色提示',
+    'friend_poke': '好友戳一戳',
+    'poke': '戳一戳',
+    'lucky_king': '红包运气王',
+    'honor': '群荣誉变更',
+    'title': '群头衔变更',
+    'group_msg_reject': '关闭主动消息',
+    'group_msg_receive': '开启主动消息',
+    'subscribe_status': '订阅开启',
+    'subscribe_close': '订阅关闭',
+    'message_reaction_add': '添加消息表态',
+    'message_reaction_remove': '取消消息表态',
+    'guild_update': '频道更新',
+    'bot_online': '机器人上线',
+    'bot_offline': '机器人离线',
+    'robot_online': '机器人上线',
+    'robot_offline': '机器人离线',
+    'elaina_red_packet': '红包事件',
+    'request.friend': '好友申请',
+    'request.group': '加群申请',
+    'meta_event.lifecycle': '连接生命周期',
+    'meta_event.heartbeat': '连接心跳',
+    'lifecycle': '连接生命周期',
+    'heartbeat': '连接心跳',
+}
+
+_SUBTYPE_LABELS = {
+    ('notify', 'poke'): '戳一戳',
+    ('notify', 'lucky_king'): '红包运气王',
+    ('notify', 'honor'): '群荣誉变更',
+    ('notify', 'title'): '群头衔变更',
+    ('group_ban', 'ban'): '群成员禁言',
+    ('group_ban', 'lift_ban'): '解除群成员禁言',
+    ('group_increase', 'approve'): '同意入群',
+    ('group_increase', 'invite'): '邀请入群',
+    ('group_decrease', 'leave'): '群成员退群',
+    ('group_decrease', 'kick'): '群成员被移出',
+    ('group_decrease', 'kick_me'): '机器人被移出群',
+    ('group_admin', 'set'): '设置群管理员',
+    ('group_admin', 'unset'): '取消群管理员',
+    ('essence', 'add'): '设为精华消息',
+    ('essence', 'delete'): '移出精华消息',
+    ('client_status', 'online'): '客户端上线',
+    ('client_status', 'offline'): '客户端离线',
+    ('request.group', 'add'): '加群申请',
+    ('request.group', 'invite'): '群邀请',
+    ('meta_event.lifecycle', 'enable'): 'OneBot 已启用',
+    ('meta_event.lifecycle', 'disable'): 'OneBot 已停用',
+    ('meta_event.lifecycle', 'connect'): 'OneBot 已连接',
+}
+
+
+def event_label(event_type: str, sub_type: str = '') -> str:
+    """返回事件的中文名称；未知扩展事件统一显示为“未知事件”。"""
+    normalized = str(event_type or '').strip().lower()
+    if normalized.startswith('notice.'):
+        normalized = normalized[7:]
+    label = _SUBTYPE_LABELS.get((normalized, str(sub_type or '').lower()))
+    if label:
+        return label
+    return _EVENT_LABELS.get(normalized, '未知事件')

@@ -98,7 +98,7 @@ from core.plugin.decorators import handler, on_load, on_unload, interceptor
 ```python
 @handler(pattern, *, name='', desc='', priority=0,
          owner_only=False, group_only=False, private_only=False,
-         event_types=None, cooldown=0, block=False)
+         event_types=None, cooldown=0, block=False, fallback=False)
 ```
 
 | 参数 | 类型 | 默认 | 说明 |
@@ -113,6 +113,7 @@ from core.plugin.decorators import handler, on_load, on_unload, interceptor
 | `event_types` | `list[str]` | `None` | 仅响应指定事件类型 (见下表) |
 | `cooldown` | `int` | `0` | 同一用户冷却时间 (秒, 0 = 无冷却) |
 | `block` | `bool` | `False` | 命中后是否拦截后续处理器 (见 3.1.1) |
+| `fallback` | `bool \| Callable[[Event], bool]` | `False` | 仅在普通处理器完成原文和加/去 `/` 匹配后仍未命中时参与 |
 
 **事件类型常量** (`event_types` 可选值)：
 
@@ -121,6 +122,7 @@ from core.plugin.decorators import handler, on_load, on_unload, interceptor
 | `message` | 消息事件 (群聊 + 私聊) |
 | `notice.<notice_type>` | 通知事件, 如 `notice.group_increase` (入群)、`notice.group_decrease` (退群)、`notice.group_ban` (禁言)、`notice.friend_add` 等 |
 | `request.<request_type>` | 请求事件, 如 `request.friend` (加好友)、`request.group` (加群) |
+| `meta_event.lifecycle` | OneBot 连接生命周期事件 |
 
 > 不传 `event_types` 时默认只处理消息事件。处理通知/请求事件时需显式指定，且正则会对 `event_type` 字符串匹配，常用 `r'.*'` 全匹配。
 
@@ -144,6 +146,22 @@ async def welcome(event, match):
     await event.call_api('send_group_msg', {
         'group_id': event.group_id,
         'message': f"欢迎新成员 {event.user_id}!"})
+
+
+@handler(r'(?s)^(.+)$', name='自然对话', priority=-50, fallback=True)
+async def chat(event, match):
+    await event.reply(await ask_model(match.group(1)))
+```
+
+`fallback=True` 用于 AI 对话等真正的兜底正则。框架先匹配普通指令的原文与加/去 `/` 兼容文本，最后才让兜底处理器匹配原始消息，避免宽泛正则阻止其他插件触发。
+
+娱乐聚合器等需要与其他插件同时执行的逻辑应使用 `@interceptor`，处理完成后返回 `False`。这样无需注册宽泛正则，也不会阻断普通处理器：
+
+```python
+@interceptor(priority=-40)
+async def entertainment(event):
+    await try_handle_entertainment(event)
+    return False
 ```
 
 #### 3.1.1 `block` 放行 / 拦截
@@ -254,6 +272,8 @@ async def send_without_interception(group_id, message, self_id):
 | `local` | 目标是否为框架内置 QQ |
 
 中间件可直接返回 OneBot 风格结果以接管调用。调用原始 API 时应使用 `bypass_api_interceptors()`，避免递归进入自身。
+
+框架会自动标记消息处理器、插件导入与生命周期钩子、由这些入口创建的异步后台任务，以及 `/api/ext/` 插件路由中的 API 调用。中间件可据此使用 `source_plugin` 按插件目录名拦截框架内插件发送；只有框架执行上下文之外的调用才会留空。
 
 ---
 

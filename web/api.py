@@ -320,4 +320,9 @@ async def handle_ext_route(request: web.Request):
         denied = _authorize_ext_request(request)
         if denied is not None:
             return denied
-    return await entry['handler'](request)
+    # 插件面板路由也属于该插件的执行上下文。路由中直接发送消息，
+    # 或在路由中创建的后台任务，都应能被出站 API 中间件按插件识别。
+    from core.onebot.api import api_call_source
+
+    with api_call_source(entry.get('owner', '')):
+        return await entry['handler'](request)

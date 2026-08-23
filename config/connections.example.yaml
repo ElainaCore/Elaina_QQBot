@@ -1,6 +1,6 @@
 # ===== OneBot 网络连接配置 =====
 # 在「网络配置」页面可视化管理，每条连接可单独配置 token/secret
-# 主服务端口 (server.port) 始终内置 /OneBotv11 反向 WS 入口, 可直接用作反向 WS 连接
+# 主服务端口保留 /OneBotv11 路由，但必须在 Web 面板启用对应网络接入后才接受连接
 #
 # 连接类型说明：
 #   ws_reverse  — 反向 WS, 框架作为服务器, OneBot 端连入

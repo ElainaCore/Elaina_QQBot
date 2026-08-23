@@ -1,8 +1,12 @@
 """日志查询 — 最近日志 / 分页 / 登录日志 (异步架构)"""
 
+import contextlib
+import json
+
 from aiohttp import web
 
 import web.auth as auth
+from core.onebot.event_labels import event_label
 from web.protocol import json_body
 from web.tools import _common
 
@@ -45,18 +49,26 @@ def _transform_message_rows(rows: list, bot_qq: str = '') -> list:
 
 def _transform_lifecycle_rows(rows: list, bot_qq: str = '') -> list:
     """将事件(通知)DB 行转换为前端「事件」面板期望的字段格式"""
-    return [
-        {
+    result = []
+    for r in rows:
+        event_type = r.get('message_type', '')
+        raw_data = r.get('raw_data', '')
+        sub_type = ''
+        if raw_data:
+            with contextlib.suppress(TypeError, ValueError):
+                sub_type = str((json.loads(raw_data) or {}).get('sub_type') or '')
+        result.append({
             'timestamp': r.get('timestamp', ''),
-            'type': r.get('message_type', ''),
+            'type': event_type,
+            'event_type': event_type,
+            'type_label': event_label(event_type, sub_type),
             'user_id': r.get('user_id', ''),
             'group_id': r.get('group_id', ''),
             'bot_qq': r.get('source', '') or bot_qq,
             'content': r.get('content', ''),
-            'raw_message': r.get('raw_data', ''),
-        }
-        for r in rows
-    ]
+            'raw_message': raw_data,
+        })
+    return result
 
 
 async def handle_recent_logs(request: web.Request):
@@ -107,6 +119,8 @@ async def handle_get_logs(request: web.Request):
         )
         total_rows = await _common.query_log(log_type, 'SELECT MAX(id) AS cnt FROM log')
         total = (total_rows[0].get('cnt') or 0) if total_rows else 0
+    if log_type == 'lifecycle':
+        rows = _transform_lifecycle_rows(rows, requested)
     return web.json_response(
         {
             'logs': rows,

@@ -7,6 +7,7 @@ import gc
 import json
 import os
 import signal
+import zlib
 
 from core.base.branding import PRODUCT_NAME
 from core.base.config import cfg
@@ -18,7 +19,8 @@ from core.module.manager import ModuleManager
 from core.onebot.adapter import OneBotAdapter
 from core.onebot.api import set_adapter, set_main_loop
 from core.onebot.connection import ConnectionManager
-from core.onebot.event import MessageEvent, MetaEvent, NoticeEvent
+from core.onebot.event import MessageEvent, MetaEvent, NoticeEvent, RequestEvent
+from core.onebot.event_labels import event_label
 from core.plugin.manager import PluginManager
 from core.server.http_server import HttpServer
 from core.services.config_watcher import ConfigWatcherService
@@ -27,6 +29,49 @@ from core.storage.log import LogService
 log = get_logger(SYSTEM, '启动器')
 
 _app = None
+
+_MESSAGE_LABELS = {
+    'image': '图片',
+    'face': '表情',
+    'record': '语音',
+    'video': '视频',
+    'reply': '回复',
+    'json': 'JSON',
+    'xml': 'XML',
+    'node': '合并转发',
+}
+_SEND_ACTIONS = {'send_msg', 'send_group_msg', 'send_private_msg'}
+
+
+def _format_message_content(message) -> str:
+    """将 OneBot 字符串或消息段转换为适合日志展示的文本。"""
+    if isinstance(message, str):
+        return message.strip() or '[空消息]'
+    if isinstance(message, dict):
+        segments = (message,)
+    elif isinstance(message, (list, tuple)):
+        segments = message
+    else:
+        content = str(message or '').strip()
+        return content or '[空消息]'
+
+    parts: list[str] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        segment_type = str(segment.get('type') or '')
+        data = segment.get('data')
+        if not isinstance(data, dict):
+            data = {}
+        if segment_type == 'text':
+            parts.append(str(data.get('text') or '').strip())
+        elif segment_type == 'at':
+            parts.append(f'@{data.get("qq", "")}')
+        elif segment_type in _MESSAGE_LABELS:
+            parts.append(f'[{_MESSAGE_LABELS[segment_type]}]')
+        elif segment_type:
+            parts.append(f'[{segment_type}]')
+    return ''.join(parts) or '[空消息]'
 
 
 def get_app():
@@ -114,6 +159,10 @@ class Application:
         set_adapter(self._adapter)
         set_main_loop(asyncio.get_running_loop())
 
+        # 先创建内置 QQ 管理器，使插件加载钩子可以直接注册原生能力回调。
+        # QQ 进程仍在 HTTP 和连接服务就绪后启动。
+        self._embedded_qq = EmbeddedQQManager(self)
+
         # 3) HTTP 服务器
         self._http_server = HttpServer(self, self._base_dir)
         self._http_server.init_app()
@@ -157,7 +206,6 @@ class Application:
         await self._connection_manager.start()
 
         # 8.6) 内置 QQ 运行时。关闭时由 shutdown 统一回收。
-        self._embedded_qq = EmbeddedQQManager(self)
         if self._embedded_qq.enabled:
             log.info('内置 QQ 运行时已启用')
             self._embedded_qq_start_task = asyncio.create_task(self._embedded_qq.start_enabled(), name='embedded-qq-autostart')
@@ -251,7 +299,7 @@ class Application:
 
     async def process_event(self, event):
         """处理 OneBot 事件 (异步分发)"""
-        if isinstance(event, MetaEvent):
+        if isinstance(event, MetaEvent) and event.meta_event_type != 'lifecycle':
             return
 
         # 注入 API 引用, 使插件可通过 event.reply() 调用
@@ -267,12 +315,13 @@ class Application:
 
     def submit_event(self, event) -> bool:
         """事件入队，并通过容量上限约束生产者的内存占用。"""
-        if isinstance(event, MetaEvent):
+        # 心跳只更新连接状态，不进入插件链；生命周期事件允许插件显式订阅。
+        if isinstance(event, MetaEvent) and event.meta_event_type != 'lifecycle':
             return True
         if not self._event_queues:
             return False
         self_id = str(getattr(event, 'self_id', '') or '')
-        queue_index = sum(self_id.encode('utf-8')) % len(self._event_queues) if self_id else 0
+        queue_index = zlib.crc32(self_id.encode('utf-8')) % len(self._event_queues) if self_id else 0
         queue = self._event_queues[queue_index]
         try:
             queue.put_nowait(event)
@@ -296,6 +345,85 @@ class Application:
             finally:
                 queue.task_done()
 
+    async def log_sent_message(
+        self,
+        self_id: str,
+        action: str,
+        params: dict,
+        response: dict,
+    ) -> bool:
+        """记录成功发送的 OneBot 消息，并推送到 Web 面板。"""
+        if action not in _SEND_ACTIONS or response.get('status') == 'failed' or response.get('retcode') != 0:
+            return False
+
+        message_type = str(params.get('message_type') or '')
+        if action == 'send_group_msg' or params.get('group_id') is not None:
+            message_type = 'group'
+        elif action == 'send_private_msg' or params.get('user_id') is not None:
+            message_type = 'private'
+        if message_type not in {'group', 'private'}:
+            return False
+
+        target_key = 'group_id' if message_type == 'group' else 'user_id'
+        target_id = str(params.get(target_key) or '')
+        if not target_id:
+            return False
+
+        bot_qq = str(self_id or '')
+        content = _format_message_content(params.get('message'))
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        result_data = response.get('data')
+        if not isinstance(result_data, dict):
+            result_data = {}
+        message_id = str(result_data.get('message_id') or '')
+        group_id = target_id if message_type == 'group' else ''
+        user_id = '' if message_type == 'group' else target_id
+        location = f'群({target_id})' if message_type == 'group' else f'私聊({target_id})'
+        display = content[:100] + '...' if len(content) > 100 else content
+        log.info(
+            '[%s] 发送%s | %s | %s',
+            bot_qq,
+            '群聊' if message_type == 'group' else '私聊',
+            location,
+            display,
+            extra={'web_skip': True},
+        )
+
+        if self._log_service:
+            await self._log_service.add(
+                'message',
+                {
+                    'timestamp': timestamp,
+                    'content': content,
+                    'source': bot_qq,
+                    'user_id': user_id,
+                    'group_id': group_id,
+                    'message_id': message_id,
+                    'message_type': message_type,
+                    'raw_data': '',
+                    'extra': 'send',
+                },
+                bot_qq=bot_qq,
+            )
+
+        if self._web_log_cb:
+            self._web_log_cb(
+                'message',
+                {
+                    'timestamp': timestamp,
+                    'content': content,
+                    'user_id': user_id,
+                    'group_id': group_id,
+                    'message_id': message_id,
+                    'message_type': message_type,
+                    'sender': bot_qq,
+                    'bot_qq': bot_qq,
+                    'direction': 'send',
+                    'raw_message': '',
+                },
+            )
+        return True
+
     async def _log_event(self, event):
         """记录事件日志"""
         if isinstance(event, MessageEvent):
@@ -303,29 +431,7 @@ class Application:
             sender = event.sender_card or event.sender_nickname or str(event.user_id)
             location = f'群({event.group_id})' if event.is_group else f'私聊({event.user_id})'
 
-            parts = []
-            for seg in event.message:
-                if not isinstance(seg, dict):
-                    continue
-                t, d = seg.get('type', ''), seg.get('data', {})
-                if t == 'text':
-                    parts.append(d.get('text', '').strip())
-                elif t == 'at':
-                    parts.append(f'@{d.get("qq", "")}')
-                elif t == 'image':
-                    parts.append('[图片]')
-                elif t == 'face':
-                    parts.append('[表情]')
-                elif t == 'record':
-                    parts.append('[语音]')
-                elif t == 'video':
-                    parts.append('[视频]')
-                elif t == 'reply':
-                    parts.append('[回复]')
-                else:
-                    parts.append(f'[{t}]')
-
-            content = ''.join(parts) or '[空消息]'
+            content = _format_message_content(event.message)
             display = content[:100] + '...' if len(content) > 100 else content
             # 消息内容属于「消息记录」(按 QQ 分库), 不应混入「框架日志」: web_skip=True
             log.info(f'[{event.self_id}] {msg_type} | {location} | {sender}: {display}', extra={'web_skip': True})
@@ -369,13 +475,23 @@ class Application:
                     },
                 )
 
-        elif isinstance(event, NoticeEvent):
-            # 通知事件不进「框架」日志(避免刷屏), 改为持久化 + 实时推送到「事件」面板
-            log.debug(f'通知: {event.notice_type} | 群 {event.group_id} | 用户 {event.user_id}', extra={'web_skip': True})
+        elif isinstance(event, (NoticeEvent, RequestEvent, MetaEvent)):
+            # 通知、请求和生命周期事件进入「事件」面板，并统一使用中文名称。
+            if isinstance(event, NoticeEvent):
+                event_type = event.notice_type
+            elif isinstance(event, RequestEvent):
+                event_type = f'request.{event.request_type}'
+            else:
+                event_type = f'meta_event.{event.meta_event_type}'
+            sub_type = str(getattr(event, 'sub_type', '') or event.raw_data.get('sub_type') or '')
+            user_id = str(getattr(event, 'user_id', '') or '')
+            group_id = str(getattr(event, 'group_id', '') or '')
+            type_label = event_label(event_type, sub_type)
+            log.debug(f'事件: {type_label} | 群 {group_id} | 用户 {user_id}', extra={'web_skip': True})
             now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             bot_qq = str(event.self_id or '')
             raw_json = json.dumps(event.raw_data, ensure_ascii=False)
-            content = f'{event.notice_type} | 群{event.group_id or ""} | 用户{event.user_id}'
+            content = f'{type_label} | 群{group_id} | 用户{user_id}'
             if self._log_service:
                 await self._log_service.add(
                     'lifecycle',
@@ -383,9 +499,9 @@ class Application:
                         'timestamp': now,
                         'content': content,
                         'source': bot_qq,
-                        'user_id': str(event.user_id or ''),
-                        'group_id': str(event.group_id or ''),
-                        'message_type': event.notice_type,
+                        'user_id': user_id,
+                        'group_id': group_id,
+                        'message_type': event_type,
                         'raw_data': raw_json,
                     },
                     bot_qq=bot_qq,
@@ -395,16 +511,18 @@ class Application:
                     'lifecycle',
                     {
                         'timestamp': now,
-                        'type': event.notice_type,
-                        'user_id': str(event.user_id or ''),
-                        'group_id': str(event.group_id or ''),
+                        'type': event_type,
+                        'event_type': event_type,
+                        'type_label': type_label,
+                        'user_id': user_id,
+                        'group_id': group_id,
                         'bot_qq': bot_qq,
                         'content': content,
                         'raw_message': raw_json,
                     },
                 )
             # 撤回事件：标记对应消息为已撤回
-            if self._log_service and event.notice_type in ('group_recall', 'friend_recall'):
+            if self._log_service and isinstance(event, NoticeEvent) and event.notice_type in ('group_recall', 'friend_recall'):
                 recalled_mid = str(event.raw_data.get('message_id', '') or '')
                 if recalled_mid:
                     await self._log_service.execute(

@@ -106,7 +106,23 @@ class LogService:
 
     async def query(self, log_type: str, sql: str, params=None, bot_qq: str = '') -> list:
         """异步查询日志"""
+        # 面板读取前立即写出目标分库的待处理项，使内置 QQ 的最新历史无需等待定时 flush。
+        await self.flush(log_type, bot_qq)
         return await asyncio.to_thread(self._query_sync, log_type, sql, params, bot_qq)
+
+    async def flush(self, log_type: str | None = None, bot_qq: str = '') -> None:
+        """立即写出指定分库的待处理日志；不传类型时写出全部。"""
+        async with self._lock:
+            keys = list(self._queues) if log_type is None else [(str(log_type), str(bot_qq or ''))]
+            for key in keys:
+                queue = self._queues.get(key)
+                if not queue:
+                    continue
+                entries = []
+                while queue:
+                    entries.append(queue.popleft())
+                if entries:
+                    await asyncio.to_thread(self._write_entries, key[0], key[1], entries)
 
     def _query_sync(self, log_type: str, sql: str, params=None, bot_qq: str = '') -> list:
         try:
@@ -124,17 +140,7 @@ class LogService:
             await self._flush_all()
 
     async def _flush_all(self):
-        for key in list(self._queues.keys()):
-            queue = self._queues.get(key)
-            if not queue:
-                continue
-            entries = []
-            while queue:
-                entries.append(queue.popleft())
-            if not entries:
-                continue
-            log_type, bot_qq = key
-            await asyncio.to_thread(self._write_entries, log_type, bot_qq, entries)
+        await self.flush()
 
     def _write_entries(self, log_type: str, bot_qq: str, entries: list):
         try:

@@ -60,8 +60,10 @@ class ConnectionManager:
         self._forward_ids = set()  # 正向连接占用的账号标识，包含临时标识
         self._configs = []
         self._stopping = False
+        self._reloading = False
         self._sites = {}  # 监听地址映射到运行器和站点
         self._client_session: aiohttp.ClientSession | None = None
+        self._lifecycle_lock = asyncio.Lock()
 
     # ── 配置 ──
     def load_configs(self):
@@ -80,22 +82,24 @@ class ConnectionManager:
 
     # ── 启动 / 停止 ──
     async def start(self):
-        self._loop = asyncio.get_running_loop()
-        self._stopping = False
-        self.load_configs()
-        self._apply_server_auth()
-        self._register_http_clients()
-        await self._start_listeners()
-        await self._start_forward_clients()
+        async with self._lifecycle_lock:
+            self._loop = asyncio.get_running_loop()
+            self._stopping = False
+            self.load_configs()
+            self._apply_server_auth()
+            self._register_http_clients()
+            await self._start_listeners()
+            await self._start_forward_clients()
 
     async def stop(self):
-        self._stopping = True
-        await self._close_reverse_ws()
-        await self._cancel_forward_clients()
-        await self._stop_listeners()
-        if self._client_session is not None and not self._client_session.closed:
-            await self._client_session.close()
-        self._client_session = None
+        async with self._lifecycle_lock:
+            self._stopping = True
+            await self._close_reverse_ws()
+            await self._cancel_forward_clients()
+            await self._stop_listeners()
+            if self._client_session is not None and not self._client_session.closed:
+                await self._client_session.close()
+            self._client_session = None
 
     async def _close_reverse_ws(self):
         """主动关闭已接入的反向 WS, 避免监听端口清理时等待空闲超时"""
@@ -104,17 +108,52 @@ class ConnectionManager:
             if ws is not None:
                 with contextlib.suppress(Exception):
                     await ws.close(code=1001, message=b'Server shutdown')
+                # 热重载必须立即清除账号状态，不能依赖连接处理协程稍后执行 finally。
+                self._adapter.unregister_bot(sid, ws)
 
     async def reload(self):
         """配置变更后重新应用 (重启正向客户端 / 自定义监听 + 刷新鉴权/HTTP 客户端)"""
-        await self._cancel_forward_clients()
-        await self._stop_listeners()
-        self.load_configs()
-        self._apply_server_auth()
-        self._register_http_clients()
-        self._stopping = False
-        await self._start_listeners()
-        await self._start_forward_clients()
+        async with self._lifecycle_lock:
+            self._reloading = True
+            try:
+                await self._cancel_forward_clients()
+                await self._close_reverse_ws()
+                self._clear_http_bot_state()
+                await self._stop_listeners()
+                self.load_configs()
+                self._apply_server_auth()
+                self._register_http_clients()
+                self._stopping = False
+                await self._start_listeners()
+                await self._start_forward_clients()
+            finally:
+                self._reloading = False
+
+    def _clear_http_bot_state(self) -> None:
+        """清除无长连接可触发断开回调的 HTTP 上报账号状态。"""
+        for self_id, record in list(self._adapter.bots.items()):
+            if record.get('type') == 'http':
+                self._adapter.unregister_bot(self_id)
+
+    @staticmethod
+    def _normalize_path(path: str) -> str:
+        normalized = '/' + str(path or '/').strip('/')
+        return normalized if normalized != '//' else '/'
+
+    def server_connection_enabled(self, connection_type: ConnType, port: int | None, path: str) -> bool:
+        """判断外部 OneBot 服务端入口是否已在网络接入中启用。"""
+        if self._stopping or self._reloading or port is None:
+            return False
+        requested_path = self._normalize_path(path)
+        _main_host, main_port = self._main_addr()
+        for connection in self._configs:
+            if not connection.get('enable') or connection.get('type') != connection_type:
+                continue
+            configured_port = int(connection.get('port') or main_port)
+            configured_path = self._normalize_path(connection.get('path') or '/')
+            if configured_port == int(port) and configured_path == requested_path:
+                return True
+        return False
 
     # ── 反向服务器鉴权 (按连接区分: 每条反向 WS/HTTP 上报各自的 token/secret) ──
     def _apply_server_auth(self):
@@ -270,7 +309,7 @@ class ConnectionManager:
         adapter = self._adapter
         echo = f'probe:{conn["name"]}:{uuid.uuid4().hex[:8]}'
         fut = self._loop.create_future()
-        adapter.api_responses[echo] = fut
+        adapter.register_api_response(echo, fut, ws)
         try:
             send = getattr(ws, 'send_str', None) or ws.send_text
             await send(json.dumps({'action': 'get_login_info', 'params': {}, 'echo': echo}))
@@ -283,9 +322,7 @@ class ConnectionManager:
         except (TimeoutError, aiohttp.ClientError, TypeError, ValueError):
             pass
         finally:
-            pending = adapter.api_responses.pop(echo, None)
-            if pending is not None and not pending.done():
-                pending.cancel()
+            adapter.discard_api_response(echo)
 
     async def _consume(self, ws, conn):
         adapter = self._adapter
@@ -298,10 +335,7 @@ class ConnectionManager:
                 if not isinstance(data, dict):
                     continue
                 echo = data.get('echo')
-                if echo and echo in adapter.api_responses:
-                    fut = adapter.api_responses.pop(echo)
-                    if not fut.done():
-                        fut.set_result(data)
+                if echo and adapter.resolve_api_response(echo, data):
                     continue
                 event = adapter.parse_event(data)
                 if not event:
@@ -317,7 +351,7 @@ class ConnectionManager:
     def _rekey_forward(self, conn, real_id, ws):
         old = conn.get('_self_id')
         if old and old != real_id:
-            self._adapter.unregister_bot(old, ws)
+            self._adapter.unregister_bot(old, ws, cancel_responses=False)
             self._forward_ids.discard(old)
         self._adapter.register_bot(real_id, ws)
         self._forward_ids.add(real_id)
@@ -343,7 +377,7 @@ class ConnectionManager:
             entry = {'name': name, 'type': ctype, 'enable': c.get('enable', False), 'connected': False, 'self_id': None, 'error': ''}
             if ctype == ConnType.WS_FORWARD:
                 st = self._status.get(name, {})
-                entry['connected'] = st.get('connected', False)
+                entry['connected'] = c.get('enable', False) and st.get('connected', False)
                 entry['self_id'] = st.get('self_id')
                 entry['error'] = st.get('error', '')
             elif ctype == ConnType.WS_REVERSE:

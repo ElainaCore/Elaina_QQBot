@@ -10,6 +10,7 @@ from aiohttp import web
 from core.base.branding import public_text
 from core.base.config import cfg
 from core.base.logger import SYSTEM, get_logger
+from core.onebot.connection import ConnType
 
 log = get_logger(SYSTEM, 'HTTP')
 
@@ -187,11 +188,15 @@ class HttpServer:
         if not adapter:
             return web.Response(status=503)
 
+        port, path = _local_port(request), request.path
+        connection_manager = self._app_instance.connection_manager
+        if not connection_manager or not connection_manager.server_connection_enabled(ConnType.HTTP_SERVER, port, path):
+            return web.Response(status=503, text='OneBot HTTP 网络接入未启用')
+
         body = await request.read()
         if not body:
             return web.Response(status=400)
 
-        port, path = _local_port(request), request.path
         success, event = adapter.handle_http_callback(body, dict(request.headers), port=port, path=path)
         if event:
             self._app_instance.submit_event(event)
@@ -208,8 +213,13 @@ class HttpServer:
         if not adapter:
             return web.Response(status=503)
 
+        port, path = _local_port(request), request.path
+        connection_manager = self._app_instance.connection_manager
+        if not connection_manager or not connection_manager.server_connection_enabled(ConnType.WS_REVERSE, port, path):
+            return web.Response(status=503, text='OneBot WebSocket 网络接入未启用')
+
         headers = dict(request.headers)
-        valid, self_id, error = adapter.validate_websocket_headers(headers, port=_local_port(request), path=request.path)
+        valid, self_id, error = adapter.validate_websocket_headers(headers, port=port, path=path)
         if not valid:
             return web.Response(status=401, text=error or 'Unauthorized')
 
@@ -231,10 +241,8 @@ class HttpServer:
                         event = adapter.parse_event(data)
                         if event:
                             self._app_instance.submit_event(event)
-                        elif 'echo' in data and data['echo'] in adapter.api_responses:
-                            future = adapter.api_responses.pop(data['echo'])
-                            if not future.done():
-                                future.set_result(data)
+                        elif 'echo' in data:
+                            adapter.resolve_api_response(data['echo'], data)
                     except json.JSONDecodeError:
                         pass
                 elif msg.type == web.WSMsgType.ERROR:

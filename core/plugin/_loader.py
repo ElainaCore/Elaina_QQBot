@@ -9,6 +9,7 @@ import time
 
 import core.plugin.context as _ctx_mod
 from core.base.logger import PLUGIN, get_logger, report_error
+from core.onebot.api import api_call_source
 from core.plugin.context import PluginContext, PluginInfo
 from core.plugin.decorators import (
     _pending_api_interceptors,
@@ -47,7 +48,8 @@ def _collect_pending():
 async def _run_hooks(funcs, name):
     for func, is_coro in funcs:
         try:
-            await func() if is_coro else await asyncio.to_thread(func)
+            with api_call_source(name):
+                await func() if is_coro else await asyncio.to_thread(func)
         except Exception as e:
             report_error(PLUGIN, name, e)
 
@@ -133,7 +135,8 @@ class _LoaderMixin:
                             raise ImportError(f'无法创建插件模块: {mod_name}')
                         module = importlib.util.module_from_spec(spec)
                         sys.modules[mod_name] = module
-                        spec.loader.exec_module(module)
+                        with api_call_source(name):
+                            spec.loader.exec_module(module)
                         if first_module is None:
                             first_module = module
                         h, lo, ul, ic, hf, api_ic = _collect_pending()
@@ -176,6 +179,7 @@ class _LoaderMixin:
                 )
                 await _run_hooks(plugin.on_load_funcs, name)
                 self._plugins[name] = plugin
+                self._rebuild_handler_list()
                 get_logger(PLUGIN, name).info(f'加载完成 ({len(py_files)} 个文件, {len(plugin.handlers)} 个处理器, {plugin.load_time:.2f}s)')
             finally:
                 _clear_pending()
@@ -194,7 +198,8 @@ class _LoaderMixin:
             _ctx_mod.ctx = plugin_ctx
             start = time.perf_counter()
             try:
-                module = self._import_plugin(name, plugin_dir, entry)
+                with api_call_source(name):
+                    module = self._import_plugin(name, plugin_dir, entry)
                 h, lo, ul, ic, hf, api_ic = _collect_pending()
                 # 根据子模块禁用配置过滤处理器。
                 prefix = f'plugins.{name}.'
@@ -205,6 +210,7 @@ class _LoaderMixin:
                 plugin = _finalize_plugin(name, plugin_dir, module, plugin_ctx, h, lo, ul, ic, hf, api_ic, start, is_large=True)
                 await _run_hooks(plugin.on_load_funcs, name)
                 self._plugins[name] = plugin
+                self._rebuild_handler_list()
                 get_logger(PLUGIN, name).info(f'大型插件加载完成 ({len(h)} 个处理器, {plugin.load_time:.2f}s)')
             except Exception:
                 sys.modules.pop(f'plugins.{name}', None)

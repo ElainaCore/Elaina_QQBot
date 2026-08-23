@@ -15,11 +15,30 @@ logger = logging.getLogger('ElainaQQ.onebot.api')
 # 常用 OneBot v11 与 QQ 动作；call_api 不设白名单，新增动作无需升级框架即可调用。
 SUPPORTED_ACTIONS = frozenset(
     {
+        '.get_word_slices',
+        '.handle_quick_operation',
+        '.ocr_image',
+        'ArkShareGroup',
+        'ArkSharePeer',
+        '_del_group_notice',
+        '_get_group_notice',
+        '_get_model_show',
+        '_mark_all_as_read',
+        '_send_group_notice',
+        '_set_model_show',
+        'add_custom_face',
         'bot_exit',
+        'cancel_group_album_media_like',
+        'cancel_group_todo',
+        'cancel_online_file',
         'can_send_image',
         'can_send_record',
+        'check_url_safely',
         'clean_cache',
+        'clean_stream_temp_file',
+        'complete_group_todo',
         'create_collection',
+        'create_group_file_folder',
         'create_flash_task',
         'delete_custom_face',
         'delete_essence_msg',
@@ -28,6 +47,20 @@ SUPPORTED_ACTIONS = frozenset(
         'delete_group_folder',
         'delete_msg',
         'delete_qzone_msg',
+        'del_group_album_media',
+        'do_group_album_comment',
+        'download_file',
+        'download_file_image_stream',
+        'download_file_record_stream',
+        'download_file_stream',
+        'download_fileset',
+        'fetch_custom_face',
+        'fetch_custom_face_detail',
+        'fetch_emoji_like',
+        'fetch_ptt_text',
+        'forward_friend_single_msg',
+        'forward_group_single_msg',
+        'friend_poke',
         'get_ai_characters',
         'get_ai_record',
         'get_clientkey',
@@ -67,6 +100,7 @@ SUPPORTED_ACTIONS = frozenset(
         'get_group_shut_list',
         'get_group_signed_list',
         'get_group_system_msg',
+        'group_poke',
         'get_guild_list',
         'get_guild_service_profile',
         'get_image',
@@ -76,6 +110,7 @@ SUPPORTED_ACTIONS = frozenset(
         'get_msg',
         'get_online_clients',
         'get_online_file_msg',
+        'ocr_image',
         'get_packet_status',
         'get_private_file_url',
         'get_profile_like',
@@ -95,6 +130,13 @@ SUPPORTED_ACTIONS = frozenset(
         'mark_group_msg_as_read',
         'mark_msg_as_read',
         'mark_private_msg_as_read',
+        'move_group_file',
+        'nc_get_packet_status',
+        'nc_get_rkey',
+        'nc_get_user_status',
+        'receive_online_file',
+        'refuse_online_file',
+        'rename_group_file',
         'send_ark_share',
         'send_flash_msg',
         'click_inline_keyboard_button',
@@ -149,6 +191,8 @@ SUPPORTED_ACTIONS = frozenset(
         'set_qq_profile',
         'set_restart',
         'set_self_longnick',
+        'trans_group_file',
+        'translate_en2zh',
         'upload_file_stream',
         'upload_group_file',
         'upload_image_to_qun_album',
@@ -362,7 +406,7 @@ class OneBotAPI:
         }
 
         future = asyncio.get_running_loop().create_future()
-        self._adapter.api_responses[echo] = future
+        self._adapter.register_api_response(echo, future, ws)
 
         try:
             # aiohttp 的 WebSocketResponse/ClientWebSocketResponse 使用 send_str
@@ -371,13 +415,19 @@ class OneBotAPI:
             async with asyncio.timeout(30):
                 return await future
         except TimeoutError:
-            logger.warning(f'API 超时: {action}')
-            self._adapter.api_responses.pop(echo, None)
+            logger.warning('API 超时: %s', action)
+            return None
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            logger.debug('API 连接已断开: %s', action)
             return None
         except Exception as e:
-            logger.error(f'API 错误: {action} - {e}')
-            self._adapter.api_responses.pop(echo, None)
+            logger.error('API 错误: %s - %s', action, e)
             return None
+        finally:
+            self._adapter.discard_api_response(echo)
 
     def __getattr__(self, name):
         """将任意 OneBot action 暴露为异步方法，兼容未预先封装的扩展接口。"""

@@ -23,6 +23,7 @@ class OneBotAdapter:
         self.bots: dict[str, Any] = {}
         self.websockets: dict[str, Any] = {}
         self.api_responses: dict[str, asyncio.Future] = {}
+        self._api_response_owners: dict[str, Any] = {}
         self.http_clients: dict[str, dict[str, str]] = {}  # 名称映射到地址和令牌
         self.local_actions: dict[str, Any] = {}
         # 鉴权按端口和路径隔离，避免不同连接误用令牌或签名密钥。
@@ -143,17 +144,76 @@ class OneBotAdapter:
 
     def register_bot(self, self_id: str, ws=None):
         # aiohttp 的连接对象可能被判定为假值，因此必须显式判断是否为 None。
+        self_id = str(self_id)
         is_ws = ws is not None
+        previous_ws = self.websockets.get(self_id)
+        if previous_ws is not None and previous_ws is not ws:
+            self.cancel_api_responses(previous_ws)
         self.bots[self_id] = {'self_id': self_id, 'type': 'websocket' if is_ws else 'http', 'ws': ws}
         if is_ws:
             self.websockets[self_id] = ws
 
-    def unregister_bot(self, self_id: str, ws=None):
+    def unregister_bot(self, self_id: str, ws=None, *, cancel_responses: bool = True):
+        self_id = str(self_id)
         if ws is not None and self.websockets.get(self_id) is not ws:
             return False
+        active_ws = self.websockets.get(self_id)
+        if cancel_responses and active_ws is not None:
+            self.cancel_api_responses(active_ws)
         self.bots.pop(self_id, None)
         self.websockets.pop(self_id, None)
         return True
+
+    def register_api_response(
+        self,
+        echo: str,
+        future: asyncio.Future,
+        owner=None,
+    ) -> None:
+        """登记等待中的 API 响应，并记录所属连接以便断线时回收。"""
+        old_future = self.api_responses.get(echo)
+        if old_future is not None and not old_future.done():
+            old_future.cancel()
+        self.api_responses[echo] = future
+        if owner is not None:
+            self._api_response_owners[echo] = owner
+        else:
+            self._api_response_owners.pop(echo, None)
+
+    def resolve_api_response(self, echo, payload: dict) -> bool:
+        """完成指定 API 响应；未知或已经结束的 echo 返回 False。"""
+        key = str(echo)
+        future = self.api_responses.pop(key, None)
+        self._api_response_owners.pop(key, None)
+        if future is None or future.done():
+            return False
+        future.set_result(payload)
+        return True
+
+    def discard_api_response(self, echo, *, cancel: bool = True) -> bool:
+        """移除指定待响应对象，并按需取消仍在等待的 Future。"""
+        key = str(echo)
+        future = self.api_responses.pop(key, None)
+        self._api_response_owners.pop(key, None)
+        if future is None:
+            return False
+        if cancel and not future.done():
+            future.cancel()
+        return True
+
+    def cancel_api_responses(self, owner=None) -> int:
+        """取消全部或指定连接所属的待响应对象。"""
+        if owner is None:
+            echoes = tuple(self.api_responses)
+        else:
+            echoes = tuple(
+                echo
+                for echo, response_owner in self._api_response_owners.items()
+                if response_owner is owner
+            )
+        for echo in echoes:
+            self.discard_api_response(echo)
+        return len(echoes)
 
     def get_bot_ws(self, self_id: str | None = None):
         """获取 bot WebSocket 连接"""
@@ -195,10 +255,7 @@ class OneBotAdapter:
 
     async def close(self) -> None:
         """关闭网络资源并取消仍在等待的 API 响应。"""
-        for future in self.api_responses.values():
-            if not future.done():
-                future.cancel()
-        self.api_responses.clear()
+        self.cancel_api_responses()
         if self._http_session is not None and not self._http_session.closed:
             await self._http_session.close()
         self._http_session = None
