@@ -2,6 +2,7 @@
 
 from aiohttp import web
 
+from web.protocol import json_body
 from web.tools._market.fetch import _extract_plugins, _fetch_plugin_json
 from web.tools._market.install import (
     TYPE_MODULE,
@@ -68,7 +69,7 @@ async def handle_market_categories(request: web.Request):
 
 async def handle_market_detail(request: web.Request):
     """获取插件详情"""
-    body = await request.json()
+    body = await json_body(request)
     name = body.get('name', '')
     data = await _fetch_plugin_json()
     if data is None:
@@ -109,7 +110,7 @@ async def handle_market_get_mirror(request: web.Request):
 
 async def handle_market_set_mirror(request: web.Request):
     """设置市场镜像偏好"""
-    body = await request.json()
+    body = await json_body(request)
     mirror = body.get('mirror', '')
     _save_market_mirror(mirror)
     return web.json_response({'success': True, 'message': f'镜像已设为: {mirror or "(自动选择)"}'})
@@ -117,9 +118,9 @@ async def handle_market_set_mirror(request: web.Request):
 
 async def handle_market_test_mirror(request: web.Request):
     """测试单个镜像延迟"""
-    body = await request.json()
+    body = await json_body(request)
     mirror = body.get('mirror', '')
-    from web.tools._updater.mirror import _test_one_mirror
+    from web.tools._updater.mirror import test_one_mirror
 
-    result = await _test_one_mirror(mirror, timeout=5)
+    result = await test_one_mirror(mirror, timeout=5)
     return web.json_response({'success': True, 'data': result})

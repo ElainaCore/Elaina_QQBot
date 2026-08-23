@@ -2,6 +2,8 @@
 
 import asyncio
 import base64
+import concurrent.futures
+import contextlib
 import hashlib
 import hmac
 import json
@@ -10,6 +12,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta
+from urllib.parse import urlsplit
 
 from aiohttp import web
 
@@ -21,8 +24,8 @@ _FAIL_WINDOW = 86400
 _MAX_SESSIONS = 10
 _MAX_FAIL_COUNT = 5
 _SESSION_DAYS = 7
-_TOKEN_EXPIRY = 86400 * 7
 _MAX_IP_RECORDS = 10000
+SESSION_COOKIE = 'elaina_session'
 
 valid_sessions: dict = {}
 ip_access_data: dict = {}
@@ -33,6 +36,7 @@ _ip_file = ''
 _session_file = ''
 _secret_file = ''
 _io_lock = threading.Lock()  # 串行化文件写入, 避免内容交错损坏
+_write_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='web-auth-io')
 
 
 def init(base_dir: str):
@@ -54,6 +58,8 @@ def _load_or_create_secret() -> str:
             with open(_secret_file, encoding='utf-8') as f:
                 secret = f.read().strip()
                 if len(secret) >= 32:
+                    if os.name != 'nt':
+                        os.chmod(_secret_file, 0o600)
                     return secret
         except Exception:
             pass
@@ -61,43 +67,70 @@ def _load_or_create_secret() -> str:
     try:
         with open(_secret_file, 'w', encoding='utf-8') as f:
             f.write(secret)
+        if os.name != 'nt':
+            os.chmod(_secret_file, 0o600)
     except Exception:
         pass
     return secret
 
 
-# ==================== 密码 hash ====================
+# ==================== 密码摘要 ====================
 
-_PWD_HASH_PREFIX = 'sha256:'
+_PWD_HASH_PREFIX = 'pbkdf2_sha256:'
+_LEGACY_HASH_PREFIX = 'sha256:'
+_PBKDF2_ITERATIONS = 310_000
 
 
 def hash_password(plain: str) -> str:
-    """SHA-256 加盐 hash"""
+    """使用 PBKDF2-HMAC-SHA256 生成带盐密码摘要。"""
     salt = os.urandom(16)
-    h = hashlib.sha256(salt + plain.encode('utf-8')).hexdigest()
-    return _PWD_HASH_PREFIX + base64.b64encode(salt).decode() + ':' + h
+    digest = hashlib.pbkdf2_hmac('sha256', plain.encode('utf-8'), salt, _PBKDF2_ITERATIONS)
+    return ':'.join(
+        (
+            _PWD_HASH_PREFIX.rstrip(':'),
+            str(_PBKDF2_ITERATIONS),
+            base64.b64encode(salt).decode(),
+            base64.b64encode(digest).decode(),
+        )
+    )
 
 
 def verify_password(plain: str, stored: str) -> bool:
-    """恒定时间比较, 兼容明文旧密码"""
+    """验证当前摘要、旧版带盐 SHA-256 及待迁移的明文配置。"""
     if stored.startswith(_PWD_HASH_PREFIX):
         try:
-            rest = stored[len(_PWD_HASH_PREFIX) :]
-            salt_b64, expected_hex = rest.split(':', 1)
+            _, iterations, salt_b64, expected_b64 = stored.split(':', 3)
+            salt = base64.b64decode(salt_b64)
+            expected = base64.b64decode(expected_b64)
+            actual = hashlib.pbkdf2_hmac('sha256', plain.encode('utf-8'), salt, int(iterations))
+            return hmac.compare_digest(actual, expected)
+        except Exception:
+            return False
+    if stored.startswith(_LEGACY_HASH_PREFIX):
+        try:
+            salt_b64, expected_hex = stored[len(_LEGACY_HASH_PREFIX) :].split(':', 1)
             salt = base64.b64decode(salt_b64)
             actual_hex = hashlib.sha256(salt + plain.encode('utf-8')).hexdigest()
             return hmac.compare_digest(actual_hex, expected_hex)
         except Exception:
             return False
-    # 明文回退 (旧配置兼容), 仍用恒定时间比较
     return hmac.compare_digest(plain, stored)
 
 
 def is_hashed(stored: str) -> bool:
-    return stored.startswith(_PWD_HASH_PREFIX)
+    return stored.startswith((_PWD_HASH_PREFIX, _LEGACY_HASH_PREFIX))
 
 
-# ==================== JSON IO ====================
+def needs_rehash(stored: str) -> bool:
+    if not stored.startswith(_PWD_HASH_PREFIX):
+        return True
+    try:
+        return int(stored.split(':', 2)[1]) < _PBKDF2_ITERATIONS
+    except (ValueError, IndexError):
+        return True
+
+
+# ==================== JSON 读写 ====================
 
 
 def _read_json(path, default=None):
@@ -111,29 +144,34 @@ def _read_json(path, default=None):
 
 
 def _write_text_sync(path, text):
-    """同步写入文本 (在 executor 中调用)"""
+    """在专用线程中原子写入文本，避免并发快照乱序或半写文件。"""
     with _io_lock:
+        temporary = f'{path}.{os.getpid()}.tmp'
         try:
-            with open(path, 'w', encoding='utf-8') as f:
-                f.write(text)
+            with open(temporary, 'w', encoding='utf-8') as file:
+                file.write(text)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary, path)
         except Exception:
-            pass
+            with contextlib.suppress(OSError):
+                os.remove(temporary)
 
 
 def _write_json(path, data):
-    """异步友好的 JSON 写入: 主线程序列化 (一致性), executor 写盘 (不阻塞 loop)"""
+    """在主线程序列化快照，并按提交顺序异步写盘。"""
     try:
         text = json.dumps(data, ensure_ascii=False, indent=2, default=str)
     except Exception:
         return
     try:
         loop = asyncio.get_running_loop()
-        loop.run_in_executor(None, _write_text_sync, path, text)
+        loop.run_in_executor(_write_executor, _write_text_sync, path, text)
     except RuntimeError:
         _write_text_sync(path, text)
 
 
-# ==================== IP ====================
+# ==================== 网络地址 ====================
 
 
 def _load_ip_data():
@@ -194,6 +232,11 @@ def record_ip_access(ip, access_type='success'):
         if len(d['fail_times']) >= _MAX_FAIL_COUNT:
             d['is_banned'] = True
             d['ban_time'] = now_iso
+    elif access_type == 'success':
+        d['fail_count'] = 0
+        d['fail_times'] = []
+        d['is_banned'] = False
+        d['ban_time'] = None
     _save_ip_data()
 
 
@@ -253,7 +296,7 @@ def cleanup_expired_ip_bans():
     _save_ip_data()
 
 
-# ==================== Token ====================
+# ==================== 会话令牌 ====================
 
 
 def _generate_token() -> str:
@@ -274,7 +317,7 @@ def _verify_sig(signed) -> tuple:
         return False, None
 
 
-# ==================== Session ====================
+# ==================== 会话管理 ====================
 
 
 def _load_session_data():
@@ -317,11 +360,11 @@ def _cleanup_sessions():
 
 
 def create_session(request: web.Request) -> str:
-    """创建会话并返回 bearer token"""
+    """创建面板会话。"""
     _cleanup_sessions()
-    if len(valid_sessions) > _MAX_SESSIONS:
+    if len(valid_sessions) >= _MAX_SESSIONS:
         oldest = sorted(valid_sessions, key=lambda t: valid_sessions[t]['created'])
-        for t in oldest[: len(valid_sessions) - _MAX_SESSIONS]:
+        for t in oldest[: len(valid_sessions) - _MAX_SESSIONS + 1]:
             valid_sessions.pop(t)
 
     ip = get_real_ip(request)
@@ -336,17 +379,32 @@ def create_session(request: web.Request) -> str:
     return token
 
 
-def validate_token(request: web.Request) -> bool:
-    """验证 Authorization: Bearer <token> 或 ?token= 查询参数"""
-    _cleanup_sessions()
-    # 优先从 Authorization 头获取
-    token = ''
+def get_request_token(request: web.Request) -> str:
+    """从请求头或安全 Cookie 获取会话令牌。"""
     auth_header = request.headers.get('Authorization', '')
-    if auth_header.startswith('Bearer '):
-        token = auth_header[7:]
-    # 回退: 从 query 参数获取 (iframe/导航请求无法带 header)
-    if not token:
-        token = request.query.get('token', '')
+    scheme, _, value = auth_header.partition(' ')
+    if scheme.lower() == 'bearer':
+        return value.strip()
+    return request.cookies.get(SESSION_COOKIE, '')
+
+
+def set_session_cookie(response: web.StreamResponse, request: web.Request, token: str) -> None:
+    forwarded_proto = request.headers.get('X-Forwarded-Proto', '').split(',')[0].strip().lower() if _trust_forwarded() else ''
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        httponly=True,
+        secure=request.secure or forwarded_proto == 'https',
+        samesite='Strict',
+        max_age=_SESSION_DAYS * 86400,
+        path='/',
+    )
+
+
+def validate_token(request: web.Request) -> bool:
+    """验证 Bearer 或 HttpOnly Cookie 中的会话令牌。"""
+    _cleanup_sessions()
+    token = get_request_token(request)
     if not token or token not in valid_sessions:
         return False
     info = valid_sessions[token]
@@ -357,20 +415,51 @@ def validate_token(request: web.Request) -> bool:
     return True
 
 
+def revoke_session(request: web.Request) -> None:
+    token = get_request_token(request)
+    if token:
+        valid_sessions.pop(token, None)
+        _save_session_data()
+
+
+def is_same_origin(request: web.Request) -> bool:
+    """Cookie 鉴权时拒绝跨站请求。"""
+    origin = request.headers.get('Origin')
+    if not origin:
+        return True
+    try:
+        return hmac.compare_digest(urlsplit(origin).netloc.lower(), request.host.lower())
+    except ValueError:
+        return False
+
+
 # ==================== 中间件 ====================
 
 
 def require_auth(handler):
-    """aiohttp 路由装饰器: 要求 Bearer token"""
+    """aiohttp 路由装饰器：要求有效会话并校验 Cookie 写请求来源。"""
 
     async def wrapped(request):
-        if not validate_token(request):
-            return web.json_response({'success': False, 'error': '未登录或会话已过期'}, status=401)
+        denied = authorize_request(request)
+        if denied is not None:
+            return denied
         return await handler(request)
 
     wrapped.__name__ = handler.__name__
     wrapped.__qualname__ = handler.__qualname__
     return wrapped
+
+
+def authorize_request(request: web.Request) -> web.Response | None:
+    """复用面板会话与 Cookie 写请求来源校验。"""
+    from web.protocol import error
+
+    if not validate_token(request):
+        return error('未登录或会话已过期', status=401)
+    uses_cookie = not request.headers.get('Authorization', '').lower().startswith('bearer ')
+    if uses_cookie and request.method not in ('GET', 'HEAD', 'OPTIONS') and not is_same_origin(request):
+        return error('跨站请求已拒绝', status=403)
+    return None
 
 
 # ==================== 登录日志查询 ====================

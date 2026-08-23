@@ -19,9 +19,7 @@ class HookManager:
 
     def register(self, hook_name, callback, *, owner='unknown', priority=100):
         """注册 hook 回调"""
-        self._hooks[hook_name].append(
-            (priority, owner, callback, asyncio.iscoroutinefunction(callback))
-        )
+        self._hooks[hook_name].append((priority, owner, callback, asyncio.iscoroutinefunction(callback)))
         self._sorted.pop(hook_name, None)
 
     def unregister(self, hook_name, callback):
@@ -81,10 +79,7 @@ class HookManager:
         return bool(self._hooks.get(hook_name))
 
     def list_hooks(self):
-        return {
-            name: [{'owner': e[1], 'priority': e[0]} for e in self._get_sorted(name)]
-            for name in self._hooks if self._hooks[name]
-        }
+        return {name: [{'owner': e[1], 'priority': e[0]} for e in self._get_sorted(name)] for name in self._hooks if self._hooks[name]}
 
     def clear(self):
         self._hooks.clear()
@@ -98,6 +93,7 @@ def get_hook_manager():
     global _instance
     try:
         from core.application import get_app
+
         app = get_app()
         if app is not None:
             return app.hook_manager

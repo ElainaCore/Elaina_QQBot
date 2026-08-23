@@ -5,19 +5,21 @@ import contextlib
 import json
 import logging
 import os
-import re
 import shutil
 import tempfile
-import zipfile
 from datetime import datetime
-from typing import cast
 
-import yaml
-from aiohttp import BodyPartReader, web
+from aiohttp import web
 
-from core.base.zipsafe import safe_extractall
+from core.base.zipsafe import is_within
+from web.protocol import json_body
+from web.tools import _common
+from web.tools._plugin_mgr.archives import handle_module_upload as handle_module_upload
+from web.tools._plugin_mgr.archives import handle_upload_plugin as handle_upload_plugin
+from web.tools._plugin_mgr.config_files import handle_read_config as handle_read_config
+from web.tools._plugin_mgr.config_files import handle_save_config as handle_save_config
 
-log = logging.getLogger('ElainaBot.web.plugin_mgr')
+log = logging.getLogger('ElainaQQ.web.plugin_mgr')
 
 _app = None
 _base_dir = ''
@@ -73,7 +75,7 @@ def validate_path(rel_or_abs, root):
     if not os.path.isabs(cand):
         cand = os.path.join(root, cand) if not cand.startswith(os.path.basename(root)) else os.path.join(_base_dir, cand)
     abs_path = os.path.abspath(cand)
-    if not abs_path.startswith(root_abs):
+    if not is_within(root_abs, abs_path):
         return False, ''
     return True, abs_path
 
@@ -93,8 +95,14 @@ def list_config_files(data_dir):
     for fname in sorted(os.listdir(data_dir)):
         fpath = os.path.join(data_dir, fname)
         if os.path.isfile(fpath) and os.path.splitext(fname)[1].lower() in _CONFIG_EXTS:
-            files.append({'name': fname, 'path': fpath.replace('\\', '/'),
-                          'size': os.path.getsize(fpath)})
+            files.append(
+                {
+                    'name': fname,
+                    'path': fpath.replace('\\', '/'),
+                    'size': os.path.getsize(fpath),
+                    'format': detect_config_format(os.path.splitext(fname)[1].lower()),
+                }
+            )
     return files
 
 
@@ -108,14 +116,13 @@ def detect_config_format(ext):
 
 # ════════════════ 插件扫描 ════════════════
 
+
 def _read_file_meta(py_path):
     try:
         with open(py_path, encoding='utf-8') as f:
             tree = ast.parse(f.read())
         for node in ast.iter_child_nodes(tree):
-            if (isinstance(node, ast.Assign) and len(node.targets) == 1
-                    and isinstance(node.targets[0], ast.Name)
-                    and node.targets[0].id == '__plugin_meta__'):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id == '__plugin_meta__':
                 meta = ast.literal_eval(node.value)
                 if isinstance(meta, dict):
                     allowed = {'name', 'version', 'author', 'description'}
@@ -157,6 +164,7 @@ def _scan_plugin_dirs():
     pm = get_pm()
     plugin_info_map = pm.get_web_plugin_info() if pm else {}
     disabled_set = pm.get_disabled_plugins() if pm else set()
+    bots_map = pm.get_plugin_bots() if pm and hasattr(pm, 'get_plugin_bots') else {}
 
     for dir_name in sorted(os.listdir(pdir)):
         dir_path = os.path.join(pdir, dir_name)
@@ -164,8 +172,7 @@ def _scan_plugin_dirs():
             continue
         is_system = dir_name == 'system'
         pinfo = plugin_info_map.get(dir_name, {})
-        has_entry = any(e in os.listdir(dir_path) for e in ENTRY_CANDIDATES) or \
-            os.path.isfile(os.path.join(dir_path, f'{dir_name}.py'))
+        has_entry = any(e in os.listdir(dir_path) for e in ENTRY_CANDIDATES) or os.path.isfile(os.path.join(dir_path, f'{dir_name}.py'))
         files = _scan_py_files(dir_path, read_meta=not has_entry)
         if not files:
             continue
@@ -180,6 +187,7 @@ def _scan_plugin_dirs():
             stem = f['name'][:-3] if f['name'].endswith('.py') else f['name']
             if persist_disabled or f'{dir_name}/{stem}' in disabled_set:
                 f['enabled'] = False
+            f['allowed_bots'] = bots_map.get(f'{dir_name}/{stem}', [])
 
         if has_entry:
             app_dir = os.path.join(dir_path, 'app')
@@ -189,20 +197,23 @@ def _scan_plugin_dirs():
                     stem = f['name'][:-3] if f['name'].endswith('.py') else f['name']
                     if persist_disabled or f'{dir_name}/{stem}' in disabled_set:
                         f['enabled'] = False
+                    f['allowed_bots'] = bots_map.get(f'{dir_name}/{stem}', [])
                 files.extend(sub_files)
 
         loaded = dir_name in (pm.plugins if pm else {})
-        dirs.append({
-            'directory': dir_name,
-            'is_system': is_system,
-            'enabled': loaded and not persist_disabled,
-            'is_large': has_entry,
-            'files': files,
-            'allowed_bots': [],
-            'commands': pinfo.get('commands', []),
-            'description': pinfo.get('description', ''),
-            'meta': pinfo.get('meta', {}),
-        })
+        dirs.append(
+            {
+                'directory': dir_name,
+                'is_system': is_system,
+                'enabled': loaded and not persist_disabled,
+                'is_large': has_entry,
+                'files': files,
+                'allowed_bots': bots_map.get(dir_name, []),
+                'commands': pinfo.get('commands', []),
+                'description': pinfo.get('description', ''),
+                'meta': pinfo.get('meta', {}),
+            }
+        )
     dirs.sort(key=lambda d: (not d['enabled'], d['directory']))
     return dirs
 
@@ -217,14 +228,16 @@ async def handle_scan_plugin_dirs(request: web.Request):
 
 # ════════════════ 插件启停 / 重载 ════════════════
 
+
 async def handle_toggle_plugin(request: web.Request):
-    body = await request.json()
+    body = await json_body(request)
     name = body.get('name', '')
     file = body.get('file', '')
     action = body.get('action', '')
     if not name or action not in ('enable', 'disable'):
         return web.json_response({'success': False, 'message': '参数不完整'}, status=400)
-    if not os.path.isdir(os.path.join(plugins_dir(), name)):
+    valid, plugin_dir = validate_path(name, plugins_dir())
+    if not valid or not os.path.isdir(plugin_dir):
         return web.json_response({'success': False, 'message': f'插件目录不存在: {name}'}, status=404)
     pm = get_pm()
     if not pm:
@@ -251,10 +264,13 @@ async def handle_toggle_plugin(request: web.Request):
 
 
 async def handle_reload_plugin(request: web.Request):
-    body = await request.json()
+    body = await json_body(request)
     name = body.get('name', '')
     if not name:
         return web.json_response({'success': False, 'message': '缺少插件名'}, status=400)
+    valid, plugin_dir = validate_path(name, plugins_dir())
+    if not valid or not os.path.isdir(plugin_dir):
+        return web.json_response({'success': False, 'message': '无效插件名'}, status=403)
     pm = get_pm()
     if not pm:
         return web.json_response({'success': False, 'message': '插件管理器未初始化'}, status=503)
@@ -271,8 +287,9 @@ async def handle_reload_plugin(request: web.Request):
 
 # ════════════════ 插件读写 / 创建 / 上传 ════════════════
 
+
 async def handle_read_plugin(request: web.Request):
-    body = await request.json()
+    body = await json_body(request)
     plugin_path = os.path.normpath(body.get('path', ''))
     if not plugin_path:
         return web.json_response({'success': False, 'message': '缺少路径'}, status=400)
@@ -281,29 +298,37 @@ async def handle_read_plugin(request: web.Request):
         return web.json_response({'success': False, 'message': '无效路径'}, status=403)
     with open(abs_path, encoding='utf-8') as f:
         content = f.read()
-    return web.json_response({'success': True, 'content': content,
-                              'path': plugin_path.replace('\\', '/'),
-                              'filename': os.path.basename(plugin_path)})
+    return web.json_response({'success': True, 'content': content, 'path': plugin_path.replace('\\', '/'), 'filename': os.path.basename(plugin_path)})
 
 
 async def handle_save_plugin(request: web.Request):
-    body = await request.json()
+    body = await json_body(request)
     plugin_path = os.path.normpath(body.get('path', ''))
     content = body.get('content')
-    if not plugin_path or content is None:
+    if not plugin_path or not isinstance(content, str):
         return web.json_response({'success': False, 'message': '缺少参数'}, status=400)
+    if not plugin_path.lower().endswith('.py') or len(content.encode('utf-8')) > 2 * 1024 * 1024:
+        return web.json_response({'success': False, 'message': '仅允许保存不超过 2 MB 的 Python 源码'}, status=400)
     valid, abs_path = validate_path(plugin_path, plugins_dir())
     if not valid:
         return web.json_response({'success': False, 'message': '无效路径'}, status=403)
     if os.path.exists(abs_path):
         shutil.copy2(abs_path, abs_path + '.backup')
-    with open(abs_path, 'w', encoding='utf-8') as f:
-        f.write(content)
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix='.plugin-', suffix='.tmp', dir=os.path.dirname(abs_path))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(content)
+        os.replace(temp_path, abs_path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.remove(temp_path)
+        raise
     return web.json_response({'success': True, 'message': '插件已保存'})
 
 
 async def handle_create_plugin(request: web.Request):
-    body = await request.json()
+    body = await json_body(request)
     directory = body.get('directory', '')
     filename = body.get('filename', '')
     if not directory or not filename:
@@ -312,9 +337,11 @@ async def handle_create_plugin(request: web.Request):
         filename += '.py'
     pdir = plugins_dir()
     target_dir = os.path.join(pdir, directory)
-    if not os.path.abspath(target_dir).startswith(os.path.abspath(pdir)):
+    if not is_within(pdir, target_dir):
         return web.json_response({'success': False, 'message': '无效目录'}, status=403)
     plugin_path = os.path.join(target_dir, filename)
+    if not is_within(pdir, plugin_path):
+        return web.json_response({'success': False, 'message': '无效文件名'}, status=403)
     if os.path.exists(plugin_path):
         return web.json_response({'success': False, 'message': '文件已存在'}, status=409)
     os.makedirs(target_dir, exist_ok=True)
@@ -324,14 +351,14 @@ async def handle_create_plugin(request: web.Request):
 
 
 async def handle_create_folder(request: web.Request):
-    body = await request.json()
+    body = await json_body(request)
     folder_name = body.get('folder_name', '')
     parent_dir = body.get('parent_dir', '')
     if not folder_name:
         return web.json_response({'success': False, 'message': '缺少文件夹名'}, status=400)
     pdir = plugins_dir()
     target = os.path.join(pdir, parent_dir, folder_name) if parent_dir else os.path.join(pdir, folder_name)
-    if not os.path.abspath(target).startswith(os.path.abspath(pdir)):
+    if not is_within(pdir, target):
         return web.json_response({'success': False, 'message': '无效目录'}, status=403)
     if os.path.exists(target):
         return web.json_response({'success': False, 'message': '文件夹已存在'}, status=409)
@@ -349,124 +376,56 @@ async def handle_get_folders(request: web.Request):
     return web.json_response({'success': True, 'folders': folders})
 
 
-async def handle_upload_plugin(request: web.Request):
-    reader = await request.multipart()
-    file_data = filename = None
-    directory = 'alone'
-    async for field in reader:
-        field = cast(BodyPartReader, field)
-        if field.name == 'file':
-            filename = field.filename
-            file_data = await field.read()
-        elif field.name == 'directory':
-            directory = (await field.text()).strip() or 'alone'
+# ════════════════ 插件机器人绑定 ════════════════
 
-    if not file_data or not filename:
-        return web.json_response({'success': False, 'message': '没有文件'}, status=400)
-    is_zip = filename.lower().endswith('.zip')
-    is_py = filename.lower().endswith('.py')
-    if not is_zip and not is_py:
-        return web.json_response({'success': False, 'message': '仅支持 .py 或 .zip 文件'}, status=400)
-
-    pdir = plugins_dir()
-    if is_py:
-        safe_name = re.sub(r'[^\w\u4e00-\u9fa5\-.]', '_', filename)
-        target_dir = os.path.join(pdir, directory)
-        if not os.path.abspath(target_dir).startswith(os.path.abspath(pdir)):
-            return web.json_response({'success': False, 'message': '无效目录'}, status=403)
-        os.makedirs(target_dir, exist_ok=True)
-        dest = os.path.join(target_dir, safe_name)
-        if os.path.exists(dest):
-            base, c = safe_name[:-3], 1
-            while os.path.exists(dest):
-                dest = os.path.join(target_dir, f'{base}_{c}.py')
-                c += 1
-        with open(dest, 'wb') as f:
-            f.write(file_data)
-        return web.json_response({'success': True, 'message': f'上传成功: {os.path.basename(dest)}',
-                                  'path': dest.replace('\\', '/')})
-
-    tmp = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp:
-            tmp.write(file_data)
-        if not zipfile.is_zipfile(tmp.name):
-            return web.json_response({'success': False, 'message': '无效的 zip 文件'}, status=400)
-        with zipfile.ZipFile(tmp.name, 'r') as zf:
-            names = zf.namelist()
-            if not names:
-                return web.json_response({'success': False, 'message': 'zip 文件为空'}, status=400)
-            top_dirs, top_files = set(), set()
-            for n in names:
-                parts = n.replace('\\', '/').strip('/').split('/')
-                if len(parts) > 1 and parts[0]:
-                    top_dirs.add(parts[0])
-                elif len(parts) == 1 and parts[0]:
-                    top_files.add(parts[0])
-            os.makedirs(pdir, exist_ok=True)
-            if len(top_dirs) == 1 and not top_files:
-                folder_name = list(top_dirs)[0]
-                safe_folder = re.sub(r'[^\w\u4e00-\u9fa5\-]', '_', folder_name)
-                target_dir = os.path.join(pdir, safe_folder)
-                if os.path.exists(target_dir):
-                    backup = target_dir + '.bak'
-                    if os.path.exists(backup):
-                        shutil.rmtree(backup)
-                    shutil.move(target_dir, backup)
-                extract_tmp = tempfile.mkdtemp()
-                safe_extractall(zf, extract_tmp)
-                shutil.move(os.path.join(extract_tmp, folder_name), target_dir)
-                shutil.rmtree(extract_tmp, ignore_errors=True)
-            else:
-                safe_folder = re.sub(r'[^\w\u4e00-\u9fa5\-]', '_', os.path.splitext(filename)[0])
-                target_dir = os.path.join(pdir, safe_folder)
-                if os.path.exists(target_dir):
-                    backup = target_dir + '.bak'
-                    if os.path.exists(backup):
-                        shutil.rmtree(backup)
-                    shutil.move(target_dir, backup)
-                os.makedirs(target_dir, exist_ok=True)
-                safe_extractall(zf, target_dir)
-            plugin_name = os.path.basename(target_dir)
-        return web.json_response({'success': True, 'message': f'插件 {plugin_name} 上传成功', 'plugin_name': plugin_name})
-    except Exception as e:
-        return web.json_response({'success': False, 'message': str(e)}, status=500)
-    finally:
-        if tmp is not None:
-            with contextlib.suppress(Exception):
-                os.unlink(tmp.name)
-
-
-# ════════════════ 插件机器人绑定 (OneBot 单机器人, 降级) ════════════════
 
 async def handle_get_plugin_bots(request: web.Request):
-    return web.json_response({'success': True, 'plugin_bots': {}})
+    pm = get_pm()
+    if not pm:
+        return web.json_response({'success': False, 'message': '插件管理器未初始化'}, status=503)
+    return web.json_response(
+        {
+            'success': True,
+            'plugin_bots': pm.get_plugin_bots(),
+            'bots': _common.connected_ids(),
+            'mode': 'all',
+        }
+    )
 
 
 async def handle_set_plugin_bots(request: web.Request):
-    return web.json_response({'success': True, 'message': 'OneBot 为单机器人模式，无需配置机器人绑定'})
+    pm = get_pm()
+    if not pm:
+        return web.json_response({'success': False, 'message': '插件管理器未初始化'}, status=503)
+    body = await json_body(request)
+    data = body.get('plugin_bots')
+    if not isinstance(data, dict):
+        return web.json_response({'success': False, 'message': 'plugin_bots 必须为对象'}, status=400)
+    pm.set_plugin_bots(data)
+    return web.json_response({'success': True, 'message': '插件机器人绑定已保存'})
 
 
 async def handle_plugin_config_files(request: web.Request):
-    body = await request.json()
+    body = await json_body(request)
     plugin_name = body.get('name', '')
     if not plugin_name:
         return web.json_response({'success': False, 'message': '缺少插件名'}, status=400)
-    plugin_dir = os.path.join(plugins_dir(), plugin_name)
+    valid, plugin_dir = validate_path(plugin_name, plugins_dir())
+    if not valid or not os.path.isdir(plugin_dir):
+        return web.json_response({'success': False, 'message': '无效插件名'}, status=403)
     files = list_config_files(os.path.join(plugin_dir, 'data'))
     return web.json_response({'success': True, 'config_files': files})
 
 
 # ════════════════ 模块管理 ════════════════
 
+
 def _read_module_meta(entry_path):
     try:
         with open(entry_path, encoding='utf-8') as f:
             tree = ast.parse(f.read())
         for node in ast.iter_child_nodes(tree):
-            if (isinstance(node, ast.Assign) and len(node.targets) == 1
-                    and isinstance(node.targets[0], ast.Name)
-                    and node.targets[0].id == '__module_meta__'):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id == '__module_meta__':
                 return ast.literal_eval(node.value)
     except Exception:
         pass
@@ -495,18 +454,20 @@ def _scan_modules():
             continue
         meta = _read_module_meta(entry)
         rt = runtime.get(name, {})
-        result.append({
-            'name': name,
-            'display_name': meta.get('name') or rt.get('display_name') or name,
-            'description': meta.get('description') or rt.get('description', ''),
-            'version': meta.get('version') or rt.get('version', '1.0.0'),
-            'author': meta.get('author') or rt.get('author', ''),
-            'enabled': rt.get('enabled', False),
-            'persist_enabled': rt.get('persist_enabled', persist_map.get(name, False)),
-            'error': rt.get('error'),
-            'last_modified': datetime.fromtimestamp(os.path.getmtime(entry)).strftime('%Y-%m-%d %H:%M:%S'),
-            'config_files': list_config_files(os.path.join(mod_dir, 'data')),
-        })
+        result.append(
+            {
+                'name': name,
+                'display_name': meta.get('name') or rt.get('display_name') or name,
+                'description': meta.get('description') or rt.get('description', ''),
+                'version': meta.get('version') or rt.get('version', '1.0.0'),
+                'author': meta.get('author') or rt.get('author', ''),
+                'enabled': rt.get('enabled', False),
+                'persist_enabled': rt.get('persist_enabled', persist_map.get(name, False)),
+                'error': rt.get('error'),
+                'last_modified': datetime.fromtimestamp(os.path.getmtime(entry)).strftime('%Y-%m-%d %H:%M:%S'),
+                'config_files': list_config_files(os.path.join(mod_dir, 'data')),
+            }
+        )
     return result
 
 
@@ -515,7 +476,7 @@ async def handle_scan_modules(request: web.Request):
 
 
 async def handle_module_toggle(request: web.Request):
-    body = await request.json()
+    body = await json_body(request)
     name = body.get('name', '')
     action = body.get('action', '')
     if not name or action not in ('enable', 'disable'):
@@ -537,204 +498,3 @@ async def handle_module_toggle(request: web.Request):
         return web.json_response({'success': False, 'message': '操作失败'})
     except Exception as e:
         return web.json_response({'success': False, 'message': str(e)}, status=500)
-
-
-async def handle_module_upload(request: web.Request):
-    reader = await request.multipart()
-    field = cast(BodyPartReader, await reader.next())
-    if not field or field.name != 'file':
-        return web.json_response({'success': False, 'message': '缺少文件'}, status=400)
-    filename = field.filename or ''
-    if not filename.lower().endswith('.zip'):
-        return web.json_response({'success': False, 'message': '仅支持 zip 格式'}, status=400)
-
-    tmp = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp:
-            while True:
-                chunk = await field.read_chunk()
-                if not chunk:
-                    break
-                tmp.write(chunk)
-        if not zipfile.is_zipfile(tmp.name):
-            return web.json_response({'success': False, 'message': '无效的 zip 文件'}, status=400)
-        with zipfile.ZipFile(tmp.name, 'r') as zf:
-            names = zf.namelist()
-            if not any(n.endswith('.py') for n in names):
-                return web.json_response({'success': False, 'message': 'zip 必须包含 .py 文件'}, status=400)
-            mod_name = os.path.splitext(filename)[0]
-            top_dirs = {n.replace('\\', '/').split('/')[0] for n in names if '/' in n.replace('\\', '/')}
-            mdir = modules_dir()
-            os.makedirs(mdir, exist_ok=True)
-            target_dir = os.path.join(mdir, mod_name)
-            if os.path.exists(target_dir):
-                backup = target_dir + '.bak'
-                if os.path.exists(backup):
-                    shutil.rmtree(backup)
-                shutil.move(target_dir, backup)
-            if len(top_dirs) == 1:
-                extract_tmp = tempfile.mkdtemp()
-                safe_extractall(zf, extract_tmp)
-                shutil.move(os.path.join(extract_tmp, list(top_dirs)[0]), target_dir)
-                shutil.rmtree(extract_tmp, ignore_errors=True)
-            else:
-                os.makedirs(target_dir, exist_ok=True)
-                safe_extractall(zf, target_dir)
-        if not os.path.isfile(os.path.join(target_dir, 'main.py')):
-            shutil.rmtree(target_dir, ignore_errors=True)
-            return web.json_response({'success': False, 'message': '解压后未找到 main.py'}, status=400)
-        return web.json_response({'success': True, 'message': f'模块 {mod_name} 上传成功，重启后生效', 'module_name': mod_name})
-    except Exception as e:
-        return web.json_response({'success': False, 'message': str(e)}, status=500)
-    finally:
-        if tmp is not None:
-            with contextlib.suppress(Exception):
-                os.unlink(tmp.name)
-
-
-# ════════════════ 配置文件读写 (YAML 注释保留) ════════════════
-
-def _ys(v):
-    if v is None:
-        return 'null'
-    if isinstance(v, bool):
-        return 'true' if v else 'false'
-    if not isinstance(v, str):
-        return str(v)
-    if not v:
-        return "''"
-    return f"'{v}'" if any(c in v for c in ':#[]{}|>&*!?,') or v[0] == ' ' or v[-1] == ' ' else v
-
-
-def _rebuild_yaml(data, cmt, pre='', ind=0):
-    if not isinstance(data, dict):
-        return []
-    out, pad = [], '  ' * ind
-    for k, v in data.items():
-        p = f'{pre}.{k}' if pre else k
-        c = cmt.get(p, '')
-        if isinstance(v, dict):
-            if c:
-                out.append(f'{pad}# {c}')
-            out.append(f'{pad}{k}:')
-            out.extend(_rebuild_yaml(v, cmt, p, ind + 1))
-        elif isinstance(v, list):
-            if c:
-                out.append(f'{pad}# {c}')
-            if not v:
-                out.append(f'{pad}{k}: []')
-            else:
-                out.append(f'{pad}{k}:')
-                cp = '  ' * (ind + 1)
-                for it in v:
-                    if isinstance(it, dict):
-                        for i, (ik, iv) in enumerate(it.items()):
-                            out.append(f'{cp}{"- " if not i else "  "}{ik}: {_ys(iv)}')
-                    else:
-                        out.append(f'{cp}- {_ys(it)}')
-        else:
-            s = _ys(v)
-            out.append(f'{pad}{k}: {s}  # {c}' if c else f'{pad}{k}: {s}')
-    return out
-
-
-def _extract_yaml_comments(raw_text):
-    comments = {}
-    pending = None
-    stack = []
-    for line in raw_text.split('\n'):
-        stripped = line.rstrip()
-        if not stripped:
-            pending = None
-            continue
-        m_comment = re.match(r'^(\s*)#\s*(.*)', stripped)
-        if m_comment:
-            pending = m_comment.group(2).strip()
-            continue
-        m_kv = re.match(r'^(\s*)([A-Za-z_][\w]*)\s*:', stripped)
-        if not m_kv:
-            pending = None
-            continue
-        indent = len(m_kv.group(1))
-        key = m_kv.group(2)
-        while stack and stack[-1][0] >= indent:
-            stack.pop()
-        inline = ''
-        m_inline = re.search(r'#\s*(.+)$', stripped)
-        if m_inline:
-            before = stripped[:m_inline.start()].rstrip()
-            if ':' in before:
-                inline = m_inline.group(1).strip()
-        comment = inline or pending or ''
-        if comment:
-            comments['.'.join([p[1] for p in stack] + [key])] = comment
-        stack.append((indent, key))
-        pending = None
-    return comments
-
-
-async def handle_read_config(request: web.Request):
-    body = await request.json()
-    if not body.get('path', ''):
-        return web.json_response({'success': False, 'message': '缺少路径'}, status=400)
-    abs_path, err = validate_config_path(body['path'])
-    if err:
-        return err
-    if not os.path.isfile(abs_path):
-        return web.json_response({'success': False, 'message': '文件不存在'}, status=404)
-    fmt = detect_config_format(os.path.splitext(abs_path)[1].lower())
-    with open(abs_path, encoding='utf-8') as f:
-        raw = f.read()
-    parsed, comments = None, {}
-    if fmt == 'yaml':
-        with contextlib.suppress(Exception):
-            parsed = yaml.safe_load(raw)
-            comments = _extract_yaml_comments(raw)
-    elif fmt == 'json':
-        with contextlib.suppress(Exception):
-            parsed = json.loads(raw)
-    return web.json_response({'success': True, 'format': fmt, 'raw': raw, 'parsed': parsed,
-                              'comments': comments, 'filename': os.path.basename(abs_path)})
-
-
-async def handle_save_config(request: web.Request):
-    body = await request.json()
-    content = body.get('content')
-    fmt = body.get('format', 'raw')
-    if not body.get('path', '') or content is None:
-        return web.json_response({'success': False, 'message': '缺少参数'}, status=400)
-    abs_path, err = validate_config_path(body['path'])
-    if err:
-        return err
-    if fmt == 'yaml':
-        try:
-            parsed = yaml.safe_load(content)
-        except Exception as e:
-            return web.json_response({'success': False, 'message': f'YAML 格式错误: {e}'}, status=400)
-        if isinstance(parsed, dict) and os.path.isfile(abs_path):
-            with contextlib.suppress(Exception):
-                with open(abs_path, encoding='utf-8') as f:
-                    old_comments = _extract_yaml_comments(f.read())
-                if old_comments:
-                    content = '\n'.join(_rebuild_yaml(parsed, old_comments)) + '\n'
-    elif fmt == 'json':
-        try:
-            content = json.dumps(json.loads(content), ensure_ascii=False, indent=2)
-        except Exception as e:
-            return web.json_response({'success': False, 'message': f'JSON 格式错误: {e}'}, status=400)
-    if os.path.isfile(abs_path):
-        shutil.copy2(abs_path, abs_path + '.backup')
-    with open(abs_path, 'w', encoding='utf-8') as f:
-        f.write(content)
-
-    reloaded = ''
-    mdir = os.path.abspath(modules_dir())
-    if abs_path.startswith(mdir):
-        mm = get_mm()
-        if mm:
-            mod_name = os.path.relpath(abs_path, mdir).split(os.sep)[0]
-            if mm.is_enabled(mod_name):
-                with contextlib.suppress(Exception):
-                    await mm.reload(mod_name)
-                    reloaded = mod_name
-    return web.json_response({'success': True, 'message': f'配置已保存, 模块 {reloaded} 已重载' if reloaded else '配置已保存'})

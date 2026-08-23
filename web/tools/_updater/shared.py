@@ -4,14 +4,14 @@ import json
 import logging
 import os
 
-log = logging.getLogger('ElainaBot.web.updater')
+log = logging.getLogger('ElainaQQ.web.updater')
 
-GITHUB_REPO = 'ElainaCore/ElainaBot-Onebot'
+GITHUB_REPO = 'ElainaCore/Elaina_QQBot'
 GITHUB_API_URL = f'https://api.github.com/repos/{GITHUB_REPO}'
 GITHUB_DOWNLOAD_URL = f'https://github.com/{GITHUB_REPO}/archive/main.zip'
 GITHUB_SHA_URL = f'https://codeload.github.com/{GITHUB_REPO}/zip/{{version}}'
 
-# GitHub API 代理 (能代理 api.github.com 请求)
+# 代码托管接口代理（可代理接口请求）
 GITHUB_API_MIRRORS = [
     f'https://api.github.com/repos/{GITHUB_REPO}',  # 直连
     f'https://ghproxy.cc/https://api.github.com/repos/{GITHUB_REPO}',

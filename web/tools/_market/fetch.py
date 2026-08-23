@@ -1,4 +1,4 @@
-"""插件市场 — GitHub 下载, 镜像排名"""
+"""插件市场的索引读取、镜像重试与文件下载。"""
 
 import json
 import time
@@ -13,18 +13,60 @@ from web.tools._market.shared import (
 _plugin_cache = None  # 缓存的插件列表
 _plugin_cache_ts = 0
 _PLUGIN_CACHE_TTL = 10 * 60  # 10 分钟
+_MAX_JSON_SIZE = 2 * 1024 * 1024
+_MAX_DOWNLOAD_SIZE = 128 * 1024 * 1024
+_REQUEST_HEADERS = {'User-Agent': 'ElainaQQ/1.0'}
 
 
-async def _try_fetch_json(session, urls, headers, timeout):
-    """依次尝试 URL 列表下载 JSON, 成功返回解析结果, 全部失败返回 None"""
+async def _read_limited(response, limit):
+    declared = int(response.headers.get('content-length', 0) or 0)
+    if declared > limit:
+        raise ValueError(f'下载内容超过 {limit // 1024 // 1024} MB 限制')
+    chunks = []
+    size = 0
+    async for chunk in response.content.iter_chunked(256 * 1024):
+        size += len(chunk)
+        if size > limit:
+            raise ValueError(f'下载内容超过 {limit // 1024 // 1024} MB 限制')
+        chunks.append(chunk)
+    return b''.join(chunks)
+
+
+async def _try_fetch_json(session, urls, timeout):
+    """依次尝试候选地址，返回首个有效的 JSON 数据。"""
     for url in urls:
         try:
-            async with session.get(url, headers=headers, timeout=timeout, ssl=False, allow_redirects=True) as resp:
+            async with session.get(url, timeout=timeout, allow_redirects=True) as resp:
                 if resp.status == 200:
-                    body = await resp.read()
-                    if body[:1] in (b'[', b'{'):
-                        return json.loads(body)
-        except Exception:
+                    body = await _read_limited(resp, _MAX_JSON_SIZE)
+                    if body.lstrip()[:1] in (b'[', b'{'):
+                        data = json.loads(body)
+                        if isinstance(data, (dict, list)):
+                            return data
+        except (
+            _aiohttp.ClientError,
+            TimeoutError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            ValueError,
+        ):
+            continue
+    return None
+
+
+async def _try_download(session, urls, timeout):
+    """依次下载候选地址，返回首个成功响应的内容。"""
+    request_timeout = _aiohttp.ClientTimeout(total=timeout)
+    for url in urls:
+        try:
+            async with session.get(
+                url,
+                timeout=request_timeout,
+                allow_redirects=True,
+            ) as response:
+                if response.status == 200:
+                    return await _read_limited(response, _MAX_DOWNLOAD_SIZE)
+        except (_aiohttp.ClientError, TimeoutError, ValueError):
             continue
     return None
 
@@ -37,16 +79,14 @@ async def _fetch_plugin_json(force=False):
         return _plugin_cache
 
     raw_url = f'https://raw.githubusercontent.com/{PLUGIN_REPO}/main/onebot_plugins.json'
-    headers = {'User-Agent': 'ElainaBot/1.0'}
     timeout = _aiohttp.ClientTimeout(total=10)
-    async with _aiohttp.ClientSession() as session:
-        data = await _try_fetch_json(session, _ranked_mirror_urls(raw_url), headers, timeout)
-    if not data:
-        from web.tools._updater.mirror import get_fast_mirrors
+    async with _aiohttp.ClientSession(headers=_REQUEST_HEADERS) as session:
+        data = await _try_fetch_json(session, _ranked_mirror_urls(raw_url), timeout)
+        if not data:
+            from web.tools._updater.mirror import get_fast_mirrors
 
-        await get_fast_mirrors(force=True)
-        async with _aiohttp.ClientSession() as session:
-            data = await _try_fetch_json(session, _ranked_mirror_urls(raw_url), headers, timeout)
+            await get_fast_mirrors(force=True)
+            data = await _try_fetch_json(session, _ranked_mirror_urls(raw_url), timeout)
     if data:
         _plugin_cache, _plugin_cache_ts = data, now
     return data
@@ -61,44 +101,23 @@ async def _download_file(url, timeout=60, mirror=None):
         urls = [_build_mirror_url(url, mirror)] + _ranked_mirror_urls(url)
     else:
         urls = _ranked_mirror_urls(url) if is_gh else [url]
-    async with _aiohttp.ClientSession() as session:
-        for u in urls:
-            try:
-                async with session.get(
-                    u,
-                    timeout=_aiohttp.ClientTimeout(total=timeout),
-                    ssl=False,
-                    allow_redirects=True,
-                    headers={'User-Agent': 'ElainaBot/1.0'},
-                ) as resp:
-                    if resp.status == 200:
-                        return await resp.read()
-            except Exception:
-                continue
-    # 全失败 → 重新测速后再试
-    if is_gh:
+    async with _aiohttp.ClientSession(headers=_REQUEST_HEADERS) as session:
+        content = await _try_download(session, urls, timeout)
+        if content is not None or not is_gh:
+            return content
+
+        # 首轮全部失败后刷新镜像测速，并复用当前连接池再次尝试。
         from web.tools._updater.mirror import get_fast_mirrors
 
         await get_fast_mirrors(force=True)
-        for u in _ranked_mirror_urls(url):
-            try:
-                async with (
-                    _aiohttp.ClientSession() as session,
-                    session.get(
-                        u,
-                        timeout=_aiohttp.ClientTimeout(total=timeout),
-                        ssl=False,
-                        allow_redirects=True,
-                        headers={'User-Agent': 'ElainaBot/1.0'},
-                    ) as resp,
-                ):
-                    if resp.status == 200:
-                        return await resp.read()
-            except Exception:
-                continue
-    return None
+        return await _try_download(session, _ranked_mirror_urls(url), timeout)
 
 
 def _extract_plugins(data):
-    """从缓存数据提取插件列表 (兼容 list 和 dict 格式)"""
-    return data if isinstance(data, list) else data.get('plugins', [])
+    """从缓存数据提取插件列表，兼容列表和对象两种格式。"""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        plugins = data.get('plugins', [])
+        return plugins if isinstance(plugins, list) else []
+    return []

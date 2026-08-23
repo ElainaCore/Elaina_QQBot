@@ -1,15 +1,18 @@
-"""Application — 顶层编排, 组合所有子系统"""
+"""应用程序顶层编排，组合所有子系统。"""
 
 import asyncio
 import contextlib
 import datetime
+import gc
 import json
 import os
 import signal
 
+from core.base.branding import PRODUCT_NAME
 from core.base.config import cfg
 from core.base.logger import SYSTEM, get_logger
 from core.base.logger import setup as setup_logger
+from core.embedded_qq import EmbeddedQQManager
 from core.module.hook import HookManager
 from core.module.manager import ModuleManager
 from core.onebot.adapter import OneBotAdapter
@@ -30,8 +33,16 @@ def get_app():
     return _app
 
 
+def _tune_gc() -> None:
+    """冻结启动期稳定对象并降低全量回收频率。"""
+    gc.collect()
+    with contextlib.suppress(AttributeError):
+        gc.freeze()
+    gc.set_threshold(50_000, 25, 25)
+
+
 class Application:
-    """ElainaBot OneBot 应用入口"""
+    """ElainaQQ 应用入口。"""
 
     def __init__(self):
         self._base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -46,6 +57,11 @@ class Application:
         self._stop_event = None
         self._restart_requested = False
         self._web_log_cb = None
+        self._embedded_qq = None
+        self._embedded_qq_start_task = None
+        self._event_queues = []
+        self._event_workers = []
+        self._last_queue_warning = 0.0
 
     @property
     def adapter(self):
@@ -54,6 +70,10 @@ class Application:
     @property
     def connection_manager(self):
         return self._connection_manager
+
+    @property
+    def embedded_qq(self):
+        return self._embedded_qq
 
     async def reload_connections(self):
         """重新应用 OneBot 连接配置 (网络配置页面保存后调用)"""
@@ -85,9 +105,9 @@ class Application:
 
         # 1) 配置
         cfg.init(self._path('config'))
-        fw_name = cfg.get('settings', 'web.framework_name', 'ElainaBot')
+        fw_name = cfg.get('settings', 'web.framework_name', PRODUCT_NAME)
         setup_logger(framework_name=fw_name)
-        log.info(f'{"=" * 5} {fw_name} OneBot 启动中 {"=" * 5}')
+        log.info(f'{"=" * 5} {fw_name} 启动中 {"=" * 5}')
 
         # 2) OneBot 适配器 (每条连接自带 token/secret, 无需全局配置)
         self._adapter = OneBotAdapter()
@@ -111,6 +131,10 @@ class Application:
         await self._plugin_manager.load_all()
         self._plugin_manager.start_watcher()
 
+        # 有界队列可避免慢插件在多账号突发消息时无限创建任务。
+        self._event_queues = [asyncio.Queue(maxsize=250) for _ in range(4)]
+        self._event_workers = [asyncio.create_task(self._event_worker(queue), name=f'event-worker-{index}') for index, queue in enumerate(self._event_queues)]
+
         # 6) 日志服务
         log_base = self._path('data', cfg.get('settings', 'logging.dir', 'log'))
         log_cfg = cfg.get('settings', 'logging') or {}
@@ -132,9 +156,18 @@ class Application:
         self._connection_manager = ConnectionManager(self)
         await self._connection_manager.start()
 
+        # 8.6) 内置 QQ 运行时。关闭时由 shutdown 统一回收。
+        self._embedded_qq = EmbeddedQQManager(self)
+        if self._embedded_qq.enabled:
+            log.info('内置 QQ 运行时已启用')
+            self._embedded_qq_start_task = asyncio.create_task(self._embedded_qq.start_enabled(), name='embedded-qq-autostart')
+            self._embedded_qq_start_task.add_done_callback(self._report_embedded_start_failure)
+
         # 9) 配置监视
         self._config_watcher = ConfigWatcherService(interval=5.0)
         self._config_watcher.start()
+
+        _tune_gc()
 
         log.info(f'启动完成: {len(self._plugin_manager._plugins)} 个插件, {self._plugin_manager.handler_count} 个处理器')
 
@@ -168,17 +201,53 @@ class Application:
         log.info('正在关闭...')
         if self._plugin_manager:
             self._plugin_manager.stop_watcher()
-        if self._connection_manager:
-            await self._connection_manager.stop()
         if self._config_watcher:
             self._config_watcher.stop()
-        if self._module_manager:
-            await self._module_manager.shutdown()
-        if self._log_service:
-            await self._log_service.shutdown()
+
+        # 尽早释放主监听端口，避免重启后的新进程绑定失败。
         if self._http_server:
-            await self._http_server.stop()
+            await self._shutdown_step('HTTP 服务', self._http_server.stop(), timeout=5)
+        if self._connection_manager:
+            await self._shutdown_step('OneBot 连接', self._connection_manager.stop(), timeout=8)
+        if self._adapter:
+            await self._shutdown_step('OneBot 网络会话', self._adapter.close(), timeout=5)
+        if self._embedded_qq_start_task and not self._embedded_qq_start_task.done():
+            self._embedded_qq_start_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._embedded_qq_start_task
+        if self._embedded_qq:
+            await self._shutdown_step('内置 QQ 进程', self._embedded_qq.stop_all(), timeout=20)
+        for task in self._event_workers:
+            task.cancel()
+        if self._event_workers:
+            await asyncio.gather(*self._event_workers, return_exceptions=True)
+            self._event_workers.clear()
+        if self._plugin_manager:
+            await self._shutdown_step('插件管理器', self._plugin_manager.shutdown(), timeout=10)
+        if self._module_manager:
+            await self._shutdown_step('模块管理器', self._module_manager.shutdown(), timeout=10)
+        if self._log_service:
+            await self._shutdown_step('日志服务', self._log_service.shutdown(), timeout=10)
         log.info('已关闭')
+
+    @staticmethod
+    async def _shutdown_step(name: str, operation, timeout: float) -> None:
+        """限时关闭单个子系统，避免一个组件阻塞整体重启。"""
+        try:
+            async with asyncio.timeout(timeout):
+                await operation
+        except TimeoutError:
+            log.warning('%s 关闭超时（%.0f 秒），继续回收其他资源', name, timeout)
+        except Exception as error:
+            log.warning('%s 关闭失败: %s', name, error)
+
+    @staticmethod
+    def _report_embedded_start_failure(task):
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error:
+            log.error('内置 QQ 自动启动任务失败: %s', error, exc_info=error)
 
     async def process_event(self, event):
         """处理 OneBot 事件 (异步分发)"""
@@ -186,24 +255,53 @@ class Application:
             return
 
         # 注入 API 引用, 使插件可通过 event.reply() 调用
-        from core.onebot.api import get_api
+        from core.onebot.api import get_api, routed_self_id
+
         event._api = get_api()
 
-        # Hook: on_raw_event
-        await self._hook_manager.emit('on_raw_event', event)
+        # 同一事件链中的 API 调用始终回到产生事件的 QQ，避免多账号串号。
+        with routed_self_id(str(event.self_id or '')):
+            await self._hook_manager.emit('on_raw_event', event)
+            await self._log_event(event)
+            await self._plugin_manager.dispatch(event)
 
-        # 日志记录
-        await self._log_event(event)
+    def submit_event(self, event) -> bool:
+        """事件入队，并通过容量上限约束生产者的内存占用。"""
+        if isinstance(event, MetaEvent):
+            return True
+        if not self._event_queues:
+            return False
+        self_id = str(getattr(event, 'self_id', '') or '')
+        queue_index = sum(self_id.encode('utf-8')) % len(self._event_queues) if self_id else 0
+        queue = self._event_queues[queue_index]
+        try:
+            queue.put_nowait(event)
+            return True
+        except asyncio.QueueFull:
+            now = asyncio.get_running_loop().time()
+            if now - self._last_queue_warning >= 10:
+                self._last_queue_warning = now
+                log.warning('事件队列已满，丢弃新事件以保护框架内存')
+            return False
 
-        # 异步分发到插件 (消息事件 + 通知/请求事件)
-        await self._plugin_manager.dispatch(event)
+    async def _event_worker(self, queue):
+        while True:
+            event = await queue.get()
+            try:
+                await self.process_event(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                log.error('事件处理失败: %s', error, exc_info=error)
+            finally:
+                queue.task_done()
 
     async def _log_event(self, event):
         """记录事件日志"""
         if isinstance(event, MessageEvent):
-            msg_type = "群聊" if event.is_group else "私聊"
+            msg_type = '群聊' if event.is_group else '私聊'
             sender = event.sender_card or event.sender_nickname or str(event.user_id)
-            location = f"群({event.group_id})" if event.is_group else f"私聊({event.user_id})"
+            location = f'群({event.group_id})' if event.is_group else f'私聊({event.user_id})'
 
             parts = []
             for seg in event.message:
@@ -213,7 +311,7 @@ class Application:
                 if t == 'text':
                     parts.append(d.get('text', '').strip())
                 elif t == 'at':
-                    parts.append(f"@{d.get('qq', '')}")
+                    parts.append(f'@{d.get("qq", "")}')
                 elif t == 'image':
                     parts.append('[图片]')
                 elif t == 'face':
@@ -227,72 +325,84 @@ class Application:
                 else:
                     parts.append(f'[{t}]')
 
-            content = ''.join(parts) or "[空消息]"
-            display = content[:100] + "..." if len(content) > 100 else content
+            content = ''.join(parts) or '[空消息]'
+            display = content[:100] + '...' if len(content) > 100 else content
             # 消息内容属于「消息记录」(按 QQ 分库), 不应混入「框架日志」: web_skip=True
-            log.info(f'[{event.self_id}] {msg_type} | {location} | {sender}: {display}',
-                     extra={'web_skip': True})
+            log.info(f'[{event.self_id}] {msg_type} | {location} | {sender}: {display}', extra={'web_skip': True})
 
             # 写入 SQLite
             if self._log_service:
                 nickname = ''
                 if isinstance(event.sender, dict):
                     nickname = event.sender.get('card') or event.sender.get('nickname') or ''
-                await self._log_service.add('message', {
-                    'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'content': content,
-                    'source': str(event.self_id or ''),
-                    'user_id': str(event.user_id),
-                    'group_id': str(event.group_id or ''),
-                    'message_id': str(event.message_id),
-                    'message_type': event.message_type,
-                    'raw_data': json.dumps(event.raw_data, ensure_ascii=False),
-                    'extra': json.dumps({'nickname': nickname}, ensure_ascii=False),
-                }, bot_qq=str(event.self_id or ''))
+                await self._log_service.add(
+                    'message',
+                    {
+                        'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'content': content,
+                        'source': str(event.self_id or ''),
+                        'user_id': str(event.user_id),
+                        'group_id': str(event.group_id or ''),
+                        'message_id': str(event.message_id),
+                        'message_type': event.message_type,
+                        'raw_data': json.dumps(event.raw_data, ensure_ascii=False),
+                        'extra': json.dumps({'nickname': nickname}, ensure_ascii=False),
+                    },
+                    bot_qq=str(event.self_id or ''),
+                )
 
             # 推送到 Web 面板
             if self._web_log_cb:
-                self._web_log_cb('message', {
-                    'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'content': content,
-                    'user_id': str(event.user_id),
-                    'group_id': str(event.group_id or ''),
-                    'message_id': str(event.message_id),
-                    'message_type': event.message_type,
-                    'sender': sender,
-                    'bot_qq': str(event.self_id or ''),
-                    'direction': 'receive',
-                    'raw_message': json.dumps(event.raw_data, ensure_ascii=False),
-                })
+                self._web_log_cb(
+                    'message',
+                    {
+                        'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'content': content,
+                        'user_id': str(event.user_id),
+                        'group_id': str(event.group_id or ''),
+                        'message_id': str(event.message_id),
+                        'message_type': event.message_type,
+                        'sender': sender,
+                        'bot_qq': str(event.self_id or ''),
+                        'direction': 'receive',
+                        'raw_message': json.dumps(event.raw_data, ensure_ascii=False),
+                    },
+                )
 
         elif isinstance(event, NoticeEvent):
             # 通知事件不进「框架」日志(避免刷屏), 改为持久化 + 实时推送到「事件」面板
-            log.debug(f'通知: {event.notice_type} | 群 {event.group_id} | 用户 {event.user_id}',
-                      extra={'web_skip': True})
+            log.debug(f'通知: {event.notice_type} | 群 {event.group_id} | 用户 {event.user_id}', extra={'web_skip': True})
             now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             bot_qq = str(event.self_id or '')
             raw_json = json.dumps(event.raw_data, ensure_ascii=False)
             content = f'{event.notice_type} | 群{event.group_id or ""} | 用户{event.user_id}'
             if self._log_service:
-                await self._log_service.add('lifecycle', {
-                    'timestamp': now,
-                    'content': content,
-                    'source': bot_qq,
-                    'user_id': str(event.user_id or ''),
-                    'group_id': str(event.group_id or ''),
-                    'message_type': event.notice_type,
-                    'raw_data': raw_json,
-                }, bot_qq=bot_qq)
+                await self._log_service.add(
+                    'lifecycle',
+                    {
+                        'timestamp': now,
+                        'content': content,
+                        'source': bot_qq,
+                        'user_id': str(event.user_id or ''),
+                        'group_id': str(event.group_id or ''),
+                        'message_type': event.notice_type,
+                        'raw_data': raw_json,
+                    },
+                    bot_qq=bot_qq,
+                )
             if self._web_log_cb:
-                self._web_log_cb('lifecycle', {
-                    'timestamp': now,
-                    'type': event.notice_type,
-                    'user_id': str(event.user_id or ''),
-                    'group_id': str(event.group_id or ''),
-                    'bot_qq': bot_qq,
-                    'content': content,
-                    'raw_message': raw_json,
-                })
+                self._web_log_cb(
+                    'lifecycle',
+                    {
+                        'timestamp': now,
+                        'type': event.notice_type,
+                        'user_id': str(event.user_id or ''),
+                        'group_id': str(event.group_id or ''),
+                        'bot_qq': bot_qq,
+                        'content': content,
+                        'raw_message': raw_json,
+                    },
+                )
             # 撤回事件：标记对应消息为已撤回
             if self._log_service and event.notice_type in ('group_recall', 'friend_recall'):
                 recalled_mid = str(event.raw_data.get('message_id', '') or '')

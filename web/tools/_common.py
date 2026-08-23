@@ -39,6 +39,15 @@ def connected_ids() -> list:
     return sorted(ids)
 
 
+def bot_ids() -> list:
+    """返回已连接账号与内置账号编号，供面板查询使用。"""
+    ids = set(connected_ids())
+    manager = getattr(_app, 'embedded_qq', None)
+    if manager:
+        ids.update(str(bot.uin or bot.bot_id) for bot in manager.bots.values())
+    return sorted(item for item in ids if item)
+
+
 def primary_bot_qq() -> str:
     """当前主要连接的机器人 QQ (用于按 QQ 分库的消息/事件记录)"""
     ids = connected_ids()

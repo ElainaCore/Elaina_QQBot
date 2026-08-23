@@ -1,7 +1,7 @@
 [project]
-name = "elainabot-onebot"
-version = "1.0.0"
-description = "ElainaBot OneBot - OneBot v11 QQ Bot Framework"
+name = "elainaqq-onebot"
+version = "1.0.1"
+description = "ElainaQQ asynchronous QQ bot framework with OneBot v11 compatibility"
 requires-python = ">=3.11"
 readme = "README.md"
 license = "MIT"

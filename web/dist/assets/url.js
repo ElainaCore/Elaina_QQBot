@@ -1,0 +1,1 @@
+function e(e){let t=String(e||``).trim();if(!t)return``;try{let e=new URL(t,`http://localhost`);return e.protocol===`http:`||e.protocol===`https:`?t:``}catch(e){return``}}function t(t){let n=String(t||``).trim();return n.startsWith(`/`)&&!n.startsWith(`//`)?n:e(n)}export{t as n,e as t};

@@ -16,7 +16,7 @@ class ConfigWatcherService:
         self._interval = interval
         self._running = False
         self._task = None
-        self._mtimes = {}
+        self._mtimes: dict[str, float] = {}
 
     def start(self):
         self._running = True

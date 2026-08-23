@@ -1,4 +1,4 @@
-"""OneBot 连接管理器 — 维护正向/反向 WS 与 HTTP 连接"""
+"""OneBot 正向、反向和 HTTP 连接管理器。"""
 
 import asyncio
 import contextlib
@@ -12,11 +12,12 @@ from aiohttp import web
 
 from core.base.config import cfg
 
-logger = logging.getLogger('ElainaBot.onebot.connection')
+logger = logging.getLogger('ElainaQQ.onebot.connection')
 
 
 class ConnType(StrEnum):
     """OneBot 连接类型"""
+
     WS_REVERSE = 'ws_reverse'
     WS_FORWARD = 'ws_forward'
     HTTP_SERVER = 'http_server'
@@ -54,12 +55,13 @@ class ConnectionManager:
         self._app = app
         self._adapter = app.adapter
         self._loop = None
-        self._tasks = {}      # name -> asyncio.Task (正向 WS)
-        self._status = {}     # name -> {connected, self_id, error}
-        self._forward_ids = set()  # 正向连接占用的 self_id (含临时 id)
+        self._tasks = {}  # 连接名称映射到正向连接任务
+        self._status = {}  # 连接名称映射到运行状态
+        self._forward_ids = set()  # 正向连接占用的账号标识，包含临时标识
         self._configs = []
         self._stopping = False
-        self._sites = {}      # (host, port) -> (runner, site)
+        self._sites = {}  # 监听地址映射到运行器和站点
+        self._client_session: aiohttp.ClientSession | None = None
 
     # ── 配置 ──
     def load_configs(self):
@@ -91,11 +93,13 @@ class ConnectionManager:
         await self._close_reverse_ws()
         await self._cancel_forward_clients()
         await self._stop_listeners()
+        if self._client_session is not None and not self._client_session.closed:
+            await self._client_session.close()
+        self._client_session = None
 
     async def _close_reverse_ws(self):
         """主动关闭已接入的反向 WS, 避免监听端口清理时等待空闲超时"""
-        for sid in [k for k in list(self._adapter.websockets)
-                    if not str(k).startswith('forward:') and k not in self._forward_ids]:
+        for sid in [k for k in list(self._adapter.websockets) if not str(k).startswith('forward:') and k not in self._forward_ids]:
             ws = self._adapter.websockets.get(sid)
             if ws is not None:
                 with contextlib.suppress(Exception):
@@ -142,7 +146,7 @@ class ConnectionManager:
         if not http_server:
             return
         main_host, main_port = self._main_addr()
-        # 按 (host, port) 分组, 同端口可挂多条路径
+        # 按监听地址分组，同一端口可以挂载多条路径。
         groups = {}
         for c in self._configs:
             if not c.get('enable') or c['type'] not in (ConnType.WS_REVERSE, ConnType.HTTP_SERVER):
@@ -150,7 +154,7 @@ class ConnectionManager:
             host = str(c.get('host') or main_host)
             port = int(c.get('port') or main_port)
             if (host, port) == (main_host, main_port):
-                # 主服务端口已内置 /OneBotv11 等路由, 无需重复监听
+                # 主服务端口已内置 OneBot 路由，无需重复监听。
                 self._set_status(c['name'], connected=False, error='', self_id=None)
                 continue
             groups.setdefault((host, port), []).append(c)
@@ -166,7 +170,7 @@ class ConnectionManager:
                         if key not in seen:
                             app.router.add_get(path, http_server._handle_onebot_ws)
                             seen.add(key)
-                    else:  # http_server
+                    else:  # HTTP 上报服务
                         key = ('POST', path)
                         if key not in seen:
                             app.router.add_post(path, http_server._handle_onebot_http)
@@ -221,23 +225,21 @@ class ConnectionManager:
         while not self._stopping:
             conn['_self_id'] = None
             probe_task = None
+            active_ws = None
             try:
                 self._set_status(name, connected=False, error='连接中…')
-                timeout = aiohttp.ClientTimeout(total=None, sock_connect=10)
-                async with (
-                    aiohttp.ClientSession(timeout=timeout) as session,
-                    session.ws_connect(url, headers=headers, heartbeat=30) as ws,
-                ):
+                session = await self._get_client_session()
+                async with session.ws_connect(url, headers=headers, heartbeat=30) as ws:
+                    active_ws = ws
                     self._adapter.register_bot(temp_id, ws)
                     conn['_self_id'] = temp_id
                     self._forward_ids.add(temp_id)
                     self._set_status(name, connected=True, error='', self_id=temp_id)
                     logger.info(f'正向 WS 已连接: {name} -> {url}')
-                    # 主动探测真实 self_id, 即便事件经其它通道(HTTP)上报也能正确归属
+                    # 主动探测真实账号，即使事件从其他通道上报也能正确归属。
                     probe_task = asyncio.create_task(self._probe_self_id(conn, ws))
                     await self._consume(ws, conn)
             except asyncio.CancelledError:
-                self._cleanup_forward(conn)
                 self._set_status(name, connected=False, error='已停止')
                 raise
             except Exception as e:
@@ -246,13 +248,25 @@ class ConnectionManager:
             finally:
                 if probe_task:
                     probe_task.cancel()
-            self._cleanup_forward(conn)
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await probe_task
+                self._cleanup_forward(conn, active_ws)
             if self._stopping:
                 break
             await asyncio.sleep(interval)
 
+    async def _get_client_session(self) -> aiohttp.ClientSession:
+        """复用正向 WebSocket 客户端会话，降低断线重连时的建连开销。"""
+        if self._client_session is None or self._client_session.closed:
+            self._client_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None, sock_connect=10),
+                connector=aiohttp.TCPConnector(limit=32, limit_per_host=16, ttl_dns_cache=300),
+                headers={'User-Agent': 'ElainaQQ/1.0'},
+            )
+        return self._client_session
+
     async def _probe_self_id(self, conn, ws):
-        """连接后调用 get_login_info 获取真实 QQ 并 rekey"""
+        """连接后查询登录信息，并将临时标识替换为真实账号。"""
         adapter = self._adapter
         echo = f'probe:{conn["name"]}:{uuid.uuid4().hex[:8]}'
         fut = self._loop.create_future()
@@ -266,8 +280,12 @@ class ConnectionManager:
             if uid and conn.get('_self_id') != uid:
                 self._rekey_forward(conn, uid, ws)
                 self._set_status(conn['name'], connected=True, error='', self_id=uid)
-        except Exception:
-            adapter.api_responses.pop(echo, None)
+        except (TimeoutError, aiohttp.ClientError, TypeError, ValueError):
+            pass
+        finally:
+            pending = adapter.api_responses.pop(echo, None)
+            if pending is not None and not pending.done():
+                pending.cancel()
 
     async def _consume(self, ws, conn):
         adapter = self._adapter
@@ -275,7 +293,9 @@ class ConnectionManager:
             if msg.type == aiohttp.WSMsgType.TEXT:
                 try:
                     data = json.loads(msg.data)
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(data, dict):
                     continue
                 echo = data.get('echo')
                 if echo and echo in adapter.api_responses:
@@ -290,23 +310,23 @@ class ConnectionManager:
                 if sid and conn.get('_self_id') != sid:
                     self._rekey_forward(conn, sid, ws)
                     self._set_status(conn['name'], connected=True, error='', self_id=sid)
-                asyncio.create_task(self._app.process_event(event))
+                self._app.submit_event(event)
             elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
                 break
 
     def _rekey_forward(self, conn, real_id, ws):
         old = conn.get('_self_id')
         if old and old != real_id:
-            self._adapter.unregister_bot(old)
+            self._adapter.unregister_bot(old, ws)
             self._forward_ids.discard(old)
         self._adapter.register_bot(real_id, ws)
         self._forward_ids.add(real_id)
         conn['_self_id'] = real_id
 
-    def _cleanup_forward(self, conn):
+    def _cleanup_forward(self, conn, ws=None):
         sid = conn.get('_self_id')
         if sid:
-            self._adapter.unregister_bot(sid)
+            self._adapter.unregister_bot(sid, ws)
             self._forward_ids.discard(sid)
         conn['_self_id'] = None
 
@@ -327,9 +347,8 @@ class ConnectionManager:
                 entry['self_id'] = st.get('self_id')
                 entry['error'] = st.get('error', '')
             elif ctype == ConnType.WS_REVERSE:
-                # 排除正向连接占用的 self_id, 仅统计真正连入的反向连接
-                reverse_ids = [k for k in self._adapter.websockets
-                               if not str(k).startswith('forward:') and k not in self._forward_ids]
+                # 排除正向连接占用的账号标识，只统计真正接入的反向连接。
+                reverse_ids = [k for k in self._adapter.websockets if not str(k).startswith('forward:') and k not in self._forward_ids]
                 entry['connected'] = c.get('enable', False) and bool(reverse_ids)
                 entry['self_id'] = reverse_ids[0] if reverse_ids else None
                 entry['error'] = self._status.get(name, {}).get('error', '')

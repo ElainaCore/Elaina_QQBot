@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-_registry: dict = {}  # {key: page_info}
+_registry: dict = {}  # 页面标识映射到页面信息
 
 
 def register_page(
@@ -55,7 +55,7 @@ def get_page_html(key: str) -> str | None:
 
 
 # 自定义 HTTP 路由 (挂 /api/ext/ 前缀, 查表执行, 热重载即时生效; auth=False 开放免验证)
-_routes: dict = {}  # {(METHOD, path): route_info}
+_routes: dict = {}  # 请求方法和路径映射到路由信息
 _ROUTE_PREFIX = '/api/ext/'
 
 

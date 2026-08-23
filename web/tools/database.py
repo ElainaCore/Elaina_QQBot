@@ -7,7 +7,10 @@ import sqlite3
 
 from aiohttp import web
 
-log = logging.getLogger('ElainaBot.web.database')
+from core.base.zipsafe import is_within
+from web.protocol import json_body
+
+log = logging.getLogger('ElainaQQ.web.database')
 
 _app = None
 _base_dir = ''
@@ -44,20 +47,22 @@ def _collect(result, directory, label):
     for f in sorted(os.listdir(directory)):
         fpath = os.path.join(directory, f)
         if f.endswith('.db') and os.path.isfile(fpath):
-            result.append({
-                'bot_qq': label or 'log',
-                'label': label or '全局日志',
-                'name': f,
-                'path': fpath.replace('\\', '/'),
-                'size': os.path.getsize(fpath),
-                'date': label if re.match(r'^\d{4}-\d{2}-\d{2}$', label) else '',
-            })
+            result.append(
+                {
+                    'bot_qq': label or 'log',
+                    'label': label or '全局日志',
+                    'name': f,
+                    'path': fpath.replace('\\', '/'),
+                    'size': os.path.getsize(fpath),
+                    'date': label if re.match(r'^\d{4}-\d{2}-\d{2}$', label) else '',
+                }
+            )
 
 
 def _validate_db_path(db_path):
     base = os.path.abspath(_log_base_dir())
     abs_path = os.path.abspath(db_path)
-    if not abs_path.startswith(base) or not abs_path.endswith('.db') or not os.path.isfile(abs_path):
+    if not is_within(base, abs_path) or not abs_path.endswith('.db') or not os.path.isfile(abs_path):
         return False, ''
     return True, abs_path
 
@@ -77,7 +82,7 @@ async def handle_list_databases(request: web.Request):
 
 
 async def handle_list_tables(request: web.Request):
-    body = await request.json()
+    body = await json_body(request)
     db_path = body.get('path', '')
     if not db_path:
         return web.json_response({'success': False, 'message': '缺少 path'}, status=400)
@@ -90,8 +95,10 @@ async def handle_list_tables(request: web.Request):
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"):
             tname = row['name']
             count = conn.execute(f'SELECT COUNT(*) AS c FROM "{tname}"').fetchone()['c']
-            columns = [{'name': c['name'], 'type': c['type'], 'notnull': bool(c['notnull']), 'pk': bool(c['pk'])}
-                       for c in conn.execute(f'PRAGMA table_info("{tname}")')]
+            columns = [
+                {'name': c['name'], 'type': c['type'], 'notnull': bool(c['notnull']), 'pk': bool(c['pk'])}
+                for c in conn.execute(f'PRAGMA table_info("{tname}")')
+            ]
             tables.append({'name': tname, 'count': count, 'columns': columns})
         conn.close()
         return web.json_response({'success': True, 'tables': tables})
@@ -100,7 +107,7 @@ async def handle_list_tables(request: web.Request):
 
 
 async def handle_query_table(request: web.Request):
-    body = await request.json()
+    body = await json_body(request)
     db_path = body.get('path', '')
     table = body.get('table', '')
     page = max(1, int(body.get('page', 1)))
@@ -130,15 +137,14 @@ async def handle_query_table(request: web.Request):
         data = [dict(r) for r in rows]
         columns = [{'name': c['name'], 'type': c['type']} for c in conn.execute(f'PRAGMA table_info("{table}")')]
         conn.close()
-        return web.json_response({'success': True, 'data': data, 'columns': columns,
-                                  'total': total, 'page': page, 'page_size': page_size})
+        return web.json_response({'success': True, 'data': data, 'columns': columns, 'total': total, 'page': page, 'page_size': page_size})
     except Exception as e:
         log.warning(f'查询表失败: {e}')
         return web.json_response({'success': False, 'message': str(e)}, status=500)
 
 
 async def handle_execute_sql(request: web.Request):
-    body = await request.json()
+    body = await json_body(request)
     db_path = body.get('path', '')
     sql = (body.get('sql', '') or '').strip()
     if not db_path or not sql:
@@ -173,7 +179,7 @@ async def handle_execute_sql(request: web.Request):
 
 
 async def handle_delete_rows(request: web.Request):
-    body = await request.json()
+    body = await json_body(request)
     db_path = body.get('path', '')
     table = body.get('table', '')
     rowids = body.get('rowids', [])

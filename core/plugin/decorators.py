@@ -1,4 +1,4 @@
-"""插件装饰器: handler / on_load / on_unload / interceptor"""
+"""插件装饰器: handler / interceptor / handler_filter / api_interceptor / 生命周期钩子。"""
 
 import asyncio
 import re
@@ -8,6 +8,8 @@ _pending_handlers: list = []
 _pending_on_load: list = []
 _pending_on_unload: list = []
 _pending_interceptors: list = []
+_pending_handler_filters: list = []
+_pending_api_interceptors: list = []
 
 
 def handler(
@@ -65,6 +67,38 @@ def interceptor(priority=100):
 
     def decorator(func):
         _pending_interceptors.append(
+            {
+                'func': func,
+                'is_coro': asyncio.iscoroutinefunction(func),
+                'priority': priority,
+            }
+        )
+        return func
+
+    return decorator
+
+
+def handler_filter(priority=100):
+    """注册目标插件处理器过滤器；返回 True 跳过该目标插件。"""
+
+    def decorator(func):
+        _pending_handler_filters.append(
+            {
+                'func': func,
+                'is_coro': asyncio.iscoroutinefunction(func),
+                'priority': priority,
+            }
+        )
+        return func
+
+    return decorator
+
+
+def api_interceptor(priority=100):
+    """注册出站 OneBot API 中间件。"""
+
+    def decorator(func):
+        _pending_api_interceptors.append(
             {
                 'func': func,
                 'is_coro': asyncio.iscoroutinefunction(func),

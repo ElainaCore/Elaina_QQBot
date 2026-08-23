@@ -1,23 +1,39 @@
 # ===== 框架全局设置 =====
 # 修改后自动热加载，无需重启
 
-# HTTP 服务器
+# 网页服务器
 server:
   host: "0.0.0.0"
   port: 5201
 
-# Web 面板
+# 管理面板
 web:
-  access_token: "admin"                    # URL 参数验证令牌
   admin_password: "admin"                  # 管理员密码
   trust_forwarded_headers: false           # 是否信任 X-Forwarded-For/X-Real-IP (仅在可信反向代理后开启, 直连开启会导致封禁被伪造头绕过)
-  framework_name: "Elaina"                 # 框架名称
+  framework_name: "ElainaQQ"              # 产品名称
   favicon_url: ""                          # 网页图标 URL
 
 # 主人配置
 owner:
   ids:                                     # 主人 QQ 号列表
     - ""
+
+# 内置 QQ 运行时
+# 框架直接启动 QQNT，并为每个账号隔离数据目录
+# 启用后，可直接在 Web 面板创建机器人并扫码登录
+embedded_qq:
+  enabled: true                                # 启用内置 QQ
+  bridge_port_start: 30010                     # 本机账号桥接端口起点，后续账号依次递增
+  command: ""                                  # 可选兼容启动命令；留空使用内置启动器
+  qq_path: ""                                  # QQ.exe/qq 路径，留空自动探测
+  bridge_entry: ""                             # 可选兼容运行时入口；留空使用内置运行时
+  data_dir: "data/qq"                          # QQ 客户端、安装包和各账号数据统一目录
+  headless: true                                # 是否以无界面模式启动 QQ
+  single_process: false                         # Windows 可选：合并 Chromium 子进程
+  rss_target_mb: 400                            # Linux 单账号 RSS 目标；0 表示仅回收文件页
+  swap_reclaim: true                            # QQ 在线且 Swap 充足时换出匿名闲置页
+  cgroup_helper: "/usr/local/sbin/elainaqq-cgroup"  # Linux 可选：受限 cgroup 辅助程序
+  accounts: []                                  # 可选：启动时自动恢复的账号配置
 
 # 日志配置
 logging:
@@ -31,7 +47,7 @@ pip:
   auto_install: true                       # 自动安装模块/插件依赖
   mirror: ""                               # pip 镜像源
 
-# AI 开发助手插件 (plugins/ai_dev)
+# 智能开发助手插件（plugins/ai_dev）
 # 接入 OpenAI 兼容接口, 让 AI 自主编写/修改框架插件并提供 Web 面板 (/ai/)
 ai:
   enabled: true

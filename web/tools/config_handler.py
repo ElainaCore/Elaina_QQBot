@@ -4,6 +4,8 @@ import os
 
 from aiohttp import web
 
+from web.protocol import error, json_body, ok
+
 _base_dir = ''
 _ALLOWED = ('settings',)
 
@@ -25,25 +27,26 @@ async def handle_get_config(request: web.Request):
         if os.path.exists(path):
             with open(path, encoding='utf-8') as f:
                 result[name] = f.read()
-    return web.json_response({'success': True, **result})
+    return ok(**result)
 
 
 async def handle_save_config(request: web.Request):
+    body = await json_body(request)
     try:
-        body = await request.json()
         file_name = body.get('file', '')
         content = body.get('content', '')
         if file_name not in _ALLOWED:
-            return web.json_response({'success': False, 'error': '无效的配置文件名'}, status=400)
+            return error('无效的配置文件名')
         if not content:
-            return web.json_response({'success': False, 'error': '内容不能为空'}, status=400)
+            return error('内容不能为空')
 
         # 校验 YAML 合法
         import yaml
+
         try:
             yaml.safe_load(content)
         except yaml.YAMLError as e:
-            return web.json_response({'success': False, 'error': f'YAML 格式错误: {e}'}, status=400)
+            return error(f'YAML 格式错误: {e}')
 
         cdir = _config_dir()
         path = os.path.join(cdir, f'{file_name}.yaml')
@@ -59,8 +62,9 @@ async def handle_save_config(request: web.Request):
 
         # 触发热重载
         from core.base.config import cfg
+
         cfg.reload(file_name)
 
-        return web.json_response({'success': True, 'message': '配置已保存'})
+        return ok(message='配置已保存')
     except Exception as e:
-        return web.json_response({'success': False, 'error': str(e)}, status=500)
+        return error(str(e), status=500)

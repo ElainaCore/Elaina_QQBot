@@ -24,7 +24,7 @@ class BaseContext:
         os.makedirs(data_dir, exist_ok=True)
         return os.path.join(data_dir, filename) if filename else data_dir
 
-    def ensure_config(self, defaults: dict, comments: dict = None) -> dict:
+    def ensure_config(self, defaults: dict, comments: dict | None = None) -> dict:
         """确保配置文件存在，返回配置字典"""
         config_path = os.path.join(self._root_dir, 'config.yaml')
         if os.path.isfile(config_path):

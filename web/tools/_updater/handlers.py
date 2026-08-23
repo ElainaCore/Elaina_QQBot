@@ -1,14 +1,18 @@
 """框架更新 — 版本检查/更新日志/在线更新/上传更新"""
 
 import asyncio
+import contextlib
 import logging
 import os
+import tempfile
 from datetime import datetime, timedelta, timezone
 from typing import cast
 
 from aiohttp import BodyPartReader, web
 
-log = logging.getLogger('ElainaBot.web.updater')
+from web.protocol import json_body
+
+log = logging.getLogger('ElainaQQ.web.updater')
 
 _base_dir = ''
 _updater = None
@@ -122,7 +126,7 @@ async def handle_get_update_progress(request: web.Request):
 
 async def handle_start_update(request: web.Request):
     try:
-        body = await request.json()
+        body = await json_body(request)
     except Exception:
         body = {}
 
@@ -219,7 +223,7 @@ async def handle_test_mirrors(request: web.Request):
 
 async def handle_set_custom_mirror(request: web.Request):
     try:
-        body = await request.json()
+        body = await json_body(request)
     except Exception:
         body = {}
     mirror = body.get('mirror', '')
@@ -239,23 +243,35 @@ async def handle_upload_update(request: web.Request):
     if not field or field.name != 'file':
         return web.json_response({'success': False, 'message': '缺少文件'}, status=400)
 
-    filename = field.filename or ''
+    filename = os.path.basename((field.filename or '').replace('\\', '/'))
     if not filename.lower().endswith('.zip'):
         return web.json_response({'success': False, 'message': '仅支持 zip 格式'}, status=400)
 
     # 保存到临时文件
     upload_dir = os.path.join(_base_dir, 'data', 'temp_update')
     os.makedirs(upload_dir, exist_ok=True)
-    filepath = os.path.join(upload_dir, filename or 'upload.zip')
+    fd, filepath = tempfile.mkstemp(prefix='upload_', suffix='.zip', dir=upload_dir)
+    os.close(fd)
 
     try:
+        uploaded = 0
+        max_upload = 512 * 1024 * 1024
         with open(filepath, 'wb') as f:
             while True:
                 chunk = await field.read_chunk()
                 if not chunk:
                     break
+                uploaded += len(chunk)
+                if uploaded > max_upload:
+                    raise ValueError('更新包超过 512 MB 限制')
                 f.write(chunk)
+    except ValueError as e:
+        with contextlib.suppress(OSError):
+            os.remove(filepath)
+        return web.json_response({'success': False, 'message': str(e)}, status=413)
     except Exception as e:
+        with contextlib.suppress(OSError):
+            os.remove(filepath)
         return web.json_response({'success': False, 'message': f'保存文件失败: {e}'}, status=500)
 
     # 读取额外字段
@@ -284,6 +300,9 @@ async def handle_upload_update(request: web.Request):
             )
         except Exception as e:
             updater._report('failed', f'更新出错: {e}', 0)
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(filepath)
 
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, _do)

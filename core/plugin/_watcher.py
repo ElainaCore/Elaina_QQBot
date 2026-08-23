@@ -1,4 +1,4 @@
-"""文件监视 (代码变更自动热重载) — PluginManager 的 Mixin"""
+"""插件文件监视与代码热重载。"""
 
 import asyncio
 import contextlib
@@ -10,7 +10,7 @@ log = get_logger(PLUGIN, '管理器')
 
 
 class _WatcherMixin:
-    """文件变更监视 + 自动热重载"""
+    """监视插件文件变更并自动热重载。"""
 
     def _scan_plugin_mtimes(self, pdir):
         for root, _, files in os.walk(pdir):
@@ -69,11 +69,13 @@ class _WatcherMixin:
         if self._watcher_task and not self._watcher_task.done():
             return
         self._watcher_running = True
-        self._watcher_task = asyncio.ensure_future(self._watcher_loop())
-        log.info('📡 插件文件监视已启动')
+        self._watcher_task = asyncio.create_task(
+            self._watcher_loop(),
+            name='plugin-file-watcher',
+        )
+        log.info('插件文件监视已启动')
 
     def stop_watcher(self):
         self._watcher_running = False
         if self._watcher_task and not self._watcher_task.done():
             self._watcher_task.cancel()
-            self._watcher_task = None

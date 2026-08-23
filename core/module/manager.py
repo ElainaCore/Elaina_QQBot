@@ -44,6 +44,7 @@ class ModuleContext(BaseContext):
         def decorator(func):
             self._hooks.register(hook_name, func, owner=self.name, priority=priority)
             return func
+
         return decorator
 
     def register_hook(self, hook_name, callback, *, priority=100):
@@ -60,8 +61,16 @@ class ModuleInfo:
     """已发现模块的信息"""
 
     __slots__ = (
-        'name', 'display_name', 'description', 'module_dir',
-        'module', 'version', 'author', 'instance', 'ctx', 'error',
+        'name',
+        'display_name',
+        'description',
+        'module_dir',
+        'module',
+        'version',
+        'author',
+        'instance',
+        'ctx',
+        'error',
     )
 
     def __init__(self, name, module_dir):
@@ -84,9 +93,7 @@ class ModuleManager:
         if modules_dir:
             self._dir = os.path.abspath(modules_dir)
         else:
-            self._dir = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'modules'
-            )
+            self._dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'modules')
         self._hook_manager = hook_manager or get_hook_manager()
         self._modules = {}
         self._lock = asyncio.Lock()
@@ -243,9 +250,7 @@ class ModuleManager:
         if not os.path.isfile(entry):
             raise FileNotFoundError(f'模块入口不存在: {mod_dir}')
         mod_name = f'modules.{name}'
-        spec = importlib.util.spec_from_file_location(
-            mod_name, entry, submodule_search_locations=[mod_dir]
-        )
+        spec = importlib.util.spec_from_file_location(mod_name, entry, submodule_search_locations=[mod_dir])
         module = importlib.util.module_from_spec(spec)
         sys.modules[mod_name] = module
         spec.loader.exec_module(module)

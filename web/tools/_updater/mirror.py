@@ -11,29 +11,24 @@ from web.tools._updater.shared import (
     _build_mirror_url,
     _load_mirror_cache,
     _save_mirror_cache,
-    clear_mirror_cache,  # noqa: F401  # re-export for handlers.py
+    clear_mirror_cache,  # noqa: F401  # 供处理器模块复用
 )
 
-_mirror_testing = None  # asyncio.Task (防重复测速)
+_mirror_testing = None  # 防止并发触发重复测速
 
 
-async def _test_one_mirror(mirror, timeout=3):
-    """HEAD 请求测试镜像延迟, 2xx/3xx 均视为成功"""
-    test_url = _build_mirror_url('https://github.com/ElainaCore/ElainaBot-Onebot/releases/latest', mirror)
-    start = time.time()
+async def _test_one_mirror(session, mirror, timeout=3):
+    """通过响应头请求测试镜像延迟，成功或重定向均视为可用。"""
+    test_url = _build_mirror_url('https://github.com/ElainaCore/Elaina_QQBot/releases/latest', mirror)
+    start = time.monotonic()
     try:
-        async with (
-            _aiohttp.ClientSession() as session,
-            session.head(
-                test_url,
-                headers={'User-Agent': 'ElainaBot-Mirror-Test'},
-                timeout=_aiohttp.ClientTimeout(total=timeout),
-                allow_redirects=False,
-                ssl=False,
-            ) as resp,
-        ):
-            latency = time.time() - start
-            # 2xx/3xx 成功, 405(不支持HEAD但镜像本身可用)也算成功
+        async with session.head(
+            test_url,
+            timeout=_aiohttp.ClientTimeout(total=timeout),
+            allow_redirects=False,
+        ) as resp:
+            latency = time.monotonic() - start
+            # 部分镜像不支持响应头请求，但服务本身仍然可用。
             ok = (200 <= resp.status < 400) or resp.status == 405
             return {
                 'mirror': mirror,
@@ -41,21 +36,34 @@ async def _test_one_mirror(mirror, timeout=3):
                 'success': ok,
                 'status': resp.status,
             }
-    except Exception as e:
+    except (_aiohttp.ClientError, TimeoutError) as e:
         return {
             'mirror': mirror,
-            'latency': round(time.time() - start, 3),
+            'latency': round(time.monotonic() - start, 3),
             'success': False,
             'error': type(e).__name__,
         }
 
 
+async def test_one_mirror(mirror, timeout=3):
+    """使用独立会话测试单个镜像，供管理接口调用。"""
+    connector = _aiohttp.TCPConnector(limit=2, ttl_dns_cache=300)
+    async with _aiohttp.ClientSession(
+        connector=connector,
+        headers={'User-Agent': 'ElainaQQ-Mirror-Test'},
+    ) as session:
+        return await _test_one_mirror(session, mirror, timeout)
+
+
 async def test_all_mirrors(timeout=3):
-    """并行测试所有镜像, 返回按延迟排序的结果列表"""
-    tasks = [_test_one_mirror(m, timeout) for m in GITHUB_FILE_MIRRORS]
-    # 加上 GitHub 直连
-    tasks.append(_test_one_mirror('', timeout))
-    results = await asyncio.gather(*tasks)
+    """使用共享连接池并行测试镜像并按延迟排序。"""
+    connector = _aiohttp.TCPConnector(limit=16, limit_per_host=4, ttl_dns_cache=300)
+    async with _aiohttp.ClientSession(
+        connector=connector,
+        headers={'User-Agent': 'ElainaQQ-Mirror-Test'},
+    ) as session:
+        mirrors = [*GITHUB_FILE_MIRRORS, '']
+        results = await asyncio.gather(*(_test_one_mirror(session, mirror, timeout) for mirror in mirrors))
     results = sorted(results, key=lambda r: (not r['success'], r['latency']))
     return results
 
@@ -69,10 +77,12 @@ async def get_fast_mirrors(force=False):
             return cached
     if _mirror_testing and not _mirror_testing.done():
         return await _mirror_testing
-    _mirror_testing = asyncio.ensure_future(test_all_mirrors())
-    results = await _mirror_testing
+    _mirror_testing = asyncio.create_task(test_all_mirrors(), name='mirror-latency-test')
+    try:
+        results = await _mirror_testing
+    finally:
+        _mirror_testing = None
     ok = [r for r in results if r['success']]
-    _mirror_testing = None
     _save_mirror_cache(ok)
     return ok
 
@@ -83,7 +93,7 @@ async def get_fast_mirrors(force=False):
 def detect_environment():
     """检测运行环境, 返回 {docker, writable, warning}"""
     info = {'docker': False, 'writable': True, 'warnings': []}
-    # Docker 检测
+    # 检测 Docker 环境
     if os.path.exists('/.dockerenv'):
         info['docker'] = True
     else:

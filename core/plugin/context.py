@@ -38,6 +38,8 @@ class PluginInfo:
         'on_load_funcs',
         'on_unload_funcs',
         'interceptors',
+        'handler_filters',
+        'api_interceptors',
         'enabled',
         'load_time',
         'error',
@@ -54,6 +56,8 @@ class PluginInfo:
         self.on_load_funcs = []
         self.on_unload_funcs = []
         self.interceptors = []
+        self.handler_filters = []
+        self.api_interceptors = []
         self.enabled = True
         self.load_time = 0
         self.error = None

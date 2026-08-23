@@ -1,40 +1,37 @@
-<p>
-<img src="https://download.nature.qq.com/SnsShare/SocialProfile/1779098988_1264b08a.png" width="200" align="left" style="border-radius:50%; margin-right:16px" />
+# ElainaQQ
 
-<h1>ElainaBot OneBot</h1>
-
-ElainaBot OneBot 是一个基于 Python 的 QQ 机器人框架，采用 **OneBot v11** 协议标准，纯异步架构，支持 NapCat / LLOneBot / go-cqhttp 等多种 OneBot 实现，具备插件热重载、模块化扩展、插件市场、Web 面板管理等特性。
+ElainaQQ 是一个基于 Python 的异步 QQ 机器人框架，内置 QQNT 启动、扫码登录、多账号隔离、插件热重载和 Web 面板管理，并提供 OneBot v11 协议兼容接口。
 
 [![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![QQ群](https://img.shields.io/badge/QQ交流群-164178653-blue)](https://qm.qq.com/q/nepv1UcwRE)
 
-- **纯异步架构** — 基于 aiohttp，反向/正向 WebSocket 与 HTTP 多种接入方式
-- **插件市场** — 基于 GitHub 插件库，一键浏览、安装、更新插件
-- **Web 管理面板** — 实时日志、系统监控、插件管理、配置编辑、网络连接管理
-
-</p>
-<br clear="left" />
+- **纯异步架构**：基于 aiohttp，支持 WebSocket 与 HTTP 网络接入。
+- **内置 QQ**：直接管理 QQ 安装、扫码登录、版本切换与多账号会话。
+- **插件系统**：支持插件热重载、模块扩展、机器人绑定和在线配置。
+- **Web 管理面板**：提供运行监控、消息记录、插件管理和框架配置。
 
 > 项目仅供学习交流使用，严禁用于非法行为。
 
-## 📢 交流群
+## 交流群
 
-**Elaina Bot 框架交流群：[164178653](https://qm.qq.com/q/nepv1UcwRE)**
+**ElainaQQ 框架交流群：[164178653](https://qm.qq.com/q/nepv1UcwRE)**
 
-## 🚀 快速开始
+## 快速开始
 
 ### 环境要求
 
 - Python 3.11+
 - Git
-- NapCat / LLOneBot / go-cqhttp 等任意 OneBot v11 实现
+- QQNT 内置运行时，所有账号共用一份 QQ 安装文件
+
+运行框架和内置 QQ 不需要服务器预装 Node.js。只有开发或重新构建 Web 前端时才需要 Node.js。
 
 ### 安装
 
 ```bash
-git clone https://github.com/ElainaCore/ElainaBot-Onebot.git
-cd ElainaBot-Onebot
+git clone https://github.com/ElainaCore/Elaina_QQBot.git ElainaQQ
+cd ElainaQQ
 pip install -r requirements.txt
 python main.py
 ```
@@ -44,35 +41,41 @@ python main.py
 启动后访问 Web 面板完成配置：
 
 ```
-http://localhost:5201/web/?token=admin
+http://localhost:5201/web/
 ```
 
-> 默认端口 `5201`、令牌 `admin`，可在 `config/settings.yaml` 的 `server` / `web` 区块修改。主人 QQ 号填在 `owner.ids`。
+> 默认端口为 `5201`，首次登录使用 `config/settings.yaml` 中的 `web.admin_password`。主人 QQ 号填在 `owner.ids`。
 
-### 连接 OneBot 实现
+内置 QQ 为每个账号分配独立的本机桥接端口，默认从 `30010` 开始递增。桥接端口只绑定 `127.0.0.1`，无需在防火墙或安全组中开放；可通过 `embedded_qq.bridge_port_start` 修改起始值。主面板和公开 OneBot 入口仍使用 `server.port`。
 
-框架在主服务端口内置反向 WS 入口 `/OneBotv11`，在 NapCat / LLOneBot 中把**反向 WebSocket 客户端**指向：
+### 网络接入
+
+框架在主服务端口提供 OneBot v11 反向 WebSocket 入口 `/OneBotv11`：
 
 ```
 ws://127.0.0.1:5201/OneBotv11
 ```
 
-也可在 Web 面板「网络配置」页面可视化添加反向 WS、正向 WS、HTTP 上报 / HTTP 客户端等连接，每条连接可单独配置 `token` / `secret`。
+其他网络连接可直接在 Web 面板中创建和维护。
 
-## 🌐 Web 管理面板
+## Web 管理面板
 
 启动框架后访问：
 
 ```
-http://localhost:5201/web/?token=<access_token>
+http://localhost:5201/web/
 ```
 
 面板提供：实时消息与日志、系统状态监控、插件启停/热重载、插件市场、配置编辑、网络连接管理等。
 
-## 📁 框架结构
+前端源码独立维护在 [Elaina_QQBot_web](https://github.com/ElainaCore/Elaina_QQBot_web)。后端仓库保留可直接运行的 `web/dist` 构建产物。
+
+前端仓库设置 `ELAINAQQ_BACKEND_DIR` 后，构建产物会直接写入后端的 `web/dist`。后端也可通过 `ELAINAQQ_WEB_DIST` 加载外部构建目录。
+
+## 项目结构
 
 ```
-ElainaBot-Onebot/
+ElainaQQ/
 ├── main.py          # 主程序入口
 ├── config/          # 配置文件 (settings.yaml / connections.yaml)
 ├── core/            # 核心框架
@@ -86,9 +89,10 @@ ElainaBot-Onebot/
 └── web/             # Web 面板 (后端 + 前端 dist)
 ```
 
-## 🔌 插件开发
+## 开发文档
 
-详见 **[插件开发文档 (PLUGIN_DEVELOPMENT.md)](PLUGIN_DEVELOPMENT.md)** — 包含完整的装饰器、Event 事件对象、OneBot 消息发送 API、插件上下文、元数据、Web 面板扩展等参考。
+- [插件开发指南](docs/PLUGIN_DEVELOPMENT.md)
+- [OneBot API 参考](docs/ONEBOT_API.md)
 
 最简插件 `plugins/hello/main.py`：
 
@@ -101,7 +105,7 @@ async def say_hello(event, match):
     await event.reply("你好!")
 ```
 
-## 🛒 插件市场
+## 插件市场
 
 框架内置插件市场，从 [ElainaCore/Elaina-plugins](https://github.com/ElainaCore/Elaina-plugins) 的 `onebot_plugins.json` 获取插件列表。
 
@@ -110,20 +114,16 @@ async def say_hello(event, match):
 
 **插件开发者** 可前往 [Elaina-plugins](https://github.com/ElainaCore/Elaina-plugins) 提交 PR，将你的插件加入市场。
 
-## 📄 开源协议
+## 开源协议
 
 本项目采用 MIT 协议开源，详见 [LICENSE](LICENSE) 文件。
 
-## ⚠️ 免责声明
+## 免责声明
 
 本项目仅供学习交流使用，使用本框架所产生的一切后果由使用者自行承担，与开发者无关。请勿将本框架用于任何违法违规用途。
 
 ---
 
-<div align="center">
+如果这个项目对你有帮助，欢迎 Star。
 
-**如果这个项目对你有帮助，请给个 Star ⭐️**
-
-Made with ❤️ by Elaina Bot Team
-
-</div>
+ElainaQQ 团队

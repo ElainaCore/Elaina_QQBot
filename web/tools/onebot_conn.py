@@ -6,8 +6,9 @@ from aiohttp import web
 
 from core.base.config import cfg
 from core.onebot.connection import CONN_TYPES, default_connections, normalize
+from web.protocol import error, json_body, ok
 
-log = logging.getLogger('ElainaBot.web.onebot_conn')
+log = logging.getLogger('ElainaQQ.web.onebot_conn')
 
 _app = None
 
@@ -55,27 +56,23 @@ async def handle_get_connections(request: web.Request):
             status = _app.connection_manager.status()
         except Exception as e:
             log.warning(f'获取连接状态失败: {e}')
-    return web.json_response({
-        'success': True,
-        'connections': conns,
-        'status': status,
-        'server': {
+    return ok(
+        connections=conns,
+        status=status,
+        server={
             'host': cfg.get('settings', 'server.host', '0.0.0.0'),
             'port': cfg.get('settings', 'server.port', 5201),
         },
-    })
+    )
 
 
 async def handle_save_connections(request: web.Request):
     """保存连接配置并热重载"""
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({'success': False, 'error': '请求格式错误'}, status=400)
+    body = await json_body(request)
 
     conns = body.get('connections')
     if not isinstance(conns, list):
-        return web.json_response({'success': False, 'error': 'connections 必须为数组'}, status=400)
+        return error('connections 必须为数组')
 
     cleaned = []
     names = set()
@@ -84,10 +81,10 @@ async def handle_save_connections(request: web.Request):
             continue
         item = _sanitize(c)
         if item['type'] in ('ws_forward', 'http_client') and not item['url']:
-            return web.json_response({'success': False, 'error': f"连接 [{item['name']}] 缺少 URL"}, status=400)
+            return error(f'连接 [{item["name"]}] 缺少 URL')
         name = item['name']
         if name in names:
-            return web.json_response({'success': False, 'error': f'连接名称重复: {name}'}, status=400)
+            return error(f'连接名称重复: {name}')
         names.add(name)
         cleaned.append(item)
 
@@ -98,7 +95,7 @@ async def handle_save_connections(request: web.Request):
             await _app.reload_connections()
         except Exception as e:
             log.warning(f'重载连接失败: {e}')
-            return web.json_response({'success': False, 'error': f'已保存但重载失败: {e}'}, status=500)
+            return error(f'已保存但重载失败: {e}', status=500)
 
     status = _app.connection_manager.status() if (_app and _app.connection_manager) else []
-    return web.json_response({'success': True, 'message': '连接配置已保存', 'connections': cleaned, 'status': status})
+    return ok(message='连接配置已保存', connections=cleaned, status=status)

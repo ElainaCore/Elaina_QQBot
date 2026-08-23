@@ -4,16 +4,19 @@ import asyncio
 import contextlib
 import json
 import logging
+from collections import deque
 from datetime import datetime
 
 from aiohttp import WSMsgType, web
 
 import web.auth as auth
 
-log = logging.getLogger('ElainaBot.web.ws')
+log = logging.getLogger('ElainaQQ.web.ws')
+
+_MAX_PENDING_BROADCASTS = 1024
 
 
-# ==================== WSBroadcast ====================
+# ==================== 长连接广播器 ====================
 
 
 class WSBroadcast:
@@ -22,6 +25,8 @@ class WSBroadcast:
     def __init__(self):
         self._clients: set = set()
         self._sse_queues: set = set()
+        self._pending = deque(maxlen=_MAX_PENDING_BROADCASTS)
+        self._drain_task: asyncio.Task | None = None
 
     @property
     def clients(self):
@@ -39,25 +44,50 @@ class WSBroadcast:
         if not self.has_clients():
             return
         payload = json.dumps({'type': msg_type, 'data': data}, ensure_ascii=False, default=str)
-        # WebSocket
-        dead = set()
-        for ws in list(self._clients):
+
+        # 并发发送并限制单客户端等待时间，避免慢连接阻塞全部面板。
+        async def send_one(ws):
             try:
-                await ws.send_str(payload)
+                async with asyncio.timeout(2):
+                    await ws.send_str(payload)
+                return None
             except Exception:
-                dead.add(ws)
-        self._clients.difference_update(dead)
-        # SSE
+                return ws
+
+        if self._clients:
+            results = await asyncio.gather(*(send_one(ws) for ws in tuple(self._clients)))
+            self._clients.difference_update(ws for ws in results if ws is not None)
+        # 服务器推送事件
         for q in list(self._sse_queues):
-            with contextlib.suppress(Exception):
+            try:
                 q.put_nowait(payload)
+            except asyncio.QueueFull:
+                # 状态流优先保留新数据，淘汰最旧的一条积压消息。
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    q.get_nowait()
+                with contextlib.suppress(asyncio.QueueFull):
+                    q.put_nowait(payload)
 
     def schedule_broadcast(self, msg_type: str, data: dict):
-        """安全调度广播任务 (无事件循环时静默忽略)"""
+        """使用有界单消费者队列调度广播，避免突发日志无限创建任务。"""
         if not self.has_clients():
             return
-        with contextlib.suppress(RuntimeError):
-            asyncio.get_running_loop().create_task(self.broadcast(msg_type, data))
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._pending.append((msg_type, data))
+        if self._drain_task is None or self._drain_task.done():
+            self._drain_task = loop.create_task(self._drain_broadcasts())
+
+    async def _drain_broadcasts(self):
+        """按入队顺序发送广播；队列满时由 deque 自动淘汰最旧状态。"""
+        try:
+            while self._pending:
+                msg_type, data = self._pending.popleft()
+                await self.broadcast(msg_type, data)
+        finally:
+            self._drain_task = None
 
     def push_log(self, log_type: str, entry: dict):
         """实时推送日志到面板 (不缓存, 仅广播)"""
@@ -73,20 +103,26 @@ class WSBroadcast:
         """清理所有连接 (用于测试隔离)"""
         self._clients.clear()
         self._sse_queues.clear()
+        self._pending.clear()
+        if self._drain_task and not self._drain_task.done():
+            self._drain_task.cancel()
+        self._drain_task = None
 
     def shutdown(self):
         """服务器关闭时主动断开所有面板连接，避免阻塞 aiohttp runner.shutdown()
 
-        WebSocket: 发送 Close Frame (code=1001 Going Away)
-        SSE: 清空队列集合（handler 在下一次 queue 操作时自然退出）
+        WebSocket：发送关闭帧（代码 1001，服务离开）。
+        SSE：清空队列集合，处理器会在下一次队列操作时自然退出。
         """
         for ws in list(self._clients):
             with contextlib.suppress(Exception, RuntimeError):
-                asyncio.get_running_loop().create_task(
-                    ws.close(code=1001, message=b'Server shutdown')
-                )
+                asyncio.get_running_loop().create_task(ws.close(code=1001, message=b'Server shutdown'))
         self._clients.clear()
         self._sse_queues.clear()
+        self._pending.clear()
+        if self._drain_task and not self._drain_task.done():
+            self._drain_task.cancel()
+        self._drain_task = None
 
 
 # 模块级单例
@@ -128,16 +164,14 @@ def push_system_info(data: dict):
 
 
 async def handle_ws(request: web.Request) -> web.WebSocketResponse:
-    """WebSocket 端点: /ws/panel?token=xxx"""
-    # 验证 token
-    token = request.query.get('token', '')
-    if not token or token not in auth.valid_sessions:
-        return web.Response(status=401, text='Unauthorized')  # type: ignore[return-value]  # auth failure before WS upgrade
+    """面板 WebSocket 端点。"""
+    if not auth.validate_token(request) or not auth.is_same_origin(request):
+        return web.Response(status=401, text='未授权')  # type: ignore[return-value]  # 升级连接前的鉴权失败
 
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
     _broadcast.clients.add(ws)
-    log.debug(f'面板 WebSocket 已连接 ({len(_broadcast.clients)} clients)')
+    log.debug(f'面板 WebSocket 已连接（{len(_broadcast.clients)} 个客户端）')
 
     try:
         # 通知前端已连接, 初始数据由前端通过 API 获取
@@ -154,7 +188,7 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
                 break
     finally:
         _broadcast.clients.discard(ws)
-        log.debug(f'面板 WebSocket 已断开 ({len(_broadcast.clients)} clients)')
+        log.debug(f'面板 WebSocket 已断开（{len(_broadcast.clients)} 个客户端）')
 
     return ws
 
@@ -168,14 +202,13 @@ async def _handle_client_msg(ws: web.WebSocketResponse, data: dict):
 
 
 async def handle_sse(request: web.Request) -> web.StreamResponse:
-    """SSE 端点: /api/sse/panel?token=xxx
+    """SSE 降级端点。
 
     当 WebSocket 因 Nginx 未配置 upgrade 等原因不可用时,
     前端自动降级到 SSE, 走普通 HTTP 无需特殊代理配置。
     """
-    token = request.query.get('token', '')
-    if not token or token not in auth.valid_sessions:
-        return web.Response(status=401, text='Unauthorized')
+    if not auth.validate_token(request) or not auth.is_same_origin(request):
+        return web.Response(status=401, text='未授权')
 
     resp = web.StreamResponse()
     resp.headers['Content-Type'] = 'text/event-stream'

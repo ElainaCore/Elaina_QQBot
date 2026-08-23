@@ -6,6 +6,7 @@ from enum import StrEnum
 
 class PostType(StrEnum):
     """OneBot 上报类型"""
+
     MESSAGE = 'message'
     NOTICE = 'notice'
     REQUEST = 'request'
@@ -14,6 +15,7 @@ class PostType(StrEnum):
 
 class MsgType(StrEnum):
     """消息类型"""
+
     GROUP = 'group'
     PRIVATE = 'private'
 
@@ -41,8 +43,7 @@ class OneBotEvent:
 class MessageEvent(OneBotEvent):
     """消息事件"""
 
-    __slots__ = ('message_type', 'sub_type', 'message_id', 'user_id', 'group_id',
-                 'message', 'raw_message', 'sender', 'font', '_content')
+    __slots__ = ('message_type', 'sub_type', 'message_id', 'user_id', 'group_id', 'message', 'raw_message', 'sender', 'font', '_content')
 
     def __init__(self, data: dict):
         super().__init__(data)
@@ -77,11 +78,7 @@ class MessageEvent(OneBotEvent):
     def content(self) -> str:
         """提取纯文本内容 (首次访问后缓存)"""
         if self._content is None:
-            parts = [
-                seg.get('data', {}).get('text', '')
-                for seg in self.message
-                if isinstance(seg, dict) and seg.get('type') == 'text'
-            ]
+            parts = [seg.get('data', {}).get('text', '') for seg in self.message if isinstance(seg, dict) and seg.get('type') == 'text']
             self._content = ''.join(parts).strip()
         return self._content
 
@@ -92,9 +89,9 @@ class MessageEvent(OneBotEvent):
         if isinstance(message, str):
             message = [{'type': 'text', 'data': {'text': message}}]
         if self.is_group:
-            return await self._api.send_group_msg(self.group_id, message, **kwargs)
+            return await self._api.send_group_msg(self.group_id, message, **kwargs, self_id=str(self.self_id))
         else:
-            return await self._api.send_private_msg(self.user_id, message, **kwargs)
+            return await self._api.send_private_msg(self.user_id, message, **kwargs, self_id=str(self.self_id))
 
     async def reply_text(self, text: str, **kwargs):
         """回复纯文本"""
@@ -105,7 +102,7 @@ class MessageEvent(OneBotEvent):
         msg = [{'type': 'image', 'data': {'file': file}}]
         return await self.reply(msg, **kwargs)
 
-    async def call_api(self, action: str, params: dict = None):
+    async def call_api(self, action: str, params: dict | None = None):
         """调用 OneBot API"""
         if self._api is None:
             return None

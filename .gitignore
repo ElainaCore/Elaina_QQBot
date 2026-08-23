@@ -1,39 +1,39 @@
-# Python
+# Python 构建与缓存
 __pycache__/
 *.py[cod]
 *.egg-info/
 build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
 .venv/
 venv/
 
-# IDE
+# 开发工具
 .idea/
 .vscode/
 *.swp
 
-# Data (运行时数据)
-data/*.db
-data/log/
-data/media/
-data/web/
-data/group_remarks.json
-data/market_mirror.json
-data/mirror_cache.json
+# 运行时数据
+data/
+log/
+plugins/*/data/
 plugins/plugins_disabled.json
 modules/modules_enabled.json
 
-# Config (keep examples only)
+# 本地配置，仅提交示例文件
 config/settings.yaml
 config/connections.yaml
 config/bot.yaml
 
-# Node
-web/vue/node_modules/
-# web/dist/ is committed (compiled Vue panel)
+web/vue/
+# web/dist/ 为需要提交的前端构建产物
 
-# OS
+# 操作系统文件
 .DS_Store
 Thumbs.db
 
-# Env
+# 环境变量
 .env

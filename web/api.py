@@ -1,11 +1,13 @@
 """Web 面板 API 路由"""
 
+import asyncio
 import logging
 
 from aiohttp import web
 
 import web.auth as auth
 import web.ws as panel_ws
+from web.protocol import error, json_body, ok
 from web.tools import (
     bots,
     config_handler,
@@ -15,12 +17,12 @@ from web.tools import (
     messages,
     onebot_conn,
     plugin_mgr,
-    statistics,
+    qq_versions,
     system,
     update,
 )
 
-log = logging.getLogger('ElainaBot.web.api')
+log = logging.getLogger('ElainaQQ.web.api')
 
 _app = None
 _base_dir = ''
@@ -32,13 +34,35 @@ def get_routes() -> list:
     return [
         # ── 鉴权 ──
         web.post('/api/auth/login', handle_login),
+        web.post('/api/auth/logout', _(handle_auth_logout)),
         web.get('/api/auth/check', _(handle_auth_check)),
         web.get('/api/auth/password-status', _(handle_password_status)),
         # ── 机器人 ──
         web.get('/api/bots', _(bots.handle_get_bots)),
         web.post('/api/bots/toggle', _(bots.handle_toggle_bot)),
+        web.post('/api/embedded/bots', _(bots.handle_create_embedded_bot)),
+        web.post('/api/embedded/version', _(bots.handle_set_embedded_version)),
+        web.post('/api/embedded/quick-login', _(bots.handle_set_embedded_quick_login)),
+        web.post('/api/embedded/start', _(bots.handle_start_embedded_bot)),
+        web.post('/api/embedded/stop', _(bots.handle_stop_embedded_bot)),
+        web.post('/api/embedded/delete', _(bots.handle_delete_embedded_bot)),
+        web.post('/api/embedded/qr/refresh', _(bots.handle_refresh_embedded_qr)),
+        web.get('/api/embedded/status', _(bots.handle_get_embedded_status)),
+        web.post('/api/embedded/events', handle_embedded_event),
+        web.get('/api/embedded/control/poll', handle_embedded_control_poll),
+        web.post('/api/embedded/control/result', handle_embedded_control_result),
+        # ── QQ 版本管理 ──
+        web.get('/api/qq/versions', _(qq_versions.handle_list_versions)),
+        web.get('/api/qq/status', _(qq_versions.handle_get_status)),
+        web.get('/api/qq/progress', _(qq_versions.handle_get_progress)),
+        web.post('/api/qq/download', _(qq_versions.handle_download_qq)),
+        web.post('/api/qq/install', _(qq_versions.handle_install_qq)),
+        web.post('/api/qq/uninstall', _(qq_versions.handle_uninstall_qq)),
+        web.post('/api/qq/cleanup', _(qq_versions.handle_cleanup_qq)),
+        web.get('/api/qq/detect', _(qq_versions.handle_detect_qq)),
         # ── 系统信息 ──
         web.get('/api/system/info', _(system.handle_system_info)),
+        web.get('/api/system/dependencies', _(system.handle_dependencies)),
         # ── 日志 (具体路径必须在 {log_type} 之前) ──
         web.get('/api/logs/recent', _(logs.handle_recent_logs)),
         web.get('/api/logs/login', _(logs.handle_get_login_logs)),
@@ -83,16 +107,6 @@ def get_routes() -> list:
         web.post('/api/message/remarks', _(messages.handle_set_remark)),
         web.post('/api/message/remarks/delete', _(messages.handle_delete_remark)),
         web.post('/api/message/group-roles', _(messages.handle_get_group_roles)),
-        # ── 统计 ──
-        web.get('/api/statistics', _(statistics.handle_get_statistics)),
-        web.get('/api/statistics/summary', _(statistics.handle_get_summary)),
-        web.get('/api/statistics/active', _(statistics.handle_get_active)),
-        web.get('/api/statistics/top', _(statistics.handle_get_top)),
-        web.get('/api/statistics/events', _(statistics.handle_get_events)),
-        web.get('/api/statistics/totals', _(statistics.handle_get_totals)),
-        web.get('/api/statistics/hourly', _(statistics.handle_get_hourly_statistics)),
-        web.get('/api/statistics/chart', _(statistics.handle_get_chart_data)),
-        web.get('/api/statistics/dates', _(statistics.handle_get_available_dates)),
         # ── 更新 ──
         web.get('/api/update/changelog', _(update.handle_get_changelog)),
         web.get('/api/update/version', _(update.handle_get_current_version)),
@@ -129,7 +143,7 @@ def get_routes() -> list:
         web.post('/api/database/query', _(database.handle_query_table)),
         web.post('/api/database/sql', _(database.handle_execute_sql)),
         web.post('/api/database/delete', _(database.handle_delete_rows)),
-        # ── WebSocket / SSE ──
+        # ── WebSocket 与 SSE 长连接 ──
         web.get('/ws/panel', panel_ws.handle_ws),
         web.get('/api/sse/panel', panel_ws.handle_sse),
     ]
@@ -147,9 +161,9 @@ def set_context(app_instance, base_dir: str):
     plugin_mgr.set_context(app_instance, base_dir)
     config_handler.set_context(base_dir)
     database.set_context(app_instance, base_dir)
-    statistics.set_context(app_instance, base_dir)
     messages.set_context(app_instance, base_dir)
     onebot_conn.set_context(app_instance)
+    qq_versions.set_context(app_instance)
     market.set_context(base_dir)
     update.set_context(base_dir)
 
@@ -157,45 +171,95 @@ def set_context(app_instance, base_dir: str):
 # ======================== 内联路由处理 ========================
 
 
+def _local_embedded_manager(request: web.Request):
+    if request.remote not in {'127.0.0.1', '::1', None}:
+        return None
+    return getattr(_app, 'embedded_qq', None)
+
+
+async def handle_embedded_event(request: web.Request):
+    manager = _local_embedded_manager(request)
+    if not manager:
+        return error('仅允许本机 ElainaQQ QQ 运行时', status=403)
+    try:
+        payload = await json_body(request)
+    except Exception:
+        return error('请求格式错误', status=400)
+    if not await manager.handle_event(payload):
+        return error('内置 QQ 未初始化', status=503)
+    return ok()
+
+
+async def handle_embedded_control_poll(request: web.Request):
+    manager = _local_embedded_manager(request)
+    if not manager:
+        return error('仅允许本机 ElainaQQ QQ 运行时', status=403)
+    bot_id = str(request.query.get('bot_id') or '').strip()
+    if not bot_id:
+        return error('缺少 bot_id', status=400)
+    command = await manager.next_control_command(bot_id)
+    if command is None:
+        return web.Response(status=204)
+    return web.json_response(command)
+
+
+async def handle_embedded_control_result(request: web.Request):
+    manager = _local_embedded_manager(request)
+    if not manager:
+        return error('仅允许本机 ElainaQQ QQ 运行时', status=403)
+    try:
+        payload = await json_body(request)
+    except Exception:
+        return error('请求格式错误', status=400)
+    bot_id = str(payload.get('bot_id') or '').strip()
+    if not bot_id or not manager.resolve_control_command(bot_id, payload):
+        return error('命令不存在或已过期', status=404)
+    return ok()
+
+
 async def handle_login(request: web.Request):
     ip = auth.get_real_ip(request)
     auth.cleanup_expired_ip_bans()
     if auth.is_ip_banned(ip):
-        return web.json_response({'success': False, 'error': 'IP 已被封禁'}, status=403)
+        return error('IP 已被封禁', status=403)
 
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({'success': False, 'error': '请求格式错误'}, status=400)
+    body = await json_body(request)
 
     password = str(body.get('password', ''))
     from core.base.config import cfg
 
     admin_pwd = str(cfg.get('settings', 'web.admin_password', '') or '')
     if not admin_pwd:
-        return web.json_response({'success': False, 'error': '未配置管理员密码'}, status=500)
+        return error('未配置管理员密码', status=500)
 
-    if not auth.verify_password(password, admin_pwd):
+    if not await asyncio.to_thread(auth.verify_password, password, admin_pwd):
         auth.record_ip_access(ip, 'fail')
         remaining = auth.get_remaining_attempts(ip)
         if remaining <= 0:
-            return web.json_response({'success': False, 'error': 'IP 已被封禁，12小时后解除'}, status=403)
-        return web.json_response(
-            {'success': False, 'error': f'密码错误，还剩 {remaining} 次机会', 'remaining': remaining},
-            status=401,
-        )
+            return error('IP 已被封禁，12小时后解除', status=403)
+        return error(f'密码错误，还剩 {remaining} 次机会', status=401, remaining=remaining)
 
-    if not auth.is_hashed(admin_pwd):
-        cfg.set_value('settings', 'web.admin_password', auth.hash_password(password))
+    if auth.needs_rehash(admin_pwd):
+        hashed = await asyncio.to_thread(auth.hash_password, password)
+        cfg.set_value('settings', 'web.admin_password', hashed)
 
     auth.record_ip_access(ip, 'success')
     token = auth.create_session(request)
     is_weak = password in _WEAK_PASSWORDS
-    return web.json_response({'success': True, 'token': token, 'is_weak': is_weak})
+    response = ok(is_weak=is_weak)
+    auth.set_session_cookie(response, request, token)
+    return response
+
+
+async def handle_auth_logout(request: web.Request):
+    auth.revoke_session(request)
+    response = ok()
+    response.del_cookie(auth.SESSION_COOKIE, path='/')
+    return response
 
 
 async def handle_auth_check(request: web.Request):
-    return web.json_response({'success': True})
+    return ok()
 
 
 _WEAK_PASSWORDS = frozenset({'admin', '123456', 'password', 'admin123', '12345678'})
@@ -208,8 +272,9 @@ async def handle_password_status(request: web.Request):
     is_default = not pwd or (not auth.is_hashed(pwd) and pwd in _WEAK_PASSWORDS)
     is_weak = False
     if pwd and auth.is_hashed(pwd):
-        is_weak = any(auth.verify_password(w, pwd) for w in _WEAK_PASSWORDS)
-    return web.json_response({'success': True, 'is_default': is_default, 'is_weak': is_weak})
+        checks = await asyncio.gather(*(asyncio.to_thread(auth.verify_password, weak, pwd) for weak in _WEAK_PASSWORDS))
+        is_weak = any(checks)
+    return ok(is_default=is_default, is_weak=is_weak)
 
 
 # ======================== 自定义页面 (插件侧边栏页面) ========================
@@ -218,7 +283,7 @@ async def handle_password_status(request: web.Request):
 async def handle_get_web_pages(request: web.Request):
     from core.plugin.web_pages import get_pages
 
-    return web.json_response({'success': True, 'pages': get_pages()})
+    return ok(pages=get_pages())
 
 
 async def handle_get_web_page_html(request: web.Request):
@@ -227,11 +292,21 @@ async def handle_get_web_page_html(request: web.Request):
     key = request.match_info['key']
     html = get_page_html(key)
     if html is None:
-        return web.json_response({'success': False, 'error': '页面不存在'}, status=404)
+        return error('页面不存在', status=404)
     return web.Response(text=html, content_type='text/html', charset='utf-8')
 
 
 # ======================== 插件自定义路由 ========================
+
+
+def _authorize_ext_request(request: web.Request) -> web.Response | None:
+    """鉴权插件路由，并兼容先更新 API、后更新鉴权模块的部署过程。"""
+    authorize = getattr(auth, 'authorize_request', None)
+    if callable(authorize):
+        return authorize(request)
+    if not auth.validate_token(request):
+        return error('未登录或会话已过期', status=401)
+    return None
 
 
 async def handle_ext_route(request: web.Request):
@@ -240,7 +315,9 @@ async def handle_ext_route(request: web.Request):
 
     entry = match_route(request.method, request.path)
     if entry is None:
-        return web.json_response({'success': False, 'error': '路由不存在'}, status=404)
-    if entry['auth'] and not auth.validate_token(request):
-        return web.json_response({'success': False, 'error': '未登录或会话已过期'}, status=401)
+        return error('路由不存在', status=404)
+    if entry['auth']:
+        denied = _authorize_ext_request(request)
+        if denied is not None:
+            return denied
     return await entry['handler'](request)

@@ -5,7 +5,7 @@ import logging
 import os
 import re
 
-log = logging.getLogger('ElainaBot.web.market')
+log = logging.getLogger('ElainaQQ.web.market')
 
 # ==================== GitHub 插件库配置 ====================
 PLUGIN_REPO = 'ElainaCore/Elaina-plugins'

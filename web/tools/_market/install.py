@@ -3,11 +3,13 @@
 import ast
 import io
 import os
+import shutil
 import zipfile
 
 from aiohttp import web
 
-from core.base.zipsafe import is_within
+from core.base.zipsafe import is_within, validate_archive
+from web.protocol import json_body
 from web.tools._market.fetch import (
     _download_file,
 )
@@ -138,6 +140,7 @@ def _version_lt(local, remote):
 def _preview_zip(content):
     try:
         with zipfile.ZipFile(io.BytesIO(content), 'r') as zf:
+            validate_archive(zf, max_size=512 * 1024 * 1024)
             py_files = [f for f in zf.namelist() if f.endswith('.py') and not f.startswith('__') and '/__pycache__/' not in f]
             files = []
             for pf in py_files[:10]:
@@ -159,7 +162,7 @@ def _preview_zip(content):
 
 
 async def handle_market_preview(request: web.Request):
-    body = await request.json()
+    body = await json_body(request)
     url = body.get('url', '')
     if not url:
         return web.json_response({'success': False, 'message': '缺少 URL'}, status=400)
@@ -241,10 +244,11 @@ def _extract_zip_subset(content, plugin_name, subdir_path=''):
     dest_dir = os.path.join(plugins_dir, safe)
     try:
         with zipfile.ZipFile(io.BytesIO(content), 'r') as zf:
+            validate_archive(zf, max_size=512 * 1024 * 1024)
             flist = zf.namelist()
             if not flist:
                 return {'success': False, 'message': '空压缩包'}
-            # GitHub archive zip 总有一个根目录 (如 repo-main/), 自动去除
+            # GitHub 仓库压缩包总有一个根目录（如 repo-main/），自动去除。
             roots = {f.split('/')[0] for f in flist if '/' in f and f.split('/')[0]}
             root_prefix = (list(roots)[0] + '/') if len(roots) == 1 else ''
 
@@ -267,7 +271,7 @@ def _extract_zip_subset(content, plugin_name, subdir_path=''):
                     continue
                 os.makedirs(os.path.dirname(dest) or dest_dir, exist_ok=True)
                 with zf.open(fp) as src, open(dest, 'wb') as dst:
-                    dst.write(src.read())
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
                 extracted.append(rel)
             if not extracted:
                 return {'success': False, 'message': '未找到要安装的文件'}
@@ -318,8 +322,9 @@ async def _install_module(github_url, module_name, branch='main', mirror=None):
 
     try:
         with zipfile.ZipFile(io.BytesIO(content), 'r') as zf:
+            validate_archive(zf, max_size=512 * 1024 * 1024)
             flist = zf.namelist()
-            # GitHub archive 根目录 (repo-branch/)
+            # GitHub 仓库压缩包根目录（如 repo-branch/）。
             roots = {f.split('/')[0] for f in flist if '/' in f and f.split('/')[0]}
             root_prefix = (list(roots)[0] + '/') if len(roots) == 1 else ''
 
@@ -329,7 +334,7 @@ async def _install_module(github_url, module_name, branch='main', mirror=None):
 
             if not mod_files:
                 # 判断是否为框架仓库 (精确匹配官方仓库)
-                is_framework = 'ElainaCore/ElainaBot_v2' in github_url
+                is_framework = 'ElainaCore/ElainaQQ_v2' in github_url
                 if is_framework:
                     return {
                         'success': False,
@@ -364,7 +369,7 @@ async def _install_module(github_url, module_name, branch='main', mirror=None):
                     continue
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 with zf.open(fp) as src, open(dest, 'wb') as dst:
-                    dst.write(src.read())
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
                 extracted.append(rel)
 
             log.info(f'模块 {safe} 安装完成: {len(extracted)} 个文件')
@@ -444,7 +449,7 @@ async def _install_single(github_url, plugin_name, path='', branch='main', alone
 
 async def handle_market_install(request: web.Request):
     """安装插件/模块"""
-    body = await request.json()
+    body = await json_body(request)
     github_url = body.get('github', '') or body.get('url', '') or body.get('download_url', '')
     item_name = body.get('name', 'unknown')
     item_type = _canonical_type(body.get('type', ''))
@@ -508,7 +513,7 @@ async def _unload_plugin_runtime(plugin_name):
 
 async def handle_market_uninstall(request: web.Request):
     """卸载已安装的插件/模块"""
-    body = await request.json()
+    body = await json_body(request)
     item_name = body.get('name', '')
     item_type = _canonical_type(body.get('type', ''))
     keep_data = body.get('keep_data', False)

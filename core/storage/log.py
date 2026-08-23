@@ -16,14 +16,13 @@ class LogService:
 
     _instance = None
 
-    def __init__(self, base_dir: str, wal_mode: bool = True,
-                 insert_interval: float = 2.0, retention_days: int = 30):
+    def __init__(self, base_dir: str, wal_mode: bool = True, insert_interval: float = 2.0, retention_days: int = 30):
         self._base_dir = base_dir
         self._wal_mode = wal_mode
         self._insert_interval = insert_interval
         self._retention_days = retention_days
-        self._queues = {}  # {(log_type, bot_qq): deque}
-        self._connections = {}  # {(log_type, bot_qq): sqlite3.Connection}
+        self._queues: dict[tuple[str, str], deque] = {}  # 日志类型和账号映射到待写队列
+        self._connections: dict[tuple[str, str], sqlite3.Connection] = {}  # 日志类型和账号映射到数据库连接
         self._lock = asyncio.Lock()
         self._running = False
         self._flush_task = None
@@ -58,7 +57,7 @@ class LogService:
         conn.row_factory = sqlite3.Row
         if self._wal_mode:
             conn.execute('PRAGMA journal_mode=WAL')
-        conn.execute('''
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT,
@@ -72,7 +71,7 @@ class LogService:
                 raw_data TEXT DEFAULT '',
                 extra TEXT DEFAULT ''
             )
-        ''')
+        """)
         conn.execute('CREATE INDEX IF NOT EXISTS idx_log_timestamp ON log(timestamp)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_log_group ON log(group_id)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_log_user ON log(user_id, group_id)')
@@ -142,8 +141,8 @@ class LogService:
             conn = self._get_conn(log_type, bot_qq)
             for entry in entries:
                 conn.execute(
-                    '''INSERT INTO log (timestamp, content, source, level, user_id, group_id, message_id, message_type, raw_data, extra)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    """INSERT INTO log (timestamp, content, source, level, user_id, group_id, message_id, message_type, raw_data, extra)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         entry.get('timestamp', datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
                         entry.get('content', ''),
@@ -155,7 +154,7 @@ class LogService:
                         entry.get('message_type', ''),
                         entry.get('raw_data', ''),
                         entry.get('extra', ''),
-                    )
+                    ),
                 )
             conn.commit()
         except Exception as e:

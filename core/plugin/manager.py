@@ -1,37 +1,49 @@
 """插件管理器 — 加载/卸载/分发/热重载 (v2 异步架构)"""
 
 import asyncio
+import contextlib
 import json
 import os
 from collections import OrderedDict
+from typing import Any
 
 from core.base.logger import PLUGIN, get_logger
+from core.onebot.api import set_api_interceptors
 from core.plugin._dispatch import _DispatchMixin
 from core.plugin._loader import _LoaderMixin
+from core.plugin._plugin_bots import _PluginBotsMixin
 from core.plugin._watcher import _WatcherMixin
+from core.plugin.context import PluginInfo
 
 log = get_logger(PLUGIN, '管理器')
 
 
-class PluginManager(_LoaderMixin, _WatcherMixin, _DispatchMixin):
+class PluginManager(_LoaderMixin, _WatcherMixin, _DispatchMixin, _PluginBotsMixin):
     """插件管理器 — 通过 Mixin 组合加载/分发/监视能力"""
 
     def __init__(self, plugins_dir: str):
         self._dir = os.path.abspath(plugins_dir)
-        self._plugins = OrderedDict()
-        self._all_handlers = []
-        self._all_interceptors = []
+        self._plugins: OrderedDict[str, PluginInfo] = OrderedDict()
+        self._all_handlers: list[dict[str, Any]] = []
+        self._all_interceptors: list[dict[str, Any]] = []
+        self._all_handler_filters: list[dict[str, Any]] = []
+        self._all_api_interceptors: list[dict[str, Any]] = []
         # 分发索引桶 (按事件类型预分组, 避免每条事件遍历全部处理器)
-        self._msg_handlers = []
-        self._generic_handlers = []
-        self._typed_handlers = {}
-        self._disabled_plugins = set()
-        self._cooldowns = {}  # {handler_key: last_trigger_time}
+        self._msg_handlers: list[dict[str, Any]] = []
+        self._generic_handlers: list[dict[str, Any]] = []
+        self._typed_handlers: dict[str, list[dict[str, Any]]] = {}
+        self._event_handlers: dict[str, list[dict[str, Any]]] = {}
+        self._disabled_plugins: set[str] = set()
+        self._cooldowns: dict[tuple[str, ...], tuple[float, float]] = {}  # 处理器与会话标识映射到最近触发时间和冷却秒数
+        self._last_cooldown_cleanup = 0.0
         self._lock = asyncio.Lock()
-        self._file_mtimes = {}
+        self._file_mtimes: dict[str, float] = {}
         self._watcher_task = None
         self._watcher_running = False
-        self._owner_ids = []
+        self._owner_ids: list[str] = []
+        self._base_dir = os.path.dirname(self._dir)
+        self._plugin_bots = {}
+        self._load_plugin_bots()
         self._load_disabled_plugins()
 
     @property
@@ -45,7 +57,7 @@ class PluginManager(_LoaderMixin, _WatcherMixin, _DispatchMixin):
     # ==================== 索引构建 ====================
 
     def _rebuild_handler_list(self):
-        handlers, intercepts = [], []
+        handlers, intercepts, handler_filters, api_intercepts = [], [], [], []
         for plugin in self._plugins.values():
             if not plugin.enabled:
                 continue
@@ -55,9 +67,22 @@ class PluginManager(_LoaderMixin, _WatcherMixin, _DispatchMixin):
             for ic in plugin.interceptors:
                 ic['_plugin'] = plugin.name
                 intercepts.append(ic)
+            for handler_filter in plugin.handler_filters:
+                handler_filter['_plugin'] = plugin.name
+                handler_filters.append(handler_filter)
+            for ic in plugin.api_interceptors:
+                ic['_plugin'] = plugin.name
+                api_intercepts.append(ic)
         self._all_handlers = handlers
         self._all_interceptors = intercepts
+        self._all_handler_filters = sorted(
+            handler_filters,
+            key=lambda item: -item['priority'],
+        )
+        self._all_api_interceptors = sorted(api_intercepts, key=lambda item: -item['priority'])
+        self._apply_bot_bindings()
         self._build_dispatch_index()
+        set_api_interceptors(self._all_api_interceptors)
 
     # ==================== 权限 ====================
 
@@ -126,6 +151,19 @@ class PluginManager(_LoaderMixin, _WatcherMixin, _DispatchMixin):
             for h in self._all_handlers
         ]
 
+    async def shutdown(self) -> None:
+        """停止文件监视并依次执行全部插件的卸载钩子。"""
+        watcher_task = self._watcher_task
+        self.stop_watcher()
+        if watcher_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await watcher_task
+        self._watcher_task = None
+        async with self._lock:
+            for name in list(self._plugins):
+                await self._unload_plugin(name)
+            self._rebuild_handler_list()
+
     def get_web_plugin_info(self) -> dict:
         """构建 {目录名: {commands, description, meta}}"""
         result = {}
@@ -148,7 +186,7 @@ class PluginManager(_LoaderMixin, _WatcherMixin, _DispatchMixin):
 
     def list_plugins(self) -> list:
         """列出所有可发现的插件 (含未加载的)"""
-        result = []
+        result: list[dict[str, Any]] = []
         if not os.path.isdir(self._dir):
             return result
         for name in sorted(os.listdir(self._dir)):
@@ -156,19 +194,15 @@ class PluginManager(_LoaderMixin, _WatcherMixin, _DispatchMixin):
             if not os.path.isdir(plugin_dir) or name.startswith(('_', '.')):
                 continue
             info = self._plugins.get(name)
-            result.append({
-                'name': name,
-                'loaded': name in self._plugins,
-                'enabled': info.enabled if info else name not in self._disabled_plugins,
-                'handlers': len(info.handlers) if info else 0,
-            })
+            result.append(
+                {
+                    'name': name,
+                    'loaded': name in self._plugins,
+                    'enabled': info.enabled if info else name not in self._disabled_plugins,
+                    'handlers': len(info.handlers) if info else 0,
+                }
+            )
         return result
-
-    def get_plugin_bots(self) -> dict:
-        return {}
-
-    def set_plugin_bots(self, data: dict):
-        pass
 
     # ==================== 禁用持久化 ====================
 

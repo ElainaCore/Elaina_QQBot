@@ -1,0 +1,1 @@
+function e(e,t){console.error(`[naive/${e}]: ${t}`)}function t(e,t){throw Error(`[naive/${e}]: ${t}`)}function n(e){return e}export{t as n,e as r,n as t};

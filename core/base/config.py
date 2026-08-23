@@ -7,7 +7,7 @@ from typing import Any
 
 import yaml
 
-log = logging.getLogger('ElainaBot.config')
+log = logging.getLogger('ElainaQQ.config')
 
 
 class Config:
@@ -15,9 +15,9 @@ class Config:
 
     def __init__(self):
         self._config_dir = ''
-        self._data = {}  # {filename_without_ext: dict}
+        self._data = {}  # 配置文件名映射到配置内容
         self._lock = threading.Lock()
-        self._callbacks = {}  # {filename: [callbacks]}
+        self._callbacks = {}  # 配置文件名映射到回调列表
 
     def init(self, config_dir: str):
         """初始化配置目录，加载所有 yaml 文件"""
@@ -34,15 +34,14 @@ class Config:
                 example = os.path.join(self._config_dir, f'{name}.example.yaml')
                 if os.path.isfile(example):
                     import shutil
+
                     shutil.copy2(example, target)
                 else:
                     # 从项目根目录的 config/ 复制
-                    root_example = os.path.join(
-                        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-                        'config', f'{name}.example.yaml'
-                    )
+                    root_example = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'config', f'{name}.example.yaml')
                     if os.path.isfile(root_example):
                         import shutil
+
                         shutil.copy2(root_example, target)
 
     def _load_all(self):
@@ -67,7 +66,7 @@ class Config:
         except Exception as e:
             log.error(f'加载配置失败 [{name}]: {e}')
 
-    def reload(self, name: str = None):
+    def reload(self, name: str | None = None):
         """重新加载配置"""
         if name:
             self._load_file(name)

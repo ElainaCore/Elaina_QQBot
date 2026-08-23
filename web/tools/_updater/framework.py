@@ -3,7 +3,9 @@
 import fnmatch
 import json
 import os
+import re
 import shutil
+import subprocess
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +18,7 @@ from web.tools._updater.shared import (
     DEFAULT_SKIP,
     DEFAULT_WHITELIST,
     GITHUB_API_MIRRORS,
-    GITHUB_DOWNLOAD_URL,
+    GITHUB_SHA_URL,
     _build_mirror_url,
     _load_mirror_cache,
     log,
@@ -56,9 +58,50 @@ class FrameworkUpdater:
     def _load_version(self):
         try:
             with open(self.version_file, encoding='utf-8') as f:
-                return json.load(f).get('version', 'unknown')
+                version = json.load(f).get('version')
+                if version and version != 'unknown':
+                    return version
         except Exception:
-            return 'unknown'
+            pass
+        return self._read_git_version() or 'unknown'
+
+    def _read_git_version(self):
+        """读取源码仓库当前提交；发布压缩包环境没有 Git 时安静回退。"""
+        try:
+            result = subprocess.run(
+                ['git', '-C', str(self.base_dir), 'rev-parse', '--short=8', 'HEAD'],
+                capture_output=True,
+                check=False,
+                encoding='utf-8',
+                errors='ignore',
+                timeout=3,
+            )
+            version = result.stdout.strip()
+            return version if result.returncode == 0 and re.fullmatch(r'[0-9a-fA-F]{8}', version) else ''
+        except (OSError, subprocess.SubprocessError):
+            return ''
+
+    def _read_git_update_time(self):
+        try:
+            result = subprocess.run(
+                [
+                    'git',
+                    '-C',
+                    str(self.base_dir),
+                    'log',
+                    '-1',
+                    '--date=format:%Y-%m-%d %H:%M:%S',
+                    '--format=%cd',
+                ],
+                capture_output=True,
+                check=False,
+                encoding='utf-8',
+                errors='ignore',
+                timeout=3,
+            )
+            return result.stdout.strip() if result.returncode == 0 else ''
+        except (OSError, subprocess.SubprocessError):
+            return ''
 
     def _save_version(self, version):
         try:
@@ -96,17 +139,18 @@ class FrameworkUpdater:
             pass
 
     def get_version_info(self):
+        info = {}
         try:
             with open(self.version_file, encoding='utf-8') as f:
                 info = json.load(f)
-            info['custom_mirror'] = self.custom_mirror
-            return info
         except Exception:
-            return {
-                'version': self.current_version,
-                'update_time': 'unknown',
-                'custom_mirror': self.custom_mirror,
-            }
+            pass
+        stored_version = info.get('version')
+        info['version'] = self.current_version
+        if not info.get('update_time') or stored_version != self.current_version:
+            info['update_time'] = self._read_git_update_time() or 'unknown'
+        info['custom_mirror'] = self.custom_mirror
+        return info
 
     # ==================== 进度 ====================
 
@@ -145,7 +189,7 @@ class FrameworkUpdater:
         path 举例: '/commits?per_page=20'
         """
         headers = {
-            'User-Agent': 'Mozilla/5.0 ElainaBot/1.0',
+            'User-Agent': 'Mozilla/5.0 ElainaQQ/1.0',
             'Accept': 'application/vnd.github+json',
         }
         timeout = _aiohttp.ClientTimeout(total=15)
@@ -159,7 +203,6 @@ class FrameworkUpdater:
                         headers=headers,
                         timeout=timeout,
                         allow_redirects=True,
-                        ssl=False,
                     ) as resp:
                         if resp.status == 200:
                             ct = resp.headers.get('content-type', '')
@@ -206,8 +249,11 @@ class FrameworkUpdater:
 
     async def download_update(self, version):
         try:
+            if not re.fullmatch(r'[0-9a-fA-F]{7,40}', str(version or '')):
+                self._report('failed', '无效的更新版本', 0)
+                return None
             self._report('downloading', '正在选择最快镜像...', 5)
-            original = GITHUB_DOWNLOAD_URL
+            original = GITHUB_SHA_URL.format(version=version)
             url = await self._pick_download_url(original)
             self._report('downloading', '下载中...', 8)
 
@@ -216,7 +262,7 @@ class FrameworkUpdater:
             zip_file = temp_dir / f'{version}.zip'
 
             timeout = _aiohttp.ClientTimeout(total=180)
-            headers = {'User-Agent': 'ElainaBot/1.0'}
+            headers = {'User-Agent': 'ElainaQQ/1.0'}
             async with (
                 _aiohttp.ClientSession() as session,
                 session.get(
@@ -224,16 +270,20 @@ class FrameworkUpdater:
                     headers=headers,
                     timeout=timeout,
                     allow_redirects=True,
-                    ssl=False,
                 ) as resp,
             ):
                 resp.raise_for_status()
-                total = int(resp.headers.get('content-length', 0))
+                total = int(resp.headers.get('content-length', 0) or 0)
+                max_size = 512 * 1024 * 1024
+                if total > max_size:
+                    raise ValueError('更新包超过 512 MB 限制')
                 downloaded = 0
                 with open(zip_file, 'wb') as f:
                     async for chunk in resp.content.iter_chunked(8192):
                         f.write(chunk)
                         downloaded += len(chunk)
+                        if downloaded > max_size:
+                            raise ValueError('更新包超过 512 MB 限制')
                         if total > 0:
                             pct = 10 + downloaded * 30 // total
                             self._report(
@@ -421,6 +471,7 @@ class FrameworkUpdater:
             self._report('checking', '获取最新版本...', 0)
             commits = await self._fetch_api('/commits?per_page=1')
             if not commits or not isinstance(commits, list):
+                self._report('failed', '无法获取版本信息', 0)
                 return {'success': False, 'message': '无法获取版本信息'}
             latest = commits[0].get('sha', '')[:8]
             return await self.update_to_version(latest, skip_backup=skip_backup, auto_restart=auto_restart)
