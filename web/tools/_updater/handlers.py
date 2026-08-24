@@ -18,6 +18,23 @@ _base_dir = ''
 _updater = None
 
 
+def _create_upload_path(directory: str) -> str:
+    os.makedirs(directory, exist_ok=True)
+    descriptor, path = tempfile.mkstemp(prefix='upload_', suffix='.zip', dir=directory)
+    os.close(descriptor)
+    return path
+
+
+def _append_upload(path: str, content: bytes) -> None:
+    with open(path, 'ab') as file:
+        file.write(content)
+
+
+def _remove_upload(path: str) -> None:
+    with contextlib.suppress(OSError):
+        os.remove(path)
+
+
 def set_context(base_dir: str):
     global _base_dir, _updater
     _base_dir = base_dir
@@ -134,7 +151,7 @@ async def handle_start_update(request: web.Request):
 
     # 设置自定义镜像
     if body.get('mirror'):
-        updater.set_custom_mirror(body['mirror'])
+        await asyncio.to_thread(updater.set_custom_mirror, body['mirror'])
 
     skip_backup = body.get('skip_backup', False)
     auto_restart = body.get('auto_restart', False)
@@ -163,7 +180,7 @@ async def handle_get_mirrors(request: web.Request):
         from web.tools._updater.shared import GITHUB_FILE_MIRRORS, _load_mirror_cache
 
         updater = _get_updater()
-        cached = _load_mirror_cache()
+        cached = await asyncio.to_thread(_load_mirror_cache)
         return web.json_response(
             {
                 'success': True,
@@ -210,7 +227,7 @@ async def handle_test_mirrors(request: web.Request):
     # 保存测速结果到磁盘
     from web.tools._updater.shared import _save_mirror_cache
 
-    _save_mirror_cache(sorted([r for r in all_results if r['success']], key=lambda r: r['latency']))
+    await asyncio.to_thread(_save_mirror_cache, sorted([r for r in all_results if r['success']], key=lambda r: r['latency']))
 
     # 发送结束标记
     try:
@@ -227,7 +244,7 @@ async def handle_set_custom_mirror(request: web.Request):
     except Exception:
         body = {}
     mirror = body.get('mirror', '')
-    _get_updater().set_custom_mirror(mirror)
+    await asyncio.to_thread(_get_updater().set_custom_mirror, mirror)
     return web.json_response({'success': True, 'message': f'已设置自定义镜像: {mirror or "(自动选择)"}'})
 
 
@@ -249,29 +266,24 @@ async def handle_upload_update(request: web.Request):
 
     # 保存到临时文件
     upload_dir = os.path.join(_base_dir, 'data', 'temp_update')
-    os.makedirs(upload_dir, exist_ok=True)
-    fd, filepath = tempfile.mkstemp(prefix='upload_', suffix='.zip', dir=upload_dir)
-    os.close(fd)
+    filepath = await asyncio.to_thread(_create_upload_path, upload_dir)
 
     try:
         uploaded = 0
         max_upload = 512 * 1024 * 1024
-        with open(filepath, 'wb') as f:
-            while True:
-                chunk = await field.read_chunk()
-                if not chunk:
-                    break
-                uploaded += len(chunk)
-                if uploaded > max_upload:
-                    raise ValueError('更新包超过 512 MB 限制')
-                f.write(chunk)
+        while True:
+            chunk = await field.read_chunk(size=1024 * 1024)
+            if not chunk:
+                break
+            uploaded += len(chunk)
+            if uploaded > max_upload:
+                raise ValueError('更新包超过 512 MB 限制')
+            await asyncio.to_thread(_append_upload, filepath, chunk)
     except ValueError as e:
-        with contextlib.suppress(OSError):
-            os.remove(filepath)
+        await asyncio.to_thread(_remove_upload, filepath)
         return web.json_response({'success': False, 'message': str(e)}, status=413)
     except Exception as e:
-        with contextlib.suppress(OSError):
-            os.remove(filepath)
+        await asyncio.to_thread(_remove_upload, filepath)
         return web.json_response({'success': False, 'message': f'保存文件失败: {e}'}, status=500)
 
     # 读取额外字段
@@ -301,9 +313,7 @@ async def handle_upload_update(request: web.Request):
         except Exception as e:
             updater._report('failed', f'更新出错: {e}', 0)
         finally:
-            with contextlib.suppress(OSError):
-                os.remove(filepath)
+            _remove_upload(filepath)
 
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, _do)
+    asyncio.create_task(asyncio.to_thread(_do), name='framework-upload-update')
     return web.json_response({'success': True, 'message': '上传成功，开始更新'})

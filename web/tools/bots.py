@@ -27,7 +27,7 @@ async def _login_info(self_id: str) -> dict:
         return c[1]
     info: dict[str, Any] = {}
     try:
-        from core.onebot.api import OneBotAPI
+        from core.protocols.onebot.api import OneBotAPI
 
         resp = await OneBotAPI(_common.adapter()).call_api('get_login_info', self_id=self_id)
         if resp and resp.get('retcode') == 0:
@@ -111,7 +111,7 @@ async def handle_toggle_bot(request: web.Request):
     else:
         bot.enabled = False
         await manager.stop(bot.bot_id)
-    manager._save_accounts()
+    await manager._save_accounts()
     return ok()
 
 
@@ -124,7 +124,7 @@ async def handle_create_embedded_bot(request: web.Request):
     if not bot_id:
         return error('缺少 bot_id')
     try:
-        bot = manager.create_bot(
+        bot = await manager.create_bot(
             bot_id,
             str(body.get('nickname') or ''),
             str(body.get('uin') or ''),
@@ -142,7 +142,7 @@ async def handle_set_embedded_version(request: web.Request):
         return error('内置 QQ 未启用')
     body = await json_body(request)
     try:
-        bot = manager.set_bot_version(
+        bot = await manager.set_bot_version(
             str(body.get('bot_id') or '').strip(),
             str(body.get('qq_version_key') or '').strip(),
         )
@@ -158,7 +158,7 @@ async def handle_set_embedded_quick_login(request: web.Request):
         return error('内置 QQ 未启用')
     body = await json_body(request)
     try:
-        bot = manager.set_force_quick_login(
+        bot = await manager.set_force_quick_login(
             str(body.get('bot_id') or '').strip(),
             bool(body.get('enabled', False)),
         )

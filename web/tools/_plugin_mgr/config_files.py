@@ -12,10 +12,26 @@ import tempfile
 import yaml
 from aiohttp import web
 
-from core.base.zipsafe import is_within
+from core.foundation.archives import is_within
+from core.services.files import read_text, run_sync
 from web.protocol import json_body
 
 MAX_CONFIG_SIZE = 2 * 1024 * 1024
+
+
+def _save_config_file(path: str, content: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.isfile(path):
+        shutil.copy2(path, path + '.backup')
+    fd, temporary = tempfile.mkstemp(prefix='.config-', suffix='.tmp', dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as file:
+            file.write(content)
+        os.replace(temporary, path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.remove(temporary)
+        raise
 
 
 def _manager():
@@ -111,16 +127,15 @@ async def handle_read_config(request: web.Request):
     if os.path.getsize(path) > MAX_CONFIG_SIZE:
         return web.json_response({'success': False, 'message': '配置文件超过 2 MB 限制'}, status=413)
     fmt = manager.detect_config_format(os.path.splitext(path)[1].lower())
-    with open(path, encoding='utf-8') as file:
-        raw = file.read()
+    raw = await read_text(path)
     parsed, comments = None, {}
     if fmt == 'yaml':
         with contextlib.suppress(Exception):
-            parsed = yaml.safe_load(raw)
+            parsed = await run_sync(yaml.safe_load, raw)
             comments = _extract_yaml_comments(raw)
     elif fmt == 'json':
         with contextlib.suppress(Exception):
-            parsed = json.loads(raw)
+            parsed = await run_sync(json.loads, raw)
     return web.json_response(
         {
             'success': True,
@@ -146,34 +161,24 @@ async def handle_save_config(request: web.Request):
         return error
     if fmt == 'yaml':
         try:
-            parsed = yaml.safe_load(content)
+            parsed = await run_sync(yaml.safe_load, content)
         except Exception as exc:
             return web.json_response({'success': False, 'message': f'YAML 格式错误: {exc}'}, status=400)
         if isinstance(parsed, dict) and os.path.isfile(path):
-            with contextlib.suppress(Exception), open(path, encoding='utf-8') as file:
-                comments = _extract_yaml_comments(file.read())
+            with contextlib.suppress(Exception):
+                comments = _extract_yaml_comments(await read_text(path))
                 if comments:
                     content = '\n'.join(_rebuild_yaml(parsed, comments)) + '\n'
     elif fmt == 'json':
         try:
-            content = json.dumps(json.loads(content), ensure_ascii=False, indent=2)
+            parsed_json = await run_sync(json.loads, content)
+            content = await run_sync(json.dumps, parsed_json, ensure_ascii=False, indent=2)
         except Exception as exc:
             return web.json_response({'success': False, 'message': f'JSON 格式错误: {exc}'}, status=400)
     else:
         return web.json_response({'success': False, 'message': '不支持的配置格式'}, status=400)
 
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    if os.path.isfile(path):
-        shutil.copy2(path, path + '.backup')
-    fd, temp_path = tempfile.mkstemp(prefix='.config-', suffix='.tmp', dir=os.path.dirname(path))
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as file:
-            file.write(content)
-        os.replace(temp_path, path)
-    except Exception:
-        with contextlib.suppress(OSError):
-            os.remove(temp_path)
-        raise
+    await run_sync(_save_config_file, path, content)
 
     reloaded = ''
     modules_root = os.path.realpath(manager.modules_dir())

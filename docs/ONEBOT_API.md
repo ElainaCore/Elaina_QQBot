@@ -4,7 +4,7 @@
 
 ElainaQQ 框架已完全暴露 OneBot v11 标准 API 及常见扩展接口。所有方法均可通过 `OneBotAPI` 类调用。
 
-**文件位置：** `core/onebot/api.py`
+**文件位置：** `core/protocols/onebot/api.py`
 
 ---
 
@@ -13,7 +13,7 @@ ElainaQQ 框架已完全暴露 OneBot v11 标准 API 及常见扩展接口。所
 ### 基础用法
 
 ```python
-from core.onebot.api import OneBotAPI
+from core.plugins import OneBotAPI
 
 # 创建 API 实例
 api = OneBotAPI()
@@ -1111,6 +1111,6 @@ await api.send_group_msg(123456, [
 - ✅ **类型提示** 完整的参数和返回值说明
 - ✅ **零学习成本** 与 OneBot 标准完全一致
 
-**文件路径：** `core/onebot/api.py`  
+**文件路径：** `core/protocols/onebot/api.py`
 **作者：** ElainaQQ 团队  
 **更新日期：** 2026-08-21

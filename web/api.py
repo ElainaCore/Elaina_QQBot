@@ -226,7 +226,7 @@ async def handle_login(request: web.Request):
     body = await json_body(request)
 
     password = str(body.get('password', ''))
-    from core.base.config import cfg
+    from core.foundation.config import cfg
 
     admin_pwd = str(cfg.get('settings', 'web.admin_password', '') or '')
     if not admin_pwd:
@@ -266,7 +266,7 @@ _WEAK_PASSWORDS = frozenset({'admin', '123456', 'password', 'admin123', '1234567
 
 
 async def handle_password_status(request: web.Request):
-    from core.base.config import cfg
+    from core.foundation.config import cfg
 
     pwd = str(cfg.get('settings', 'web.admin_password', '') or '')
     is_default = not pwd or (not auth.is_hashed(pwd) and pwd in _WEAK_PASSWORDS)
@@ -281,16 +281,16 @@ async def handle_password_status(request: web.Request):
 
 
 async def handle_get_web_pages(request: web.Request):
-    from core.plugin.web_pages import get_pages
+    from core.plugins.web_pages import get_pages
 
     return ok(pages=get_pages())
 
 
 async def handle_get_web_page_html(request: web.Request):
-    from core.plugin.web_pages import get_page_html
+    from core.plugins.web_pages import get_page_html
 
     key = request.match_info['key']
-    html = get_page_html(key)
+    html = await get_page_html(key)
     if html is None:
         return error('页面不存在', status=404)
     return web.Response(text=html, content_type='text/html', charset='utf-8')
@@ -311,7 +311,7 @@ def _authorize_ext_request(request: web.Request) -> web.Response | None:
 
 async def handle_ext_route(request: web.Request):
     """动态分发插件用 register_route 注册的 /api/ext/ 路由 (查表执行, 支持热重载)。"""
-    from core.plugin.web_pages import match_route
+    from core.plugins.web_pages import match_route
 
     entry = match_route(request.method, request.path)
     if entry is None:
@@ -322,7 +322,8 @@ async def handle_ext_route(request: web.Request):
             return denied
     # 插件面板路由也属于该插件的执行上下文。路由中直接发送消息，
     # 或在路由中创建的后台任务，都应能被出站 API 中间件按插件识别。
-    from core.onebot.api import api_call_source
+    from core.plugins.context import plugin_scope
+    from core.protocols.onebot.api import api_call_source
 
-    with api_call_source(entry.get('owner', '')):
+    with plugin_scope(entry['context']), api_call_source(entry.get('owner', '')):
         return await entry['handler'](request)

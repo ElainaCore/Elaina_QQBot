@@ -283,9 +283,23 @@ if __name__ == "__main__":
 """
 
 
+def _start_restarter(base: str, restarter: str, script: str) -> None:
+    os.makedirs(os.path.dirname(restarter), exist_ok=True)
+    with open(restarter, 'w', encoding='utf-8') as file:
+        file.write(script)
+    if _IS_WINDOWS:
+        subprocess.Popen(
+            [sys.executable, restarter],
+            cwd=base,
+            creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0),
+        )
+    else:
+        subprocess.Popen([sys.executable, restarter], cwd=base, start_new_session=True)
+
+
 async def handle_restart(request: web.Request):
     try:
-        from core.application import get_app
+        from core.runtime.application import get_app
 
         app = get_app()
         if app:
@@ -301,18 +315,12 @@ async def handle_restart(request: web.Request):
     if not os.path.exists(main_py):
         return web.json_response({'success': False, 'error': 'main.py 不存在'})
 
-    data_dir = os.path.join(base, 'data')
-    os.makedirs(data_dir, exist_ok=True)
-    restarter = os.path.join(data_dir, 'bot_restarter.py')
+    restarter = os.path.join(base, 'data', 'bot_restarter.py')
     try:
         script = (_WIN_TEMPLATE if _IS_WINDOWS else _UNIX_TEMPLATE).format(main_py=main_py)
-        with open(restarter, 'w', encoding='utf-8') as f:
-            f.write(script)
+        await asyncio.to_thread(_start_restarter, base, restarter, script)
         if _IS_WINDOWS:
-            subprocess.Popen([sys.executable, restarter], cwd=base, creationflags=getattr(subprocess, 'CREATE_NEW_CONSOLE', 0))
             threading.Thread(target=_exit_after_restart, daemon=True).start()
-        else:
-            subprocess.Popen([sys.executable, restarter], cwd=base, start_new_session=True)
         return web.json_response({'success': True, 'message': '正在重启...'})
     except Exception as e:
         return web.json_response({'success': False, 'error': str(e)})

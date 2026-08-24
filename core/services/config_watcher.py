@@ -3,8 +3,8 @@
 import asyncio
 import os
 
-from core.base.config import cfg
-from core.base.logger import SYSTEM, get_logger
+from core.foundation.config import cfg
+from core.foundation.logging import SYSTEM, get_logger
 
 log = get_logger(SYSTEM, '配置监视')
 

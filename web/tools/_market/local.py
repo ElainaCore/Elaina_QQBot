@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 from typing import Any
 
 from aiohttp import web
 
-from core.base.zipsafe import is_within
+from core.foundation.archives import is_within
 from web.protocol import json_body
 from web.tools._market.shared import _plugins_dir
 
@@ -34,11 +35,10 @@ def _read_source(path: str) -> str:
         return file.read()
 
 
-async def handle_local_plugins(request: web.Request):
-    root = _plugins_dir()
-    plugins: list[dict[str, Any]] = []
+def _scan_local_plugins(root: str) -> list[dict[str, Any]]:
+    plugins = []
     if not os.path.isdir(root):
-        return web.json_response({'success': True, 'plugins': plugins})
+        return plugins
     for item in sorted(os.listdir(root)):
         item_path = os.path.join(root, item)
         if item.startswith(('.', '__')):
@@ -48,6 +48,44 @@ async def handle_local_plugins(request: web.Request):
             plugins.extend({'name': f'{item}/{name[:-3]}', 'type': 'file', 'files': [name], 'path': f'{item}/{name}'} for name in names)
         elif item.endswith('.py'):
             plugins.append({'name': item[:-3], 'type': 'file', 'files': [item], 'path': item})
+    return plugins
+
+
+def _scan_local_source(root: str, directory: str) -> list[dict[str, Any]]:
+    files = []
+    for current, dirs, names in os.walk(directory):
+        dirs[:] = [name for name in dirs if not name.startswith(('__', '.'))]
+        for name in names:
+            if name.startswith(('__', '.')):
+                continue
+            path = os.path.join(current, name)
+            relative = os.path.relpath(path, root).replace('\\', '/')
+            item = {'name': name, 'path': relative, 'size': os.path.getsize(path), 'editable': name.endswith('.py')}
+            if item['editable']:
+                try:
+                    item['content'] = _read_source(path)
+                except (OSError, UnicodeError, ValueError):
+                    item['editable'] = False
+            files.append(item)
+    return files
+
+
+def _save_local_source(target: str, content: str) -> None:
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.plugin-', suffix='.tmp', dir=os.path.dirname(target))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as file:
+            file.write(content)
+        os.replace(temporary, target)
+    except Exception:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+        raise
+
+
+async def handle_local_plugins(request: web.Request):
+    root = _plugins_dir()
+    plugins = await asyncio.to_thread(_scan_local_plugins, root)
     return web.json_response({'success': True, 'plugins': plugins})
 
 
@@ -57,7 +95,7 @@ async def handle_local_plugin_read(request: web.Request):
     full = _source_path(requested, must_exist=True)
     if full:
         try:
-            content = _read_source(full)
+            content = await asyncio.to_thread(_read_source, full)
         except (OSError, UnicodeError, ValueError) as exc:
             return web.json_response({'success': False, 'message': str(exc)}, status=400)
         return web.json_response(
@@ -82,21 +120,7 @@ async def handle_local_plugin_read(request: web.Request):
     if not is_within(root, directory) or not os.path.isdir(directory):
         return web.json_response({'success': False, 'message': '不存在'}, status=404)
 
-    files = []
-    for current, dirs, names in os.walk(directory):
-        dirs[:] = [name for name in dirs if not name.startswith(('__', '.'))]
-        for name in names:
-            if name.startswith(('__', '.')):
-                continue
-            path = os.path.join(current, name)
-            relative = os.path.relpath(path, root).replace('\\', '/')
-            item = {'name': name, 'path': relative, 'size': os.path.getsize(path), 'editable': name.endswith('.py')}
-            if item['editable']:
-                try:
-                    item['content'] = _read_source(path)
-                except (OSError, UnicodeError, ValueError):
-                    item['editable'] = False
-            files.append(item)
+    files = await asyncio.to_thread(_scan_local_source, root, directory)
     return web.json_response({'success': True, 'type': 'folder', 'files': files})
 
 
@@ -114,16 +138,7 @@ async def handle_local_plugin_save(request: web.Request):
             errors.append(f'{path}: 无效或超过 2 MB')
             continue
         try:
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            fd, temp_path = tempfile.mkstemp(prefix='.plugin-', suffix='.tmp', dir=os.path.dirname(target))
-            try:
-                with os.fdopen(fd, 'w', encoding='utf-8') as file:
-                    file.write(content)
-                os.replace(temp_path, target)
-            except Exception:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-                raise
+            await asyncio.to_thread(_save_local_source, target, content)
             saved.append(path)
         except OSError as exc:
             errors.append(f'{path}: {exc}')

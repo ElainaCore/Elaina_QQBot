@@ -6,7 +6,7 @@ import json
 from aiohttp import web
 
 import web.auth as auth
-from core.onebot.event_labels import event_label
+from core.protocols.onebot.event_labels import event_label
 from web.protocol import json_body
 from web.tools import _common
 

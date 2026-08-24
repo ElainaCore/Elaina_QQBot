@@ -4,8 +4,8 @@ import logging
 
 from aiohttp import web
 
-from core.base.config import cfg
-from core.onebot.connection import CONN_TYPES, default_connections, normalize
+from core.foundation.config import cfg
+from core.protocols.onebot.connection import CONN_TYPES, default_connections, normalize
 from web.protocol import error, json_body, ok
 
 log = logging.getLogger('ElainaQQ.web.onebot_conn')

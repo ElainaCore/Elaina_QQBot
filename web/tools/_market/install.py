@@ -1,6 +1,7 @@
 """插件市场 — 安装/卸载/预览/版本对比"""
 
 import ast
+import asyncio
 import io
 import os
 import shutil
@@ -8,7 +9,7 @@ import zipfile
 
 from aiohttp import web
 
-from core.base.zipsafe import is_within, validate_archive
+from core.foundation.archives import is_within, validate_archive
 from web.protocol import json_body
 from web.tools._market.fetch import (
     _download_file,
@@ -76,7 +77,7 @@ def _get_installed_module_names():
     return {d for d in os.listdir(modules_dir) if os.path.isdir(os.path.join(modules_dir, d)) and not d.startswith(('.', '__'))}
 
 
-_PLUGIN_ENTRY_NAMES = ('index.py', 'app.py', 'main.py')
+_PLUGIN_ENTRY_NAMES = ('main.py',)
 
 
 def _read_meta_version(py_path, meta_var):
@@ -177,7 +178,7 @@ async def handle_market_preview(request: web.Request):
             return web.json_response({'success': False, 'message': '下载链接无效'})
 
         if content[:4] == b'PK\x03\x04':
-            return _preview_zip(content)
+            return await asyncio.to_thread(_preview_zip, content)
 
         is_py = url.endswith('.py') or any(k in content[:500] for k in [b'import ', b'def ', b'class '])
         if is_py:
@@ -319,6 +320,11 @@ async def _install_module(github_url, module_name, branch='main', mirror=None):
         return {'success': False, 'message': '下载失败, 请检查网络或镜像'}
     if content[:4] != b'PK\x03\x04':
         return {'success': False, 'message': '下载内容不是有效的 zip 文件'}
+    return await asyncio.to_thread(_install_module_archive, content, github_url, safe)
+
+
+def _install_module_archive(content: bytes, github_url: str, safe: str) -> dict:
+    """在线程中校验并解压模块归档。"""
 
     try:
         with zipfile.ZipFile(io.BytesIO(content), 'r') as zf:
@@ -388,7 +394,7 @@ async def _auto_enable_plugin(reload_name):
     if not reload_name:
         return
     try:
-        from core.application import get_app
+        from core.runtime.application import get_app
 
         app = get_app()
         if not app or not app.plugin_manager:
@@ -409,7 +415,13 @@ async def _install_complete(github_url, plugin_name, subdir_path='', branch='mai
         return {'success': False, 'message': '下载失败, 请检查网络或镜像'}
     if content[:4] != b'PK\x03\x04':
         return {'success': False, 'message': '下载内容不是有效的 zip 文件'}
-    return _extract_zip_subset(content, plugin_name, subdir_path=subdir_path)
+    return await asyncio.to_thread(_extract_zip_subset, content, plugin_name, subdir_path)
+
+
+def _install_named_source(content: bytes, destination: str) -> None:
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    with open(destination, 'wb') as file:
+        file.write(content)
 
 
 async def _install_single(github_url, plugin_name, path='', branch='main', alone=True, mirror=None):
@@ -426,7 +438,8 @@ async def _install_single(github_url, plugin_name, path='', branch='main', alone
         content = await _download_file(url, mirror=mirror)
         if content is None:
             return {'success': False, 'message': '文件下载失败, 请检查路径或网络'}, None
-        return _install_py(content, plugin_name, url), _ALONE_DIR
+        result = await asyncio.to_thread(_install_py, content, plugin_name, url)
+        return result, _ALONE_DIR
 
     p = (path or '').strip('/').replace('\\', '/')
     # 根级单文件 (无目录层级): 直接下载到专属目录, 避免整仓库 zip
@@ -436,10 +449,8 @@ async def _install_single(github_url, plugin_name, path='', branch='main', alone
         if content is None:
             return {'success': False, 'message': '文件下载失败, 请检查路径或网络'}, None
         dest_dir = os.path.join(_plugins_dir(), safe)
-        os.makedirs(dest_dir, exist_ok=True)
         fname = os.path.basename(p)
-        with open(os.path.join(dest_dir, fname), 'wb') as f:
-            f.write(content)
+        await asyncio.to_thread(_install_named_source, content, os.path.join(dest_dir, fname))
         log.info(f'独立插件安装: {safe}/{fname}')
         return {'success': True, 'message': f'已安装到 plugins/{safe}/{fname}', 'path': f'plugins/{safe}', 'files': 1}, safe
 
@@ -502,7 +513,7 @@ def _remove_dir_keep_data(dest_dir):
 async def _unload_plugin_runtime(plugin_name):
     """从运行时卸载插件"""
     try:
-        from core.application import get_app
+        from core.runtime.application import get_app
 
         app = get_app()
         if app and app.plugin_manager:
@@ -538,7 +549,7 @@ async def handle_market_uninstall(request: web.Request):
             if os.path.isfile(alone_py):
                 try:
                     await _unload_plugin_runtime(_ALONE_DIR)
-                    os.remove(alone_py)
+                    await asyncio.to_thread(os.remove, alone_py)
                     log.info(f'plugins/{_ALONE_DIR}/{safe}.py 已卸载')
                     return web.json_response({'success': True, 'message': f'已卸载 plugins/{_ALONE_DIR}/{safe}.py'})
                 except Exception as e:
@@ -552,11 +563,11 @@ async def handle_market_uninstall(request: web.Request):
     try:
         await _unload_plugin_runtime(safe)
         if keep_data and os.path.isdir(os.path.join(dest_dir, 'data')):
-            _remove_dir_keep_data(dest_dir)
+            await asyncio.to_thread(_remove_dir_keep_data, dest_dir)
             log.info(f'{label} 已卸载 (保留 data/)')
             return web.json_response({'success': True, 'message': f'已卸载 {label} (保留数据)'})
         else:
-            shutil.rmtree(dest_dir)
+            await asyncio.to_thread(shutil.rmtree, dest_dir)
             log.info(f'{label} 已卸载')
             return web.json_response({'success': True, 'message': f'已卸载 {label}'})
     except Exception as e:

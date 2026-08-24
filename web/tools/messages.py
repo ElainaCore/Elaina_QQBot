@@ -68,7 +68,7 @@ def set_context(app_instance, base_dir=''):
 
 
 def _api():
-    from core.onebot.api import get_api
+    from core.protocols.onebot.api import get_api
 
     return get_api()
 
@@ -761,7 +761,7 @@ def _save_remarks(remarks):
 
 
 async def handle_get_remarks(request: web.Request):
-    return web.json_response({'success': True, 'data': _load_remarks()})
+    return web.json_response({'success': True, 'data': await asyncio.to_thread(_load_remarks)})
 
 
 async def handle_set_remark(request: web.Request):
@@ -771,9 +771,9 @@ async def handle_set_remark(request: web.Request):
     qq = body.get('qq', '')
     if not gid:
         return web.json_response({'success': False, 'message': '缺少群号'}, status=400)
-    remarks = dict(_load_remarks())
+    remarks = dict(await asyncio.to_thread(_load_remarks))
     remarks[gid] = {'name': name, 'qq': qq}
-    _save_remarks(remarks)
+    await asyncio.to_thread(_save_remarks, remarks)
     _chat_cache.clear()
     return web.json_response({'success': True})
 
@@ -781,10 +781,10 @@ async def handle_set_remark(request: web.Request):
 async def handle_delete_remark(request: web.Request):
     body = await json_body(request)
     gid = str(body.get('group_id', '') or body.get('chat_id', ''))
-    remarks = dict(_load_remarks())
+    remarks = dict(await asyncio.to_thread(_load_remarks))
     if gid in remarks:
         del remarks[gid]
-        _save_remarks(remarks)
+        await asyncio.to_thread(_save_remarks, remarks)
         _chat_cache.clear()
     return web.json_response({'success': True})
 

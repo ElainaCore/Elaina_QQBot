@@ -27,6 +27,9 @@ embedded_qq:
   command: ""                                  # 可选兼容启动命令；留空使用内置启动器
   qq_path: ""                                  # QQ.exe/qq 路径，留空自动探测
   bridge_entry: ""                             # 可选兼容运行时入口；留空使用内置运行时
+  packet_backend: "auto"                       # PB 原始发包后端；auto 自动匹配 QQ 精确版本
+  packet_native_path: ""                       # napi2native 模块；留空自动发现同级 NapCatQQ
+  packet_offsets_path: ""                      # NapCat 版本偏移表；留空自动发现同级 NapCatQQ
   data_dir: "data/qq"                          # QQ 客户端、安装包和各账号数据统一目录
   headless: true                                # 是否以无界面模式启动 QQ
   single_process: false                         # Windows 可选：合并 Chromium 子进程

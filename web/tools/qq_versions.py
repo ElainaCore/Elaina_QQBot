@@ -6,8 +6,8 @@ from pathlib import Path
 
 from aiohttp import web
 
-from core.base.config import cfg
-from core.qq_manager import QQ_VERSIONS, QQDownloadError, get_qq_manager
+from core.foundation.config import cfg
+from core.runtime.qq.distribution import QQ_VERSIONS, QQDownloadError, get_qq_manager
 from web.protocol import json_body
 
 _app = None

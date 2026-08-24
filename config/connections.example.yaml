@@ -23,5 +23,12 @@
 #   url: "ws://127.0.0.1:6700"
 #   token: ""
 #   reconnect_interval: 5000
+#
+# - type: http_client
+#   name: HTTP客户端
+#   enable: false
+#   url: "http://127.0.0.1:5700"
+#   token: ""
+#   self_id: "123456789"  # 多账号时必须填写，API 会按事件 self_id 精确选路
 
 connections: []

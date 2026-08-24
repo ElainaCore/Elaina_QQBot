@@ -10,8 +10,8 @@ from aiohttp import web
 import web.api as _panel_api
 import web.auth as _auth
 import web.ws as _ws
-from core.base.branding import public_text
-from core.base.zipsafe import is_within
+from core.foundation.archives import is_within
+from core.foundation.branding import public_text
 from web.protocol import api_protocol_middleware, prepare_response_headers
 
 log = logging.getLogger('ElainaQQ.web')
@@ -56,7 +56,7 @@ def setup_web(app: web.Application, bot_manager, base_dir: str):
 
     # 注入日志/错误实时推送
     try:
-        from core.base.logger import on_error
+        from core.foundation.logging import on_error
 
         bot_manager._web_log_cb = _ws.push_log
 

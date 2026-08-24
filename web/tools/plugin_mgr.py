@@ -1,6 +1,7 @@
 """插件 / 模块 / 配置文件 管理 (OneBot 适配)"""
 
 import ast
+import asyncio
 import contextlib
 import json
 import logging
@@ -11,7 +12,8 @@ from datetime import datetime
 
 from aiohttp import web
 
-from core.base.zipsafe import is_within
+from core.foundation.archives import is_within
+from core.services.files import ensure_dir, read_text, run_sync, write_text
 from web.protocol import json_body
 from web.tools import _common
 from web.tools._plugin_mgr.archives import handle_module_upload as handle_module_upload
@@ -23,12 +25,12 @@ log = logging.getLogger('ElainaQQ.web.plugin_mgr')
 
 _app = None
 _base_dir = ''
-ENTRY_CANDIDATES = ('main.py', '__init__.py')
+ENTRY_CANDIDATES = ('main.py',)
 _CONFIG_EXTS = ('.yaml', '.yml', '.json')
 
 _PLUGIN_TEMPLATE = '''"""新插件"""
 
-from core.plugin.decorators import handler
+from core.plugins import handler
 
 
 @handler(r'^指令$', name='示例指令', desc='示例指令描述')
@@ -114,6 +116,31 @@ def detect_config_format(ext):
     return 'raw'
 
 
+def _save_source(path: str, content: str) -> None:
+    if os.path.exists(path):
+        shutil.copy2(path, path + '.backup')
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.plugin-', suffix='.tmp', dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as file:
+            file.write(content)
+        os.replace(temporary, path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.remove(temporary)
+        raise
+
+
+def _visible_folders(root: str) -> list[dict[str, str]]:
+    if not os.path.isdir(root):
+        return []
+    return [
+        {'name': item, 'path': item}
+        for item in sorted(os.listdir(root))
+        if os.path.isdir(os.path.join(root, item)) and not item.startswith(('.', '__', '_'))
+    ]
+
+
 # ════════════════ 插件扫描 ════════════════
 
 
@@ -172,15 +199,15 @@ def _scan_plugin_dirs():
             continue
         is_system = dir_name == 'system'
         pinfo = plugin_info_map.get(dir_name, {})
-        has_entry = any(e in os.listdir(dir_path) for e in ENTRY_CANDIDATES) or os.path.isfile(os.path.join(dir_path, f'{dir_name}.py'))
-        files = _scan_py_files(dir_path, read_meta=not has_entry)
+        has_entry = os.path.isfile(os.path.join(dir_path, 'main.py'))
+        if not has_entry:
+            continue
+        files = _scan_py_files(dir_path, read_meta=False)
         if not files:
             continue
 
         # 持久化禁用状态: 目录级 或 入口文件级 (入口文件禁用 = 整体禁用)
-        entry_path = find_entry(dir_path)
-        entry_key = f'{dir_name}/{os.path.basename(entry_path)[:-3]}' if entry_path else ''
-        persist_disabled = dir_name in disabled_set or (entry_key and entry_key in disabled_set)
+        persist_disabled = dir_name in disabled_set
 
         # 标记文件级别的 enabled
         for f in files:
@@ -189,24 +216,12 @@ def _scan_plugin_dirs():
                 f['enabled'] = False
             f['allowed_bots'] = bots_map.get(f'{dir_name}/{stem}', [])
 
-        if has_entry:
-            app_dir = os.path.join(dir_path, 'app')
-            if os.path.isdir(app_dir):
-                sub_files = _scan_py_files(app_dir, prefix='app/')
-                for f in sub_files:
-                    stem = f['name'][:-3] if f['name'].endswith('.py') else f['name']
-                    if persist_disabled or f'{dir_name}/{stem}' in disabled_set:
-                        f['enabled'] = False
-                    f['allowed_bots'] = bots_map.get(f'{dir_name}/{stem}', [])
-                files.extend(sub_files)
-
         loaded = dir_name in (pm.plugins if pm else {})
         dirs.append(
             {
                 'directory': dir_name,
                 'is_system': is_system,
                 'enabled': loaded and not persist_disabled,
-                'is_large': has_entry,
                 'files': files,
                 'allowed_bots': bots_map.get(dir_name, []),
                 'commands': pinfo.get('commands', []),
@@ -219,11 +234,13 @@ def _scan_plugin_dirs():
 
 
 async def handle_scan_plugins(request: web.Request):
-    return web.json_response({'success': True, 'plugins': _scan_plugin_dirs()})
+    plugins = await asyncio.to_thread(_scan_plugin_dirs)
+    return web.json_response({'success': True, 'plugins': plugins})
 
 
 async def handle_scan_plugin_dirs(request: web.Request):
-    return web.json_response({'success': True, 'dirs': _scan_plugin_dirs()})
+    directories = await asyncio.to_thread(_scan_plugin_dirs)
+    return web.json_response({'success': True, 'dirs': directories})
 
 
 # ════════════════ 插件启停 / 重载 ════════════════
@@ -245,9 +262,9 @@ async def handle_toggle_plugin(request: web.Request):
 
     key = f'{name}/{file}' if file else name
     try:
-        (pm.enable_plugin if action == 'enable' else pm.disable_plugin)(key)
+        await (pm.enable_plugin if action == 'enable' else pm.disable_plugin)(key)
         # 入口文件/目录级: 需加载/卸载整个插件; 子文件: 重载目录即可
-        is_entry = not file or f'{file}.py' in ('main.py', 'index.py', 'app.py') or file == name
+        is_entry = not file or file == 'main' or file == name
         if is_entry:
             if action == 'enable' and name not in pm.plugins:
                 await pm.reload(name)
@@ -296,8 +313,7 @@ async def handle_read_plugin(request: web.Request):
     valid, abs_path = validate_path(plugin_path, plugins_dir())
     if not valid or not os.path.isfile(abs_path):
         return web.json_response({'success': False, 'message': '无效路径'}, status=403)
-    with open(abs_path, encoding='utf-8') as f:
-        content = f.read()
+    content = await read_text(abs_path)
     return web.json_response({'success': True, 'content': content, 'path': plugin_path.replace('\\', '/'), 'filename': os.path.basename(plugin_path)})
 
 
@@ -312,18 +328,7 @@ async def handle_save_plugin(request: web.Request):
     valid, abs_path = validate_path(plugin_path, plugins_dir())
     if not valid:
         return web.json_response({'success': False, 'message': '无效路径'}, status=403)
-    if os.path.exists(abs_path):
-        shutil.copy2(abs_path, abs_path + '.backup')
-    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(prefix='.plugin-', suffix='.tmp', dir=os.path.dirname(abs_path))
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.write(content)
-        os.replace(temp_path, abs_path)
-    except Exception:
-        with contextlib.suppress(OSError):
-            os.remove(temp_path)
-        raise
+    await run_sync(_save_source, abs_path, content)
     return web.json_response({'success': True, 'message': '插件已保存'})
 
 
@@ -344,9 +349,7 @@ async def handle_create_plugin(request: web.Request):
         return web.json_response({'success': False, 'message': '无效文件名'}, status=403)
     if os.path.exists(plugin_path):
         return web.json_response({'success': False, 'message': '文件已存在'}, status=409)
-    os.makedirs(target_dir, exist_ok=True)
-    with open(plugin_path, 'w', encoding='utf-8') as f:
-        f.write(_PLUGIN_TEMPLATE)
+    await write_text(plugin_path, _PLUGIN_TEMPLATE)
     return web.json_response({'success': True, 'message': '插件已创建', 'path': plugin_path.replace('\\', '/')})
 
 
@@ -362,17 +365,13 @@ async def handle_create_folder(request: web.Request):
         return web.json_response({'success': False, 'message': '无效目录'}, status=403)
     if os.path.exists(target):
         return web.json_response({'success': False, 'message': '文件夹已存在'}, status=409)
-    os.makedirs(target, exist_ok=True)
+    await ensure_dir(target)
     return web.json_response({'success': True, 'message': '文件夹已创建'})
 
 
 async def handle_get_folders(request: web.Request):
     pdir = plugins_dir()
-    folders = []
-    if os.path.isdir(pdir):
-        for item in sorted(os.listdir(pdir)):
-            if os.path.isdir(os.path.join(pdir, item)) and not item.startswith(('.', '__', '_')):
-                folders.append({'name': item, 'path': item})
+    folders = await run_sync(_visible_folders, pdir)
     return web.json_response({'success': True, 'folders': folders})
 
 
@@ -401,7 +400,7 @@ async def handle_set_plugin_bots(request: web.Request):
     data = body.get('plugin_bots')
     if not isinstance(data, dict):
         return web.json_response({'success': False, 'message': 'plugin_bots 必须为对象'}, status=400)
-    pm.set_plugin_bots(data)
+    await pm.set_plugin_bots(data)
     return web.json_response({'success': True, 'message': '插件机器人绑定已保存'})
 
 
@@ -413,7 +412,7 @@ async def handle_plugin_config_files(request: web.Request):
     valid, plugin_dir = validate_path(plugin_name, plugins_dir())
     if not valid or not os.path.isdir(plugin_dir):
         return web.json_response({'success': False, 'message': '无效插件名'}, status=403)
-    files = list_config_files(os.path.join(plugin_dir, 'data'))
+    files = await run_sync(list_config_files, os.path.join(plugin_dir, 'data'))
     return web.json_response({'success': True, 'config_files': files})
 
 
@@ -472,7 +471,8 @@ def _scan_modules():
 
 
 async def handle_scan_modules(request: web.Request):
-    return web.json_response({'success': True, 'modules': _scan_modules()})
+    modules = await asyncio.to_thread(_scan_modules)
+    return web.json_response({'success': True, 'modules': modules})
 
 
 async def handle_module_toggle(request: web.Request):
@@ -490,7 +490,7 @@ async def handle_module_toggle(request: web.Request):
         else:
             ok = await mm.disable(name)
             if not ok:
-                mm.set_module_enabled_persist(name, False)
+                await mm.set_module_enabled_persist(name, False)
                 return web.json_response({'success': True, 'message': f'模块 {name} 已关闭'})
         if ok:
             verb = '开启' if action == 'enable' else '关闭'

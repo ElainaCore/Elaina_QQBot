@@ -92,7 +92,7 @@ async def get_nickname(user_id: str, bot_qq: str = '') -> str:
 
     name = ''
     try:
-        from core.onebot.api import get_api
+        from core.protocols.onebot.api import get_api
 
         resp = await get_api().get_stranger_info(uid, self_id=bot_id or None)
         if resp and resp.get('retcode') == 0:

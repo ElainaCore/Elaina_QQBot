@@ -79,12 +79,12 @@ ElainaQQ/
 ├── main.py          # 主程序入口
 ├── config/          # 配置文件 (settings.yaml / connections.yaml)
 ├── core/            # 核心框架
-│   ├── base/        #   配置、日志、上下文
-│   ├── onebot/      #   OneBot v11 适配器 / API / 连接
-│   ├── plugin/      #   插件加载、分发、热重载、装饰器
-│   ├── module/      #   模块系统
-│   ├── server/      #   HTTP / WS 服务器
-│   └── storage/     #   日志数据库等存储
+│   ├── foundation/  #   配置、日志与基础设施
+│   ├── plugins/     #   严格异步插件 API、加载与分发
+│   ├── protocols/   #   OneBot v11 事件、API 与连接
+│   ├── runtime/     #   应用、模块和内置 QQ 运行时
+│   ├── services/    #   异步文件与日志服务
+│   └── transport/   #   HTTP / WebSocket 传输
 ├── plugins/         # 插件目录 (热加载)
 └── web/             # Web 面板 (后端 + 前端 dist)
 ```
@@ -97,7 +97,7 @@ ElainaQQ/
 最简插件 `plugins/hello/main.py`：
 
 ```python
-from core.plugin.decorators import handler
+from core.plugins import handler
 
 
 @handler(r'^你好$', name='打招呼', desc='回复一句问候')

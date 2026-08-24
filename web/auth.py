@@ -192,7 +192,7 @@ def _peer_ip(request: web.Request) -> str:
 
 def _trust_forwarded() -> bool:
     try:
-        from core.base.config import cfg
+        from core.foundation.config import cfg
 
         return bool(cfg.get('settings', 'web.trust_forwarded_headers', False))
     except Exception:

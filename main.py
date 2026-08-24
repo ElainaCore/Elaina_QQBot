@@ -31,7 +31,7 @@ def _relaunch() -> None:
 
 
 def main():
-    from core.application import Application
+    from core.runtime.application import Application
 
     async def run_application():
         loop = asyncio.get_running_loop()

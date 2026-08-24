@@ -4,6 +4,7 @@ import os
 
 from aiohttp import web
 
+from core.services.files import read_text, run_sync, write_text
 from web.protocol import error, json_body, ok
 
 _base_dir = ''
@@ -25,8 +26,7 @@ async def handle_get_config(request: web.Request):
     for name in _ALLOWED:
         path = os.path.join(cdir, f'{name}.yaml')
         if os.path.exists(path):
-            with open(path, encoding='utf-8') as f:
-                result[name] = f.read()
+            result[name] = await read_text(path)
     return ok(**result)
 
 
@@ -44,7 +44,7 @@ async def handle_save_config(request: web.Request):
         import yaml
 
         try:
-            yaml.safe_load(content)
+            await run_sync(yaml.safe_load, content)
         except yaml.YAMLError as e:
             return error(f'YAML 格式错误: {e}')
 
@@ -52,18 +52,15 @@ async def handle_save_config(request: web.Request):
         path = os.path.join(cdir, f'{file_name}.yaml')
 
         if os.path.exists(path):
-            with open(path, encoding='utf-8') as f:
-                original = f.read()
-            with open(path + '.bak', 'w', encoding='utf-8') as fb:
-                fb.write(original)
+            original = await read_text(path)
+            await write_text(path + '.bak', original)
 
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write(content)
+        await write_text(path, content)
 
         # 触发热重载
-        from core.base.config import cfg
+        from core.foundation.config import cfg
 
-        cfg.reload(file_name)
+        await run_sync(cfg.reload, file_name)
 
         return ok(message='配置已保存')
     except Exception as e:

@@ -32,7 +32,7 @@
 
 ```python
 """Hello 插件 — 最小示例"""
-from core.plugin.decorators import handler
+from core.plugins import handler
 
 
 @handler(r'^你好$', name='打招呼', desc='回复一句问候')
@@ -45,17 +45,17 @@ async def say_hello(event, match):
 | 元素 | 说明 |
 | --- | --- |
 | `@handler(r'^你好$')` | 正则匹配用户消息文本 |
-| `event` | 当前消息事件对象 (`core.onebot.event.MessageEvent`) |
+| `event` | 当前消息事件对象 (`core.protocols.onebot.event.MessageEvent`) |
 | `match` | `re.Match` 对象 (匹配结果) |
 | `event.reply(...)` | 回复当前会话 (自动判断群聊/私聊) |
 
-> 处理函数签名固定为 `async def func(event, match)`，也支持同步函数 (会自动跑在线程池中)。
+> 处理函数签名固定为 `async def func(event, match)`。新版框架不再接受同步 handler。
 
 ---
 
 ## 2. 插件目录结构
 
-每个插件是 `plugins/` 下的一个**子目录**，框架会导入目录内的入口文件 (推荐 `main.py`)。以 `_` 或 `.` 开头的目录会被忽略。
+每个插件是 `plugins/` 下的一个**子目录**，框架只导入该目录的 `main.py`。以 `_` 或 `.` 开头的目录会被忽略。
 
 ### 2.1 简单插件 (单文件)
 
@@ -72,23 +72,26 @@ plugins/
 plugins/
 └── my_plugin/
     ├── main.py            # 入口 (在此 import 子模块即可生效)
-    ├── app/               # 子模块目录
-    │   └── core.py
+    ├── services/          # 业务服务
+    │   └── commands.py
+    ├── storage/           # 持久化实现
+    ├── web/               # Web 路由
+    ├── assets/            # 页面和静态资源
     ├── data/              # 数据存储 (ctx 管理)
     └── requirements.txt   # 依赖 (可选, 框架可自动 pip install)
 ```
 
-> **子目录访问**：`from .app.core import xxx` (相对导入)。
+> **子目录访问**：`from .services.commands import xxx` (相对导入)。
 > **自由组织**：框架只导入入口文件，内部结构、文件数量和命名完全自由，只需在入口文件中 import 即可生效。
 
 ---
 
 ## 3. 核心装饰器
 
-所有装饰器都从 `core.plugin.decorators` 导入：
+插件只能从公共入口 `core.plugins` 导入框架能力：
 
 ```python
-from core.plugin.decorators import handler, on_load, on_unload, interceptor
+from core.plugins import handler, interceptor, on_load, on_unload
 ```
 
 ### 3.1 `@handler` 消息处理器
@@ -182,17 +185,17 @@ async def weather(event, match):
 ### 3.2 `@on_load` / `@on_unload` 生命周期钩子
 
 ```python
-from core.plugin.decorators import on_load, on_unload
+from core.plugins import on_load, on_unload
 
 
 @on_load
 async def init():
-    """插件加载完成时执行 (支持 async/sync)"""
+    """插件加载完成时执行。"""
     print("插件已加载")
 
 
 @on_unload
-def cleanup():
+async def cleanup():
     """插件卸载/重载时执行 — 清理资源"""
     print("插件已卸载")
 ```
@@ -223,7 +226,7 @@ async def filter_keywords(event):
 目标插件过滤器在 handler 匹配前执行，适合按目标插件实现租户隔离、权限策略或审计规则。返回 `True` 时只跳过当前目标插件，不影响其他插件处理同一事件。
 
 ```python
-from core.plugin.decorators import handler_filter
+from core.plugins import handler_filter
 
 
 @handler_filter(priority=100)
@@ -240,8 +243,7 @@ async def restrict_plugin(event, target_plugin):
 API 中间件在插件调用到达 OneBot 适配器前执行，可以修改参数、接管调用或放行到下一个中间件。只有调用并返回 `await call_next()` 时，调用才会继续发送。
 
 ```python
-from core.onebot.api import bypass_api_interceptors, get_api
-from core.plugin.decorators import api_interceptor
+from core.plugins import api_interceptor, bypass_api_interceptors, get_api
 
 
 @api_interceptor(priority=100)
@@ -359,7 +361,7 @@ await event.call_api('send_private_msg', {
 没有 `event` 时 (定时任务、`@on_load` 后台循环)，取全局 API 对象直接调用：
 
 ```python
-from core.onebot.api import get_api
+from core.plugins import get_api
 
 api = get_api()
 await api.send_group_msg(123456, "后台推送")
@@ -431,7 +433,7 @@ await event.call_api('set_friend_add_request', {
     'flag': event.flag, 'approve': True})
 ```
 
-框架在 `core.onebot.api.OneBotAPI` 中封装了常用动作 (经 `event.call_api` 或 `get_api()` 间接使用)：
+框架在 `core.protocols.onebot.api.OneBotAPI` 中封装了常用动作 (插件应经 `event.call_api` 或 `get_api()` 间接使用)：
 
 | 方法 | 对应动作 |
 | --- | --- |
@@ -458,13 +460,12 @@ await event.call_api('set_friend_add_request', {
 
 ## 7. 插件上下文 `ctx`
 
-`ctx` 在插件加载时由框架注入，提供 **data/ 目录读写与日志**。在模块顶层捕获：
+插件执行期间可通过 `current_plugin()` 取得上下文。入口导入发生在插件作用域内，因此可在模块顶层捕获：
 
 ```python
-import os
-import core.plugin.context as _ctx_mod
+from core.plugins import current_plugin, read_json, write_json
 
-ctx = _ctx_mod.ctx  # 模块顶层捕获 (加载期间有效)
+ctx = current_plugin()
 
 # data/ 下文件的绝对路径 (目录已自动创建)
 path = ctx.get_data_path('counter.json')
@@ -472,15 +473,10 @@ path = ctx.get_data_path('counter.json')
 # 插件根目录下的资源文件
 res = ctx.get_resource_path('template.html')
 
-# 读写示例
-import json
-data = {}
-if os.path.exists(path):
-    with open(path, encoding='utf-8') as f:
-        data = json.load(f)
+# 异步读写示例 (应在 handler 或生命周期函数中调用)
+data = await read_json(path, default={})
 data['count'] = data.get('count', 0) + 1
-with open(path, 'w', encoding='utf-8') as f:
-    json.dump(data, f, ensure_ascii=False)
+await write_json(path, data)
 ```
 
 | 成员 | 说明 |
@@ -519,8 +515,7 @@ __plugin_meta__ = {
 ### 9.1 注册侧边栏页面
 
 ```python
-from core.plugin.web_pages import register_page, unregister_page
-from core.plugin.decorators import on_unload
+from core.plugins import on_unload, register_page, unregister_page
 
 
 # 内联 HTML
@@ -538,7 +533,7 @@ register_page(key='my-page', label='我的页面',
 
 
 @on_unload
-def _cleanup():
+async def _cleanup():
     unregister_page('my-page')
 ```
 
@@ -548,7 +543,7 @@ def _cleanup():
 
 ```python
 from aiohttp import web
-from core.plugin.web_pages import register_route
+from core.plugins import register_route
 
 
 # 免验证路由
@@ -584,19 +579,19 @@ async def echo(request):
 框架配置在 `config/settings.yaml`，通过全局 `cfg` 读取 (支持热加载)：
 
 ```python
-from core.base.config import cfg
+from core.plugins import config
 
 # cfg.get(文件名, '点路径', 默认值)
-port = cfg.get('settings', 'server.port', 5201)
-owner_ids = cfg.get('settings', 'owner.ids', [])
+port = config.get('settings', 'server.port', 5201)
+owner_ids = config.get('settings', 'owner.ids', [])
 ```
 
-`server.port` 是 Web 面板和公开 OneBot 入口端口。内置 QQ 的账号桥接端口由框架管理，默认从 `embedded_qq.bridge_port_start=30010` 开始递增，并且只监听 `127.0.0.1`。插件不应连接或占用这些内部端口；调用 QQ 能力时始终使用 `event.reply(...)` 或 `core.onebot.api.get_api()`。
+`server.port` 是 Web 面板和公开 OneBot 入口端口。内置 QQ 的账号桥接端口由框架管理，默认从 `embedded_qq.bridge_port_start=30010` 开始递增，并且只监听 `127.0.0.1`。插件不应连接或占用这些内部端口；调用 QQ 能力时始终使用 `event.reply(...)` 或 `core.plugins.get_api()`。
 
 ### 10.2 日志与异常上报
 
 ```python
-from core.base.logger import get_logger, PLUGIN, report_error
+from core.plugins import PLUGIN, get_logger, report_error
 
 log = get_logger(PLUGIN, '我的插件')
 
@@ -618,8 +613,8 @@ async def risky(event, match):
 ### 11.1 超时与异步
 
 - 框架对每个 handler 强制 **300 秒超时**，超时会自动取消并记录错误。
-- 推荐全程 `async def` + `await`；同步函数会被自动放进线程池执行，但**同步函数内无法 `await event.reply`**，应避免。
-- 不要在 async handler 里做同步阻塞 IO，用 `asyncio.to_thread(...)` 包装。
+- `handler`、生命周期、拦截器、过滤器和插件 HTTP 路由必须使用 `async def`。同步函数会在注册时直接报错。
+- 不要在异步函数里执行同步文件、SQLite、网络或子进程操作。优先用 `read_json` / `write_json` / `read_text` / `write_text`，其他阻塞库用 `run_sync` 包装。
 
 ### 11.2 命名与正则
 
@@ -635,7 +630,7 @@ async def risky(event, match):
 
 - **延迟导入**：体积大的依赖在 handler 内 `import`，加快插件加载。
 - **冷却限流**：高频指令加 `cooldown=N`。
-- **大型插件**：子模块放到 `app/` 等子目录，按需 import。
+- **大型插件**：按 `services/`、`storage/`、`web/`、`assets/` 划分职责，由 `main.py` 显式导入。
 
 ---
 
@@ -646,15 +641,21 @@ async def risky(event, match):
 ```python
 """签到插件 — 积分 + 数据持久化 + Web 页面"""
 
-import json
-import os
 import random
 import time
 
-import core.plugin.context as _ctx_mod
-from core.plugin.decorators import handler, on_load, on_unload
-from core.plugin.web_pages import register_page, unregister_page
-from core.base.logger import get_logger, PLUGIN
+from core.plugins import (
+    PLUGIN,
+    current_plugin,
+    get_logger,
+    handler,
+    on_load,
+    on_unload,
+    read_json,
+    register_page,
+    unregister_page,
+    write_json,
+)
 
 __plugin_meta__ = {
     'name': '签到插件',
@@ -665,20 +666,8 @@ __plugin_meta__ = {
 }
 
 log = get_logger(PLUGIN, '签到')
-ctx = _ctx_mod.ctx
+ctx = current_plugin()
 _DATA = ctx.get_data_path('checkin.json')
-
-
-def _load():
-    if os.path.exists(_DATA):
-        with open(_DATA, encoding='utf-8') as f:
-            return json.load(f)
-    return {}
-
-
-def _save(d):
-    with open(_DATA, 'w', encoding='utf-8') as f:
-        json.dump(d, f, ensure_ascii=False)
 
 
 @on_load
@@ -692,14 +681,14 @@ async def init():
 
 
 @on_unload
-def cleanup():
+async def cleanup():
     unregister_page('checkin-stats')
     log.info("签到插件已卸载")
 
 
 @handler(r'^签到$', name='签到', desc='每日签到领积分')
 async def check_in(event, match):
-    data = _load()
+    data = await read_json(_DATA, default={})
     uid = str(event.user_id)
     today = time.strftime('%Y-%m-%d')
     rec = data.get(uid, {'last': '', 'points': 0})
@@ -710,13 +699,14 @@ async def check_in(event, match):
     rec['points'] += gain
     rec['last'] = today
     data[uid] = rec
-    _save(data)
+    await write_json(_DATA, data)
     await event.reply(f"✅ 签到成功! +{gain} 积分, 共 {rec['points']} 分")
 
 
 @handler(r'^积分$', name='查积分')
 async def my_points(event, match):
-    rec = _load().get(str(event.user_id), {'points': 0})
+    data = await read_json(_DATA, default={})
+    rec = data.get(str(event.user_id), {'points': 0})
     await event.reply(f"你的积分: {rec['points']}")
 ```
 

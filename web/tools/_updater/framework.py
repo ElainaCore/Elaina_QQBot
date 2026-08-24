@@ -1,5 +1,6 @@
 """框架更新 — FrameworkUpdater 更新流程类"""
 
+import asyncio
 import fnmatch
 import json
 import os
@@ -12,7 +13,7 @@ from pathlib import Path
 
 import aiohttp as _aiohttp
 
-from core.base.zipsafe import safe_extractall
+from core.foundation.archives import safe_extractall
 from web.tools._updater.mirror import detect_environment
 from web.tools._updater.shared import (
     DEFAULT_SKIP,
@@ -23,6 +24,16 @@ from web.tools._updater.shared import (
     _load_mirror_cache,
     log,
 )
+
+
+def _prepare_download(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'')
+
+
+def _append_download(path: Path, content: bytes) -> None:
+    with path.open('ab') as file:
+        file.write(content)
 
 
 class FrameworkUpdater:
@@ -257,9 +268,8 @@ class FrameworkUpdater:
             url = await self._pick_download_url(original)
             self._report('downloading', '下载中...', 8)
 
-            temp_dir = self.base_dir / 'data' / 'temp_update'
-            temp_dir.mkdir(exist_ok=True)
-            zip_file = temp_dir / f'{version}.zip'
+            zip_file = self.base_dir / 'data' / 'temp_update' / f'{version}.zip'
+            await asyncio.to_thread(_prepare_download, zip_file)
 
             timeout = _aiohttp.ClientTimeout(total=180)
             headers = {'User-Agent': 'ElainaQQ/1.0'}
@@ -278,19 +288,18 @@ class FrameworkUpdater:
                 if total > max_size:
                     raise ValueError('更新包超过 512 MB 限制')
                 downloaded = 0
-                with open(zip_file, 'wb') as f:
-                    async for chunk in resp.content.iter_chunked(8192):
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if downloaded > max_size:
-                            raise ValueError('更新包超过 512 MB 限制')
-                        if total > 0:
-                            pct = 10 + downloaded * 30 // total
-                            self._report(
-                                'downloading',
-                                f'下载中... {downloaded * 100 // total}%',
-                                pct,
-                            )
+                async for chunk in resp.content.iter_chunked(1024 * 1024):
+                    downloaded += len(chunk)
+                    if downloaded > max_size:
+                        raise ValueError('更新包超过 512 MB 限制')
+                    await asyncio.to_thread(_append_download, zip_file, chunk)
+                    if total > 0:
+                        pct = 10 + downloaded * 30 // total
+                        self._report(
+                            'downloading',
+                            f'下载中... {downloaded * 100 // total}%',
+                            pct,
+                        )
 
             self._report('downloading', '下载完成', 40)
             return str(zip_file)
@@ -483,7 +492,7 @@ class FrameworkUpdater:
     def _trigger_restart():
         """更新后重启: Windows 用外部脚本, Linux/Docker 走内部重启 + os.execv"""
         try:
-            from core.application import get_app
+            from core.runtime.application import get_app
 
             app = get_app()
             if app:
