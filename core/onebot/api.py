@@ -10,6 +10,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
+from core.onebot.protocol import action_failed, normalize_action_response
+
 logger = logging.getLogger('ElainaQQ.onebot.api')
 
 # 常用 OneBot v11 与 QQ 动作；call_api 不设白名单，新增动作无需升级框架即可调用。
@@ -295,6 +297,7 @@ class OneBotAPI:
 
     def __init__(self, adapter=None):
         self._adapter = adapter or _adapter_ref
+        self._routed_methods = {}
 
     @staticmethod
     def supported_actions() -> list[str]:
@@ -308,6 +311,9 @@ class OneBotAPI:
         attr = object.__getattribute__(self, name)
         if name == 'call_api' or name.startswith('_') or not asyncio.iscoroutinefunction(attr):
             return attr
+        cache = object.__getattribute__(self, '_routed_methods')
+        if name in cache:
+            return cache[name]
 
         async def routed(*args, **kwargs):
             self_id = kwargs.pop('self_id', kwargs.pop('_self_id', None))
@@ -319,6 +325,7 @@ class OneBotAPI:
             finally:
                 _routed_self_id.reset(token)
 
+        cache[name] = routed
         return routed
 
     async def call_api(
@@ -331,7 +338,8 @@ class OneBotAPI:
         if self_id is None:
             self_id = _routed_self_id.get()
         if not self._adapter:
-            return None
+            return action_failed('OneBot 适配器未初始化', 1500)
+        self_id = self._adapter.default_self_id() if self_id is None else self._adapter.resolve_self_id(self_id)
 
         source_plugin, source_context = _api_source.get()
         local_actions = getattr(self._adapter, 'local_actions', {})
@@ -344,8 +352,10 @@ class OneBotAPI:
             local=(str(self_id) in local_actions if self_id is not None else bool(local_actions)),
         )
         if _api_interceptors and not _skip_api_interceptors.get():
-            return await self._run_api_interceptors(request, 0)
-        return await self._call_transport(request)
+            result = await self._run_api_interceptors(request, 0)
+        else:
+            result = await self._call_transport(request)
+        return normalize_action_response(result)
 
     async def _run_api_interceptors(self, request: ApiCallRequest, index: int):
         if index >= len(_api_interceptors):
@@ -353,7 +363,7 @@ class OneBotAPI:
 
         interceptor = _api_interceptors[index]
         allowed = interceptor.get('_allowed_bots')
-        if allowed is not None and str(request.self_id or '') not in allowed:
+        if not self._adapter.allows_self_id(allowed, str(request.self_id or '')):
             return await self._run_api_interceptors(request, index + 1)
 
         advanced = False
@@ -380,54 +390,56 @@ class OneBotAPI:
                 return None
             return await call_next()
 
-    async def _call_transport(self, request: ApiCallRequest) -> dict | None:
-        """跳过插件中间件，将调用发送到内置 QQ、WebSocket 或 HTTP。"""
+    async def _call_transport(self, request: ApiCallRequest) -> dict:
+        """选择唯一可用传输，并统一响应与调用后处理。"""
         action = request.action
         params = request.params
         self_id = request.self_id
-
-        local = await self._adapter.call_local_action(action, params, self_id)
-        if local is not None:
-            return local
-
-        ws = self._adapter.get_bot_ws(self_id)
-        if ws is None:  # WebSocketResponse 的 bool() 为 False, 必须用 is None 判空
-            # 反向/正向 WS 都不可用时, 尝试 HTTP 客户端 (框架 -> OneBot HTTP API)
-            if getattr(self._adapter, 'http_clients', None):
-                return await self._adapter.http_call_action(action, params)
-            logger.debug('API 未调用: 机器人未连接 (%s, self_id=%s)', action, self_id or '-')
-            return None
-
-        echo = str(uuid.uuid4())
-        payload = {
-            'action': action,
-            'params': params,
-            'echo': echo,
-        }
-
-        future = asyncio.get_running_loop().create_future()
-        self._adapter.register_api_response(echo, future, ws)
-
+        response = None
         try:
-            # aiohttp 的 WebSocketResponse/ClientWebSocketResponse 使用 send_str
-            send = getattr(ws, 'send_str', None) or ws.send_text
-            await send(json.dumps(payload, ensure_ascii=False))
-            async with asyncio.timeout(30):
-                return await future
+            request.local = bool(
+                self._adapter.local_actions
+                and (self_id is None or str(self_id) in self._adapter.local_actions)
+            )
+            response = await self._adapter.call_local_action(action, params, self_id)
+            if response is None:
+                ws = self._adapter.get_bot_ws(self_id)
+                if ws is not None:
+                    echo = str(uuid.uuid4())
+                    future = asyncio.get_running_loop().create_future()
+                    self._adapter.register_api_response(echo, future, ws)
+                    try:
+                        send = getattr(ws, 'send_str', None) or ws.send_text
+                        await send(json.dumps({'action': action, 'params': params, 'echo': echo}, ensure_ascii=False))
+                        async with asyncio.timeout(30):
+                            response = await future
+                    finally:
+                        self._adapter.discard_api_response(echo)
+                elif getattr(self._adapter, 'http_clients', None):
+                    response = await self._adapter.http_call_action(action, params)
+                else:
+                    logger.debug('API 未调用: 机器人未连接 (%s, self_id=%s)', action, self_id or '-')
         except TimeoutError:
             logger.warning('API 超时: %s', action)
-            return None
+            response = action_failed('OneBot 接口响应超时', 1500)
         except asyncio.CancelledError:
             task = asyncio.current_task()
             if task is not None and task.cancelling():
                 raise
             logger.debug('API 连接已断开: %s', action)
-            return None
+            response = action_failed('OneBot 连接已断开', 1500)
         except Exception as e:
             logger.error('API 错误: %s - %s', action, e)
-            return None
-        finally:
-            self._adapter.discard_api_response(echo)
+            response = action_failed(str(e), 1500)
+
+        normalized = normalize_action_response(response)
+        handler = getattr(self._adapter, 'action_result_handler', None)
+        if handler is not None:
+            try:
+                await handler(str(self_id or ''), action, params, normalized)
+            except Exception:
+                logger.exception('OneBot 动作后处理失败: %s', action)
+        return normalized
 
     def __getattr__(self, name):
         """将任意 OneBot action 暴露为异步方法，兼容未预先封装的扩展接口。"""
@@ -469,8 +481,13 @@ class OneBotAPI:
     async def get_login_info(self) -> dict | None:
         return await self.call_api('get_login_info')
 
-    async def get_stranger_info(self, user_id) -> dict | None:
-        return await self.call_api('get_stranger_info', {'user_id': int(user_id)})
+    async def get_stranger_info(self, user_id, **kwargs) -> dict | None:
+        self_id = kwargs.pop('self_id', kwargs.pop('_self_id', None))
+        return await self.call_api(
+            'get_stranger_info',
+            {'user_id': int(user_id), **kwargs},
+            self_id=str(self_id) if self_id is not None else None,
+        )
 
     async def get_friend_list(self) -> dict | None:
         return await self.call_api('get_friend_list')

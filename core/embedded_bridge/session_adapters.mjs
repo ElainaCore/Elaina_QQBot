@@ -129,3 +129,21 @@ export class MessageListener {
   onRedTouchChanged() {}
   onBroadcastHelperProgerssUpdate() {}
 }
+
+export class BuddyListener {
+  onBuddyListChangedV2() {}
+  onBuddyListChange() {}
+  onBuddyInfoChange() {}
+  onBuddyReqChange() {}
+  onDoubtBuddyReqChange() {}
+}
+
+export class GroupListener {
+  onGroupListInited() {}
+  onGroupListUpdate() {}
+  onGroupDetailInfoChange() {}
+  onGroupNotifiesUpdated() {}
+  onGroupSingleScreenNotifies() {}
+  onMemberInfoChange() {}
+  onMemberListChange() {}
+}

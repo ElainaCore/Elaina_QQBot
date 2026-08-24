@@ -19,6 +19,14 @@ _chat_cache: dict = {}
 _CHAT_TTL = 10
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
 def set_context(app_instance, base_dir=''):
     global _base_dir
     _common.set_app(app_instance)
@@ -112,7 +120,7 @@ def _segment_content(message) -> str:
         if not isinstance(segment, dict):
             continue
         kind = str(segment.get('type') or '')
-        data = segment.get('data') if isinstance(segment.get('data'), dict) else {}
+        data = _as_dict(segment.get('data'))
         if kind == 'text':
             parts.append(str(data.get('text') or ''))
         elif kind == 'at':
@@ -141,11 +149,37 @@ async def _fetch_directory(api, chat_type: str, bot_qq: str) -> dict[str, dict]:
     return result
 
 
-def _directory_chats(chat_type: str, directory: dict[str, dict], bot_qq: str) -> list[dict]:
-    """仅在最近会话扩展不可用时提供基础列表，绝不回读框架日志库。"""
+async def _db_chat_stats(chat_type: str, bot_qq: str) -> dict[str, dict]:
+    """读取已持久化消息的会话摘要，供完整目录补充最近消息。"""
+    if chat_type == 'group':
+        key, where = 'group_id', "group_id != ''"
+    else:
+        key, where = 'user_id', "user_id != '' AND group_id = ''"
+    rows = await _common.query_log(
+        'message',
+        f"""SELECT chat_id, id AS last_id, timestamp AS last_time, content AS last_content, msg_count
+                   FROM (
+                       SELECT {key} AS chat_id, id, timestamp, content,
+                              COUNT(*) OVER (PARTITION BY {key}) AS msg_count,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY {key} ORDER BY timestamp DESC, id DESC
+                              ) AS row_number
+                       FROM log WHERE {where}
+                   )
+                   WHERE row_number = 1
+                   ORDER BY last_time DESC, last_id DESC""",
+        bot_qq=bot_qq,
+    )
+    return {str(row.get('chat_id') or ''): row for row in rows if str(row.get('chat_id') or '')}
+
+
+def _directory_chats(chat_type: str, directory: dict[str, dict], stats: dict[str, dict], bot_qq: str) -> list[dict]:
+    """以完整好友/群目录为基础，并保留数据库中仍有记录的会话。"""
     remarks = _load_remarks()
     chats = []
-    for chat_id, item in directory.items():
+    for chat_id in dict.fromkeys((*directory.keys(), *stats.keys())):
+        item = directory.get(chat_id, {})
+        stat = stats.get(chat_id, {})
         remark = item.get('remark', '') if chat_type == 'user' else _remark_name(remarks.get(chat_id))
         name = remark or item.get('nickname') or item.get('group_name') or chat_id
         chats.append(
@@ -155,11 +189,12 @@ def _directory_chats(chat_type: str, directory: dict[str, dict], bot_qq: str) ->
                 'nickname': str(name),
                 'remark': str(remark or ''),
                 'group_qq': _remark_qq(remarks.get(chat_id)) if chat_type == 'group' else '',
-                'last_time': '',
-                'last_date': '',
-                'last_content': '',
-                'msg_count': 0,
-                'source': 'onebot_directory',
+                'last_id': str(stat.get('last_id') or ''),
+                'last_time': str(stat.get('last_time') or ''),
+                'last_date': str(stat.get('last_time') or '')[:10],
+                'last_content': str(stat.get('last_content') or ''),
+                'msg_count': int(stat.get('msg_count') or 0),
+                'source': 'onebot_directory' if chat_id in directory else 'message_database',
             }
         )
     return chats
@@ -176,14 +211,22 @@ async def _fetch_chats(chat_type, bot_qq=''):
         except Exception:
             return None
 
-    recent_response, directory = await asyncio.gather(get_recent(), _fetch_directory(api, chat_type, bot_qq))
+    recent_response, directory, stats = await asyncio.gather(
+        get_recent(),
+        _fetch_directory(api, chat_type, bot_qq),
+        _db_chat_stats(chat_type, bot_qq),
+    )
+    chats_by_id = {
+        item['chat_id']: item
+        for item in _directory_chats(chat_type, directory, stats, bot_qq)
+    }
     if not _onebot_ok(recent_response):
-        return _directory_chats(chat_type, directory, bot_qq)
+        chats = list(chats_by_id.values())
+        chats.sort(key=lambda item: (item['last_time'], item['nickname']), reverse=True)
+        return chats
 
     remarks = _load_remarks()
-    today = datetime.now().strftime('%Y-%m-%d')
     wanted_type = 2 if chat_type == 'group' else 1
-    chats_by_id = {}
     for contact in _onebot_data(recent_response, []) or []:
         if not isinstance(contact, dict) or int(contact.get('chatType') or 0) != wanted_type:
             continue
@@ -192,8 +235,6 @@ async def _fetch_chats(chat_type, bot_qq=''):
             continue
         latest = contact.get('lastestMsg') if isinstance(contact.get('lastestMsg'), dict) else {}
         last_time = _timestamp_text(contact.get('msgTime') or latest.get('time'))
-        if not last_time.startswith(today):
-            continue
         directory_item = directory.get(chat_id, {})
         if chat_type == 'group':
             remark = _remark_name(remarks.get(chat_id))
@@ -211,12 +252,17 @@ async def _fetch_chats(chat_type, bot_qq=''):
             'last_time': last_time,
             'last_date': last_time[:10],
             'last_content': _segment_content(latest.get('message')) or str(latest.get('raw_message') or ''),
-            'msg_count': 0,
+            'msg_count': int(stats.get(chat_id, {}).get('msg_count') or 0),
             'source': 'qq_native',
         }
         previous = chats_by_id.get(chat_id)
-        if previous is None or candidate['last_time'] > previous['last_time']:
+        if previous is None:
             chats_by_id[chat_id] = candidate
+        else:
+            # 最近会话提供预览，完整目录提供稳定名称与数据库统计。
+            previous.update({key: value for key, value in candidate.items() if value not in ('', None)})
+            if not previous.get('last_content'):
+                previous['last_content'] = str(stats.get(chat_id, {}).get('last_content') or '')
 
     chats = list(chats_by_id.values())
     chats.sort(key=lambda item: item['last_time'], reverse=True)
@@ -234,10 +280,10 @@ async def handle_get_chats(request: web.Request):
         chat_type = 'group'
     search = str(body.get('search') or '').lower()
     page = _bounded_int(body.get('page'), 1, 1, 100000)
-    page_size = _bounded_int(body.get('page_size'), 100, 1, 100)
+    page_size = _bounded_int(body.get('page_size'), 100, 1, 1000)
 
     now = time.time()
-    bot_ids = [requested_bot_qq] if requested_bot_qq else _common.connected_ids()
+    bot_ids = [requested_bot_qq] if requested_bot_qq else _common.bot_ids()
     if not bot_ids:
         bot_ids = [_primary_id()]
     cache_key = (tuple(bot_ids), chat_type)
@@ -278,50 +324,135 @@ def _event_epoch(event: dict) -> float:
     return value / 1000 if value > 10**11 else value
 
 
-async def _normalize_history(events: list, bot_qq: str) -> list[dict[str, Any]]:
-    parsed = []
-    missing_names = set()
-    for event in events:
-        if not isinstance(event, dict):
+def _history_db_entry(event: dict, chat_type: str, chat_id: str, bot_qq: str) -> dict:
+    """将 QQ 原生历史转换成实时 OneBot 消息使用的同一日志结构。"""
+    sender = _as_dict(event.get('sender'))
+    event_user_id = str(event.get('user_id') or sender.get('user_id') or '')
+    is_self = bool(bot_qq and event_user_id == bot_qq)
+    message = _as_list(event.get('message'))
+    nickname = str(sender.get('card') or sender.get('nickname') or '')
+    return {
+        'timestamp': _timestamp_text(event.get('time')) or datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'content': _segment_content(message) or str(event.get('raw_message') or ''),
+        'source': bot_qq,
+        # 私聊中自己发出的历史事件 user_id 是机器人，日志会话键仍应是好友 QQ；
+        # 群聊则保留实际发送者，供消息记录显示昵称与成员身份。
+        'user_id': event_user_id if chat_type == 'group' else chat_id,
+        'group_id': chat_id if chat_type == 'group' else '',
+        'message_id': str(event.get('message_id') or ''),
+        'message_type': 'group' if chat_type == 'group' else 'private',
+        'raw_data': json.dumps(event, ensure_ascii=False),
+        'extra': 'send' if is_self else json.dumps({'nickname': nickname}, ensure_ascii=False),
+    }
+
+
+async def _sync_history(events: list, chat_type: str, chat_id: str, bot_qq: str) -> None:
+    svc = _common.log_service()
+    if not svc:
+        return
+    valid = [event for event in events if isinstance(event, dict)]
+    valid.sort(key=lambda event: (_event_epoch(event), _event_cursor(event)))
+    entries = [_history_db_entry(event, chat_type, chat_id, bot_qq) for event in valid]
+    await svc.add_many('message', entries, bot_qq=bot_qq, durable=True)
+
+
+def _db_cursor(value: str) -> tuple[str, int] | None:
+    if not value.startswith('db:'):
+        return None
+    try:
+        timestamp, row_id = value[3:].rsplit(':', 1)
+        return timestamp, int(row_id)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _history_cursor_seq(
+    cursor: tuple[str, int] | None,
+    chat_type: str,
+    chat_id: str,
+    bot_qq: str,
+) -> str:
+    if cursor is None:
+        return ''
+    where = 'group_id = ?' if chat_type == 'group' else "user_id = ? AND group_id = ''"
+    rows = await _common.query_log(
+        'message',
+        f"""SELECT raw_data FROM log
+              WHERE {where}
+                AND (timestamp < ? OR (timestamp = ? AND id <= ?))
+                AND raw_data != ''
+              ORDER BY timestamp DESC, id DESC
+              LIMIT 20""",
+        (chat_id, cursor[0], cursor[0], cursor[1]),
+        bot_qq=bot_qq,
+    )
+    for row in rows:
+        try:
+            event = json.loads(row.get('raw_data') or '{}')
+        except (TypeError, ValueError):
             continue
-        sender = event.get('sender') if isinstance(event.get('sender'), dict) else {}
-        user_id = str(event.get('user_id') or sender.get('user_id') or '')
-        is_self = bool(bot_qq and user_id == bot_qq)
+        if isinstance(event, dict) and _event_cursor(event):
+            return _event_cursor(event)
+    return ''
+
+
+async def _query_db_history(chat_type: str, chat_id: str, bot_qq: str, count: int, cursor: tuple[str, int] | None) -> tuple[list[dict], bool]:
+    where = 'group_id = ?' if chat_type == 'group' else "user_id = ? AND group_id = ''"
+    params: list[Any] = [chat_id]
+    if cursor is not None:
+        where += ' AND (timestamp < ? OR (timestamp = ? AND id < ?))'
+        params.extend((cursor[0], cursor[0], cursor[1]))
+    rows = await _common.query_log(
+        'message',
+        f'SELECT * FROM log WHERE {where} ORDER BY timestamp DESC, id DESC LIMIT ?',
+        (*params, count + 1),
+        bot_qq=bot_qq,
+    )
+    has_more = len(rows) > count
+    rows = rows[:count]
+    rows.reverse()
+
+    missing_names = set()
+    prepared = []
+    for row in rows:
+        raw: dict[str, Any] = {}
+        with contextlib.suppress(TypeError, ValueError):
+            raw = _as_dict(json.loads(row.get('raw_data') or '{}'))
+        sender = _as_dict(raw.get('sender'))
+        extra = str(row.get('extra') or '')
+        is_self = extra == 'send' or str(raw.get('user_id') or sender.get('user_id') or '') == bot_qq
         nickname = str(sender.get('card') or sender.get('nickname') or '')
+        user_id = str(row.get('user_id') or '')
         if user_id and not is_self and not nickname:
             missing_names.add(user_id)
-        parsed.append((event, sender, user_id, is_self, nickname))
+        prepared.append((row, raw, sender, extra, is_self, nickname, user_id))
 
     nicknames = await _common.batch_nicknames(missing_names, bot_qq) if missing_names else {}
     messages = []
-    for index, (event, sender, user_id, is_self, nickname) in enumerate(parsed):
-        segments = event.get('message') if isinstance(event.get('message'), list) else []
+    for row, raw, sender, extra, is_self, nickname, user_id in prepared:
+        segments = _as_list(raw.get('message'))
         reply = next((item for item in segments if isinstance(item, dict) and item.get('type') == 'reply'), None)
-        message_id = str(event.get('message_id') or '')
-        timestamp = _timestamp_text(event.get('time'))
+        message_id = str(row.get('message_id') or '')
         messages.append(
             {
-                'id': f'{bot_qq}:{message_id or _event_cursor(event) or index}',
+                'id': f"db:{row.get('id')}",
+                'db_id': int(row.get('id') or 0),
                 'message_id': message_id,
-                'message_seq': _event_cursor(event),
+                'message_seq': _event_cursor(raw),
                 'reference_id': str(((reply or {}).get('data') or {}).get('id') or ''),
                 'user_id': user_id,
-                'bot_qq': bot_qq,
+                'bot_qq': str(row.get('source') or bot_qq),
                 'nickname': (bot_qq or 'Bot') if is_self else nickname or nicknames.get(user_id, user_id),
-                'content': _segment_content(segments) or str(event.get('raw_message') or ''),
-                'timestamp': timestamp,
+                'content': str(row.get('content') or ''),
+                'timestamp': str(row.get('timestamp') or ''),
                 'is_self': is_self,
                 'role': str(sender.get('role') or ''),
-                'source': 'qq_native',
-                'raw_message': json.dumps(event, ensure_ascii=False),
-                'recalled': False,
-                '_epoch': _event_epoch(event),
+                'source': 'message_database',
+                'raw_message': str(row.get('raw_data') or ''),
+                'recalled': extra == 'recalled',
             }
         )
-    messages.sort(key=lambda item: (item['_epoch'], item['message_seq']))
-    for message in messages:
-        message.pop('_epoch', None)
-    return messages
+    return messages, has_more
 
 
 async def handle_get_chat_history(request: web.Request):
@@ -331,45 +462,41 @@ async def handle_get_chat_history(request: web.Request):
         body = {}
     chat_type = body.get('chat_type', 'group')
     chat_id = str(body.get('chat_id', ''))
-    bot_qq = str(body.get('bot_qq') or _primary_id())
+    bot_qq = _common.resolve_bot_qq(str(body.get('bot_qq') or _primary_id()))
     if not chat_id:
         return web.json_response({'success': True, 'data': {'messages': [], 'has_more': False}})
 
     if chat_type not in ('group', 'user'):
         chat_type = 'group'
-    cursor = str(body.get('before_seq') or body.get('cursor') or body.get('message_seq') or '')
+    cursor_text = str(body.get('before_seq') or body.get('cursor') or body.get('message_seq') or '')
+    cursor = _db_cursor(cursor_text)
     count = _bounded_int(body.get('count'), 50, 1, 100)
+    native_cursor = await _history_cursor_seq(cursor, chat_type, chat_id, bot_qq) if cursor else cursor_text
     api = _api()
     try:
         if chat_type == 'group':
-            response = await api.get_group_msg_history(chat_id, cursor or 0, count, False, self_id=bot_qq)
+            response = await api.get_group_msg_history(chat_id, native_cursor or 0, count, False, self_id=bot_qq)
         else:
-            response = await api.get_friend_msg_history(chat_id, cursor or 0, count, False, self_id=bot_qq)
+            response = await api.get_friend_msg_history(chat_id, native_cursor or 0, count, False, self_id=bot_qq)
     except Exception:
         response = None
 
     data = _onebot_data(response, {})
     events = data.get('messages', []) if isinstance(data, dict) else []
-    normalized = await _normalize_history(events, bot_qq)
-    today = datetime.now().strftime('%Y-%m-%d')
-    if not cursor:
-        messages = [item for item in normalized if item['timestamp'].startswith(today)]
-        hidden_older = len(messages) != len(normalized)
-        has_more = hidden_older or len(events) >= count
-    else:
-        messages = normalized
-        has_more = len(events) >= count
+    if events:
+        await _sync_history(events, chat_type, chat_id, bot_qq)
 
+    messages, db_has_more = await _query_db_history(chat_type, chat_id, bot_qq, count, cursor)
+    has_more = db_has_more or len(events) >= count
     next_cursor = ''
     if messages:
-        next_cursor = str(messages[0].get('message_seq') or '')
-    elif normalized:
-        next_cursor = str(normalized[0].get('message_seq') or '')
-    if cursor and next_cursor == cursor and len(messages) <= 1:
+        first = messages[0]
+        next_cursor = f"db:{first.get('timestamp', '')}:{first.get('db_id', 0)}"
+    if cursor_text and next_cursor == cursor_text:
         has_more = False
 
     last_msg_id = next((item['message_id'] for item in reversed(messages) if not item['is_self']), '')
-    oldest_date = messages[0]['timestamp'][:10] if messages else today
+    oldest_date = messages[0]['timestamp'][:10] if messages else datetime.now().strftime('%Y-%m-%d')
     return web.json_response(
         {
             'success': True,
@@ -379,51 +506,13 @@ async def handle_get_chat_history(request: web.Request):
                 'next_cursor': next_cursor,
                 'oldest_date': oldest_date,
                 'has_more': has_more,
-                'source': 'qq_native',
+                'source': 'message_database',
             },
         }
     )
 
 
 # ──────────── 发送 / 撤回 ────────────
-
-
-async def _log_sent(chat_type, chat_id, content, message_id, bot_qq=''):
-    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    bot_qq = str(bot_qq or _primary_id())
-    svc = _common.log_service()
-    if svc:
-        await svc.add(
-            'message',
-            {
-                'timestamp': ts,
-                'content': content,
-                'user_id': '' if chat_type == 'group' else chat_id,
-                'group_id': chat_id if chat_type == 'group' else '',
-                'message_id': str(message_id or ''),
-                'message_type': chat_type,
-                'source': 'WebPanel',
-                'extra': 'send',
-            },
-            bot_qq=bot_qq,
-        )
-    # 实时推送到 Web 面板
-    from web.ws import push_log
-
-    push_log(
-        'message',
-        {
-            'timestamp': ts,
-            'content': content,
-            'user_id': '' if chat_type == 'group' else chat_id,
-            'group_id': chat_id if chat_type == 'group' else '',
-            'message_id': str(message_id or ''),
-            'message_type': chat_type,
-            'bot_qq': bot_qq,
-            'direction': 'send',
-            'raw_message': '',
-        },
-    )
 
 
 async def handle_send_message(request: web.Request):
@@ -474,19 +563,12 @@ async def handle_send_message(request: web.Request):
             segments.append({'type': 'image', 'data': {'file': f'base64://{b64}'}})
 
         api = _api()
-        adapter = _common.adapter()
-        local_actions = getattr(adapter, 'local_actions', {}) if adapter else {}
-        is_embedded = bot_qq in local_actions
         if chat_type == 'group':
             resp = await api.send_group_msg(chat_id, segments, self_id=bot_qq)
         else:
             resp = await api.send_private_msg(chat_id, segments, self_id=bot_qq)
 
         if resp and resp.get('retcode') == 0:
-            if not is_embedded:
-                mid = (resp.get('data') or {}).get('message_id', '')
-                display = content or '[图片]'
-                await _log_sent(chat_type, chat_id, display, mid, bot_qq)
             return web.json_response({'success': True, 'message': '发送成功'})
         err = (resp or {}).get('message') or (resp or {}).get('wording') or '发送失败'
         return web.json_response({'success': False, 'message': str(err)})

@@ -150,7 +150,7 @@ await api.delete_msg(123456)
 await api.send_forward_msg([
     {'type': 'node', 'data': {'user_id': 10001, 'nickname': 'Alice', 'content': 'Hello'}},
     {'type': 'node', 'data': {'user_id': 10002, 'nickname': 'Bob', 'content': 'Hi'}}
-])
+], group_id=123456)
 ```
 
 ---

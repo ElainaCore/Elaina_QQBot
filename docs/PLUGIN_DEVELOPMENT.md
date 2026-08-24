@@ -379,6 +379,21 @@ OneBot v11 的消息是「消息段」数组，常用类型：
 | `reply` | `{'id': message_id}` | 引用回复 |
 | `record` | `{'file': '...'}` | 语音 |
 | `video` | `{'file': '...'}` | 视频 |
+| `file` / `onlinefile` | `{'file': '...'}` | 文件 / 在线文件 |
+| `json` / `miniapp` | `{'data': '...'}` | Ark JSON / 小程序 Ark 数据 |
+| `xml` | `{'data': '...'}` | XML 长消息 |
+| `markdown` | `{'content': '...'}` | Markdown |
+| `music` | `{'type': 'qq', 'id': '...'}` | 音乐卡片；可用 `ELAINAQQ_MUSIC_SIGN_URL` 配置签名服务 |
+| `mface` | `{'emoji_package_id': 1, 'emoji_id': '...', 'key': '...', 'summary': '...'}` | 商城表情 |
+| `dice` / `rps` | `{'result': '...'}` | 骰子 / 猜拳 |
+| `contact` | `{'type': 'qq', 'id': '10001'}` | 好友或群联系人卡片 |
+| `location` | `{'lat': 31.2, 'lon': 121.5}` | 位置 |
+| `flashtransfer` | `{'fileSetId': '...'}` | QQ 闪传 |
+| `node` | `{'nickname': '...', 'content': [...]}` | 合并转发节点；一条消息必须全部为 `node` |
+| `forward` | `{'id': 'res_id'}` | 已有合并转发卡片；收到的段同时提供 `res_id` |
+| `poke` | `{'type': '...', 'id': '...'}` | 接收解析；发送应调用 `send_poke`，依赖协议能力 |
+
+内置 QQ 会把收到的 `poke`、`onlinefile`、`flashtransfer` 和合并转发解析为独立消息段。收到合并转发后，可把 `forward.data.id` 传给 `get_forward_msg` 读取节点；发送已有转发卡片时优先使用 `forward.data.res_id`。
 
 ```python
 # @发送者 + 文本

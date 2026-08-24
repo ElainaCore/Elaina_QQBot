@@ -28,6 +28,7 @@ from aiohttp import web
 from core.base.branding import public_text
 from core.base.config import cfg
 from core.onebot.api import api_call_source, get_supported_actions
+from core.onebot.protocol import action_failed
 from core.qq_catalog import QQ_VERSIONS
 from core.qq_installer import QQInstaller
 from core.qq_launcher import QQLauncher
@@ -556,7 +557,7 @@ class EmbeddedQQManager:
             return web.json_response({'success': True})
 
         async def handle_red_packet(request: web.Request) -> web.Response:
-            handled = self.handle_red_packet(await read_payload(request))
+            handled = await self.handle_red_packet(await read_payload(request))
             if not handled:
                 raise web.HTTPServiceUnavailable(text='内置 QQ 红包接口未初始化')
             return web.json_response({'success': True})
@@ -928,13 +929,7 @@ class EmbeddedQQManager:
         for _request_id, (pending_bot_id, future) in list(self._control_futures.items()):
             if pending_bot_id == bot_id and not future.done():
                 future.set_result(
-                    {
-                        'status': 'failed',
-                        'retcode': 200,
-                        'data': None,
-                        'message': message,
-                        'wording': message,
-                    }
+                    action_failed(message, 1500)
                 )
         queue = self._control_queues.pop(bot_id, None)
         if queue:
@@ -950,13 +945,7 @@ class EmbeddedQQManager:
     ) -> dict[str, Any]:
         bot = self.bots.get(bot_id)
         if not bot or not bot.process or bot.process.returncode is not None:
-            return {
-                'status': 'failed',
-                'retcode': 200,
-                'data': None,
-                'message': '机器人未运行',
-                'wording': '机器人未运行',
-            }
+            return action_failed('机器人未运行', 1404)
         request_id = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
         self._control_futures[request_id] = (bot_id, future)
@@ -967,32 +956,15 @@ class EmbeddedQQManager:
             )
             return await asyncio.wait_for(future, timeout)
         except TimeoutError:
-            message = 'ElainaQQ QQ 运行时响应超时'
-            return {
-                'status': 'failed',
-                'retcode': 200,
-                'data': None,
-                'message': message,
-                'wording': message,
-            }
+            return action_failed('ElainaQQ QQ 运行时响应超时', 1500)
         finally:
             self._control_futures.pop(request_id, None)
 
     async def action(self, bot_id: str, action: str, params: dict | None = None) -> dict:
-        action_params = params or {}
-        result = await self._control_call(
+        return await self._control_call(
             bot_id,
-            {'type': 'action', 'action': action, 'params': action_params},
+            {'type': 'action', 'action': action, 'params': params or {}},
         )
-        recorder = getattr(self.app, 'log_sent_message', None)
-        if recorder is not None:
-            bot = self.bots.get(bot_id)
-            self_id = bot.uin or bot.bot_id if bot else bot_id
-            try:
-                await recorder(str(self_id), action, action_params, result)
-            except Exception:
-                log.exception('内置 QQ 发送日志写入失败: %s [%s]', action, self_id)
-        return result
 
     def register_red_packet_listener(self, owner: str, callback) -> None:
         """注册内置 QQ 原生红包回调；同一 owner 热重载时自动替换。"""
@@ -1026,8 +998,8 @@ class EmbeddedQQManager:
         except Exception:
             log.exception('内置 QQ 红包监听异常: %s [%s]', owner, self_id)
 
-    def handle_red_packet(self, payload: dict[str, Any]) -> bool:
-        """接收运行时红包数据并直接分发给已注册插件，不进入 OneBot 事件链。"""
+    async def handle_red_packet(self, payload: dict[str, Any]) -> bool:
+        """将内置红包转换为标准通知后，再执行原生能力回调。"""
         bot_id = str(payload.get('bot_id') or '').strip()
         bot = self.bots.get(bot_id)
         packet = payload.get('red_packet')
@@ -1035,6 +1007,18 @@ class EmbeddedQQManager:
             return False
         bot.last_seen = time.time()
         self_id = str(payload.get('self_id') or bot.uin or bot_id)
+        event = {
+            'time': int(time.time()),
+            'self_id': self_id,
+            'post_type': 'notice',
+            'notice_type': 'elaina_red_packet',
+            'sub_type': 'receive',
+            'user_id': packet.get('sender_id') or 0,
+            'group_id': packet.get('group_id') or None,
+            'red_packet': dict(packet),
+        }
+        if not await self.app.ingest_event(event, self_id):
+            return False
         for owner, callback in tuple(self._red_packet_listeners.items()):
             task = asyncio.create_task(
                 self._run_red_packet_listener(
@@ -1112,6 +1096,7 @@ class EmbeddedQQManager:
         for alias in aliases:
             if alias and alias != keep:
                 self.app.adapter.unregister_local_bot(alias)
+        self.app.adapter.unregister_identity_alias(bot.bot_id)
 
     def on_onebot_connected(self, bot_id: str, self_id: str) -> None:
         bot = self.bots.get(bot_id)
@@ -1120,6 +1105,7 @@ class EmbeddedQQManager:
         self_id = str(self_id or '').strip()
         self._unregister_bot_aliases(bot, self_id)
         bot.uin = str(self_id)
+        self.app.adapter.register_identity_alias(bot.bot_id, bot.uin)
         bot.status = 'online'
         bot.enabled = True
         bot.error = ''
@@ -1145,10 +1131,12 @@ class EmbeddedQQManager:
 
         runtime = payload.get('runtime')
         if isinstance(runtime, dict):
+            previous_status = bot.status
             previous_uin = bot.uin
             incoming_uin = str(runtime.get('loginUin') or runtime.get('uin') or bot.uin)
             if previous_uin and incoming_uin and previous_uin != incoming_uin:
                 self.app.adapter.unregister_local_bot(previous_uin)
+                self.app.adapter.unregister_identity_alias(bot.bot_id)
             if incoming_uin and incoming_uin != bot.bot_id:
                 self.app.adapter.unregister_local_bot(bot.bot_id)
             bot.status = str(runtime.get('status') or bot.status)
@@ -1168,6 +1156,7 @@ class EmbeddedQQManager:
             if bot.status == 'online':
                 bot.qr_code = bot.qr_url = ''
             if bot.uin and bot.status == 'online':
+                self.app.adapter.register_identity_alias(bot.bot_id, bot.uin)
                 self.app.adapter.register_local_bot(
                     bot.uin,
                     lambda action, params, bot_key=bot.bot_id: self.action(
@@ -1180,13 +1169,20 @@ class EmbeddedQQManager:
                 self._unregister_bot_aliases(bot)
             self._save_accounts()
 
+            if bot.status != previous_status and bot.status in {'online', 'offline', 'error'}:
+                status_event = {
+                    'time': int(time.time()),
+                    'self_id': bot.uin or bot_id,
+                    'post_type': 'meta_event',
+                    'meta_event_type': 'lifecycle',
+                    'sub_type': 'connect' if bot.status == 'online' else 'disconnect',
+                    'status': bot.status,
+                }
+                if not await self.app.ingest_event(status_event, bot.uin or bot_id):
+                    return False
+
         event = payload.get('event')
-        if isinstance(event, dict):
-            event.setdefault('self_id', bot.uin or bot_id)
-            parsed = self.app.adapter.parse_event(event)
-            if parsed:
-                self.app.submit_event(parsed)
-        return True
+        return not isinstance(event, dict) or await self.app.ingest_event(event, bot.uin or bot_id)
 
     async def _reclaim_process_memory(
         self,

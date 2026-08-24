@@ -28,6 +28,12 @@ class _DispatchMixin:
         """由插件管理器实现主人身份判断。"""
         raise NotImplementedError
 
+    def _allows_bot(self, allowed, self_id: str) -> bool:
+        if allowed is None:
+            return True
+        matcher = getattr(self, '_bot_identity_matcher', None)
+        return matcher(allowed, self_id) if matcher else self_id in allowed
+
     def _build_dispatch_index(self):
         """按优先级预先建立事件索引，避免逐事件遍历全部处理器。"""
         self._all_handlers = sorted(self._all_handlers, key=lambda h: -h['priority'])
@@ -82,7 +88,7 @@ class _DispatchMixin:
         blocked = False
         for item in self._all_handler_filters:
             allowed = item.get('_allowed_bots')
-            if allowed is not None and str(getattr(event, 'self_id', '') or '') not in allowed:
+            if not self._allows_bot(allowed, str(getattr(event, 'self_id', '') or '')):
                 continue
             try:
                 if item['is_coro']:
@@ -105,7 +111,7 @@ class _DispatchMixin:
         # 拦截器
         for ic in self._all_interceptors:
             allowed = ic.get('_allowed_bots')
-            if allowed is not None and str(getattr(event, 'self_id', '') or '') not in allowed:
+            if not self._allows_bot(allowed, str(getattr(event, 'self_id', '') or '')):
                 continue
             try:
                 r = await ic['func'](event) if ic['is_coro'] else await asyncio.to_thread(ic['func'], event)
@@ -116,7 +122,7 @@ class _DispatchMixin:
 
         # 消息事件：普通处理器先匹配原文和斜杠兼容文本，均未命中后才运行兜底处理器。
         if post_type == 'message':
-            filter_cache = {}
+            filter_cache: dict[str, bool] = {}
             if await self._match_message_handlers(event, content, filter_cache, fallback_stage=False):
                 return True
             alternative = content[1:] if content.startswith('/') else f'/{content}'
@@ -144,7 +150,7 @@ class _DispatchMixin:
             filter_cache = {}
             for h in candidates:
                 allowed = h.get('_allowed_bots')
-                if allowed is not None and str(getattr(event, 'self_id', '') or '') not in allowed:
+                if not self._allows_bot(allowed, str(getattr(event, 'self_id', '') or '')):
                     continue
                 if await self._is_handler_filtered(h, event, filter_cache):
                     continue
@@ -168,7 +174,7 @@ class _DispatchMixin:
             if _fallback_enabled(h, event) != fallback_stage:
                 continue
             allowed = h.get('_allowed_bots')
-            if allowed is not None and self_id not in allowed:
+            if not self._allows_bot(allowed, self_id):
                 continue
             if await self._is_handler_filtered(h, event, filter_cache):
                 continue

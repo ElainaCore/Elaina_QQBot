@@ -148,19 +148,59 @@ class MetaEvent(OneBotEvent):
         self.meta_event_type = data.get('meta_event_type', '')
 
 
-def parse_event(data: dict) -> OneBotEvent | None:
-    """解析 OneBot 事件"""
-    if not isinstance(data, dict) or 'post_type' not in data:
+def normalize_event(data: dict, default_self_id: str = '') -> dict | None:
+    """统一不同 OneBot 实现上报的等价字段与消息表示。"""
+    if not isinstance(data, dict):
+        return None
+    normalized = dict(data)
+    if default_self_id and not normalized.get('self_id'):
+        normalized['self_id'] = str(default_self_id)
+    if 'post_type' not in normalized and normalized.get('postType'):
+        normalized['post_type'] = normalized['postType']
+    if 'post_type' not in normalized:
         return None
 
-    match data.get('post_type'):
+    if normalized.get('post_type') == PostType.MESSAGE:
+        message = normalized.get('message', [])
+        if isinstance(message, str):
+            message = [{'type': 'text', 'data': {'text': message}}]
+        elif isinstance(message, dict):
+            message = [message]
+        elif not isinstance(message, list):
+            message = []
+        normalized['message'] = message
+        sender = normalized.get('sender')
+        sender = {} if not isinstance(sender, dict) else dict(sender)
+        sender.setdefault('user_id', normalized.get('user_id', 0))
+        normalized['sender'] = sender
+        message_type = str(normalized.get('message_type') or '')
+        if message_type in {'friend', 'user'}:
+            normalized['message_type'] = MsgType.PRIVATE
+        if normalized.get('raw_message') is None:
+            normalized['raw_message'] = ''
+        if not normalized.get('raw_message'):
+            normalized['raw_message'] = ''.join(
+                str(segment.get('data', {}).get('text') or '')
+                for segment in message
+                if isinstance(segment, dict) and segment.get('type') == 'text'
+            )
+    return normalized
+
+
+def parse_event(data: dict, default_self_id: str = '') -> OneBotEvent | None:
+    """规范化并解析 OneBot 事件。"""
+    normalized = normalize_event(data, default_self_id)
+    if normalized is None:
+        return None
+
+    match normalized.get('post_type'):
         case PostType.MESSAGE:
-            return MessageEvent(data)
+            return MessageEvent(normalized)
         case PostType.NOTICE:
-            return NoticeEvent(data)
+            return NoticeEvent(normalized)
         case PostType.REQUEST:
-            return RequestEvent(data)
+            return RequestEvent(normalized)
         case PostType.META:
-            return MetaEvent(data)
+            return MetaEvent(normalized)
         case _:
-            return OneBotEvent(data)
+            return OneBotEvent(normalized)

@@ -197,10 +197,11 @@ class HttpServer:
         if not body:
             return web.Response(status=400)
 
-        success, event = adapter.handle_http_callback(body, dict(request.headers), port=port, path=path)
-        if event:
-            self._app_instance.submit_event(event)
-
+        payload, status = adapter.decode_http_event(body, dict(request.headers), port=port, path=path)
+        if payload is None:
+            return web.Response(status=status)
+        if not await self._app_instance.ingest_event(payload):
+            return web.Response(status=503, text='事件接入队列不可用')
         return web.Response(status=204)
 
     async def _handle_onebot_ws(self, request: web.Request):
@@ -238,13 +239,15 @@ class HttpServer:
                 if msg.type == web.WSMsgType.TEXT:
                     try:
                         data = json.loads(msg.data)
-                        event = adapter.parse_event(data)
-                        if event:
-                            self._app_instance.submit_event(event)
-                        elif 'echo' in data:
-                            adapter.resolve_api_response(data['echo'], data)
-                    except json.JSONDecodeError:
-                        pass
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if not isinstance(data, dict):
+                        continue
+                    echo = data.get('echo')
+                    if echo is not None and adapter.resolve_api_response(echo, data):
+                        continue
+                    if not await self._app_instance.ingest_event(data, self_id):
+                        log.warning('拒绝无效或无法入队的 OneBot WebSocket 事件: Bot %s', self_id)
                 elif msg.type == web.WSMsgType.ERROR:
                     break
         finally:

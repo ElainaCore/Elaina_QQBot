@@ -21,6 +21,7 @@ from core.onebot.api import set_adapter, set_main_loop
 from core.onebot.connection import ConnectionManager
 from core.onebot.event import MessageEvent, MetaEvent, NoticeEvent, RequestEvent
 from core.onebot.event_labels import event_label
+from core.onebot.protocol import action_succeeded
 from core.plugin.manager import PluginManager
 from core.server.http_server import HttpServer
 from core.services.config_watcher import ConfigWatcherService
@@ -47,6 +48,7 @@ def _format_message_content(message) -> str:
     """将 OneBot 字符串或消息段转换为适合日志展示的文本。"""
     if isinstance(message, str):
         return message.strip() or '[空消息]'
+    segments: list | tuple
     if isinstance(message, dict):
         segments = (message,)
     elif isinstance(message, (list, tuple)):
@@ -155,7 +157,7 @@ class Application:
         log.info(f'{"=" * 5} {fw_name} 启动中 {"=" * 5}')
 
         # 2) OneBot 适配器 (每条连接自带 token/secret, 无需全局配置)
-        self._adapter = OneBotAdapter()
+        self._adapter = OneBotAdapter(self.log_sent_message)
         set_adapter(self._adapter)
         set_main_loop(asyncio.get_running_loop())
 
@@ -174,6 +176,7 @@ class Application:
 
         # 5) 插件管理器
         self._plugin_manager = PluginManager(self._path('plugins'))
+        self._plugin_manager.set_bot_identity_matcher(self._adapter.allows_self_id)
         owner_ids = cfg.get('settings', 'owner.ids', []) or []
         owner_ids = [str(uid).strip() for uid in owner_ids if str(uid).strip()]
         self._plugin_manager.set_owner_ids(owner_ids)
@@ -297,11 +300,8 @@ class Application:
         if error:
             log.error('内置 QQ 自动启动任务失败: %s', error, exc_info=error)
 
-    async def process_event(self, event):
-        """处理 OneBot 事件 (异步分发)"""
-        if isinstance(event, MetaEvent) and event.meta_event_type != 'lifecycle':
-            return
-
+    async def _process_event(self, event, persisted):
+        """持久化并分发已经完成规范化的 OneBot 事件。"""
         # 注入 API 引用, 使插件可通过 event.reply() 调用
         from core.onebot.api import get_api, routed_self_id
 
@@ -309,38 +309,55 @@ class Application:
 
         # 同一事件链中的 API 调用始终回到产生事件的 QQ，避免多账号串号。
         with routed_self_id(str(event.self_id or '')):
-            await self._hook_manager.emit('on_raw_event', event)
+            # 日志属于事件接入的基础链路，必须先于可扩展钩子持久化。
+            # 这样模块或插件异常不会导致内置 QQ / OneBot 的日志一起丢失。
             await self._log_event(event)
+            if persisted is not None and not persisted.done():
+                persisted.set_result(True)
+            await self._hook_manager.emit('on_raw_event', event)
             await self._plugin_manager.dispatch(event)
 
-    def submit_event(self, event) -> bool:
-        """事件入队，并通过容量上限约束生产者的内存占用。"""
-        # 心跳只更新连接状态，不进入插件链；生命周期事件允许插件显式订阅。
+    async def ingest_event(self, payload: dict, default_self_id: str = '') -> bool:
+        """所有内置及网络来源共用的唯一 OneBot 事件入口。"""
+        if not self._adapter:
+            return False
+        event = self._adapter.parse_event(payload, default_self_id)
+        if event is None:
+            return False
         if isinstance(event, MetaEvent) and event.meta_event_type != 'lifecycle':
             return True
         if not self._event_queues:
             return False
         self_id = str(getattr(event, 'self_id', '') or '')
         queue_index = zlib.crc32(self_id.encode('utf-8')) % len(self._event_queues) if self_id else 0
-        queue = self._event_queues[queue_index]
+        persisted = asyncio.get_running_loop().create_future()
         try:
-            queue.put_nowait(event)
-            return True
-        except asyncio.QueueFull:
+            async with asyncio.timeout(2):
+                await self._event_queues[queue_index].put((event, persisted))
+        except TimeoutError:
             now = asyncio.get_running_loop().time()
             if now - self._last_queue_warning >= 10:
                 self._last_queue_warning = now
-                log.warning('事件队列已满，丢弃新事件以保护框架内存')
+                log.warning('事件队列持续繁忙，拒绝新事件以保护框架内存')
+            return False
+        try:
+            await persisted
+            return True
+        except Exception:
             return False
 
     async def _event_worker(self, queue):
         while True:
-            event = await queue.get()
+            event, persisted = await queue.get()
             try:
-                await self.process_event(event)
+                await self._process_event(event, persisted)
             except asyncio.CancelledError:
+                if persisted is not None and not persisted.done():
+                    persisted.cancel()
                 raise
             except Exception as error:
+                if persisted is not None and not persisted.done():
+                    persisted.set_exception(error)
                 log.error('事件处理失败: %s', error, exc_info=error)
             finally:
                 queue.task_done()
@@ -353,7 +370,7 @@ class Application:
         response: dict,
     ) -> bool:
         """记录成功发送的 OneBot 消息，并推送到 Web 面板。"""
-        if action not in _SEND_ACTIONS or response.get('status') == 'failed' or response.get('retcode') != 0:
+        if action not in _SEND_ACTIONS or not action_succeeded(response):
             return False
 
         message_type = str(params.get('message_type') or '')
@@ -404,6 +421,7 @@ class Application:
                     'extra': 'send',
                 },
                 bot_qq=bot_qq,
+                durable=True,
             )
 
         if self._web_log_cb:
@@ -455,6 +473,7 @@ class Application:
                         'extra': json.dumps({'nickname': nickname}, ensure_ascii=False),
                     },
                     bot_qq=str(event.self_id or ''),
+                    durable=True,
                 )
 
             # 推送到 Web 面板
@@ -505,6 +524,7 @@ class Application:
                         'raw_data': raw_json,
                     },
                     bot_qq=bot_qq,
+                    durable=True,
                 )
             if self._web_log_cb:
                 self._web_log_cb(

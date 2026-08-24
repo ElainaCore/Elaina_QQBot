@@ -1,10 +1,12 @@
 import http from 'http';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import {
+  BuddyListener,
   GlobalAdapter,
+  GroupListener,
   LoginListener,
   MessageListener,
   O3MiscListener,
@@ -310,6 +312,32 @@ function stringifyJson(value) {
     return item;
   });
 }
+function encodeProtoVarint(value) {
+  let remaining = BigInt(value);
+  if (remaining < 0n) throw new Error("protobuf varint 不能为负数");
+  const bytes = [];
+  do {
+    let byte = Number(remaining & 0x7fn);
+    remaining >>= 7n;
+    if (remaining) byte |= 0x80;
+    bytes.push(byte);
+  } while (remaining);
+  return Buffer.from(bytes);
+}
+function encodeProtoVarintField(fieldNumber, value) {
+  return Buffer.concat([
+    encodeProtoVarint(BigInt(fieldNumber) << 3n),
+    encodeProtoVarint(value),
+  ]);
+}
+function encodeProtoBytesField(fieldNumber, value) {
+  const bytes = Buffer.from(value);
+  return Buffer.concat([
+    encodeProtoVarint((BigInt(fieldNumber) << 3n) | 2n),
+    encodeProtoVarint(bytes.length),
+    bytes,
+  ]);
+}
 function qrValue(value) {
   if (value === undefined || value === null) return "";
   if (Buffer.isBuffer(value)) return value.toString("base64");
@@ -358,6 +386,10 @@ class QQInstance {
   sessionListener = null;
   selfInfo = null;
   msgListener = null;
+  buddyListener = null;
+  buddyListenerHandle = null;
+  groupListener = null;
+  groupListenerHandle = null;
   incomingMessageGate = null;
   statusCallback = null;
   oneBotEventCallback = null;
@@ -366,6 +398,8 @@ class QQInstance {
   oneBotNativeMessageIds = /* @__PURE__ */ new Map();
   oneBotRawMessages = /* @__PURE__ */ new Map();
   oneBotForwardMessages = /* @__PURE__ */ new Map();
+  pendingSentMessages = /* @__PURE__ */ new Set();
+  forwardSendTail = Promise.resolve();
   oneBotFiles = /* @__PURE__ */ new Map();
   oneBotFileStreams = /* @__PURE__ */ new Map();
   oneBotStreamFiles = /* @__PURE__ */ new Set();
@@ -469,6 +503,7 @@ class QQInstance {
       log(id, "session 初始化完成");
       log(id, "步骤6: 注册消息监听...");
       this.registerMsgListener();
+      this.registerEventListeners();
       this.botConfig.uin = this.selfInfo.uin;
       this.botConfig.nickname = this.selfInfo.nick || this.selfInfo.uin;
       botUinMap.set(this.botConfig.id, this.selfInfo.uin);
@@ -595,12 +630,31 @@ class QQInstance {
   }
   async stop() {
     try {
+      for (const pending of Array.from(this.pendingSentMessages)) {
+        pending.reject(new OneBotActionError("QQ 会话已停止", 1500, "send_msg"));
+      }
       if (this.session && this.msgListener) {
         try {
           this.session.getMsgService().removeKernelMsgListener(this.msgListener);
         } catch {
         }
       }
+      if (this.session && this.buddyListener) {
+        try {
+          this.session.getBuddyService?.().removeKernelBuddyListener?.(this.buddyListenerHandle ?? this.buddyListener);
+        } catch {
+        }
+      }
+      if (this.session && this.groupListener) {
+        try {
+          this.session.getGroupService?.().removeKernelGroupListener?.(this.groupListenerHandle ?? this.groupListener);
+        } catch {
+        }
+      }
+      this.buddyListener = null;
+      this.buddyListenerHandle = null;
+      this.groupListener = null;
+      this.groupListenerHandle = null;
       this.incomingMessageGate = null;
       this.cleanOneBotStreams();
       if (this.startupSession && typeof this.startupSession.stop === "function") {
@@ -964,10 +1018,19 @@ class QQInstance {
   }
   getCachedMessage(messageId) {
     const key = String(messageId || "");
-    const event = this.oneBotMessages.get(key);
-    const raw = this.oneBotRawMessages.get(key);
+    let cacheKey = key;
+    if (!this.oneBotMessages.has(cacheKey) && !this.oneBotRawMessages.has(cacheKey)) {
+      for (const [candidate, nativeId] of this.oneBotNativeMessageIds) {
+        if (String(nativeId) === key) {
+          cacheKey = candidate;
+          break;
+        }
+      }
+    }
+    const event = this.oneBotMessages.get(cacheKey);
+    const raw = this.oneBotRawMessages.get(cacheKey);
     if (!event && !raw) throw new OneBotActionError(`消息不存在或已过期: ${key}`, 1404, "get_msg");
-    return { key, event, raw, nativeId: this.oneBotNativeMessageIds.get(key) || raw?.msgId || key };
+    return { key: cacheKey, event, raw, nativeId: this.oneBotNativeMessageIds.get(cacheKey) || raw?.msgId || key };
   }
   getOneBotMessage(messageId) {
     return this.getCachedMessage(messageId).event;
@@ -1058,6 +1121,147 @@ class QQInstance {
     const data = node?.data || {};
     return data.content ?? data.message ?? (data.id ? [{ type: "reply", data: { id: String(data.id) } }] : []);
   }
+  forwardReference(raw, peer = null) {
+    const nativeId = String(raw?.msgId || nativeMessageKey(raw));
+    return {
+      raw,
+      peer: peer || raw?.parentMsgPeer || {
+        chatType: Number(raw?.chatType || 1),
+        peerUid: String(raw?.peerUid || ""),
+        guildId: "",
+      },
+      rootMsgId: String(raw?.parentMsgIdList?.[0] || nativeId),
+      parentMsgId: nativeId,
+    };
+  }
+  rememberForwardReference(raw, ids = []) {
+    if (!raw) return;
+    const reference = this.forwardReference(raw);
+    const keys = [
+      ...ids,
+      raw.msgId,
+      toOneBotMessageId(nativeMessageKey(raw)),
+    ].map((value) => String(value || "")).filter(Boolean);
+    for (const key of new Set(keys)) this.rememberOneBotForward(key, reference);
+  }
+  rememberOneBotForward(key, value) {
+    const cacheKey = String(key || "");
+    if (!cacheKey) return;
+    this.oneBotForwardMessages.set(cacheKey, value);
+    while (this.oneBotForwardMessages.size > 1000) {
+      this.oneBotForwardMessages.delete(this.oneBotForwardMessages.keys().next().value);
+    }
+  }
+  async resolveForwardNode(node, destinationPeer) {
+    const data = node?.data || {};
+    if (data.id !== undefined && data.id !== null && String(data.id)) {
+      const cached = this.getCachedMessage(String(data.id));
+      const raw = cached.raw;
+      if (!raw) throw new OneBotActionError(`转发节点消息不存在或已过期: ${data.id}`, 1404, "send_forward_msg");
+      return [{
+        raw,
+        peer: this.peerForEvent(cached.event, raw),
+        senderShowName: String(data.nickname || data.name || raw.sendNickName || raw.sendMemberName || "QQ用户"),
+      }];
+    }
+
+    const content = this.normalizeOneBotMessage(this.forwardNodeContent(node));
+    if (!content.length) throw new OneBotActionError("合并转发节点内容为空", 1400, "send_forward_msg");
+    const selfPeer = this.peerFor("private", String(this.selfInfo?.uid || await this.resolveUid(this.getSelfUin())));
+    let result;
+    if (content.every((segment) => String(segment.type || "").toLowerCase() === "node")) {
+      let nested = [];
+      for (const child of content) nested.push(...await this.resolveForwardNode(child, selfPeer));
+      const source = nested[0]?.peer;
+      if (!source) throw new OneBotActionError("嵌套合并转发没有可用节点", 1400, "send_forward_msg");
+      if (nested.some((child) => child.peer.chatType !== source.chatType || child.peer.peerUid !== source.peerUid)) {
+        nested = await Promise.all(nested.map((child) => this.cloneForwardNode(child, selfPeer)));
+      }
+      result = await this.sendNativeForward(nested[0].peer, selfPeer, nested);
+    } else {
+      if (content.some((segment) => String(segment.type || "").toLowerCase() === "node")) {
+        throw new OneBotActionError("转发节点中的 node 不能和普通消息段混合", 1400, "send_forward_msg");
+      }
+      const standaloneTypes = new Set(["file", "record", "video", "onlinefile", "json", "forward", "contact", "music", "miniapp"]);
+      const mixed = content.filter((segment) => !standaloneTypes.has(String(segment.type || "").toLowerCase()));
+      const batches = [
+        mixed,
+        ...content
+          .filter((segment) => standaloneTypes.has(String(segment.type || "").toLowerCase()))
+          .map((segment) => [segment]),
+      ].filter((batch) => batch.length);
+      const resolved = [];
+      for (const batch of batches) {
+        const sent = await this.sendOneBotMessage("private", this.getSelfUin(), batch, true, {
+          type: Number(destinationPeer.chatType) === 2 ? "group" : "private",
+          target: String(destinationPeer.peerUid || ""),
+        });
+        const raw = this.getCachedMessage(String(sent.message_id)).raw;
+        if (raw?.msgId) {
+          resolved.push({
+            raw,
+            peer: selfPeer,
+            senderShowName: String(data.nickname || data.name || this.getSelfNick() || "QQ用户"),
+          });
+        }
+      }
+      if (!resolved.length) throw new OneBotActionError("生成合并转发节点失败", 1500, "send_forward_msg");
+      return resolved;
+    }
+    if (!result?.msgId) throw new OneBotActionError("生成合并转发节点失败", 1500, "send_forward_msg");
+    return [{
+      raw: result,
+      peer: selfPeer,
+      senderShowName: String(data.nickname || data.name || this.getSelfNick() || "QQ用户"),
+    }];
+  }
+  async cloneForwardNode(node, selfPeer) {
+    if (node.peer.chatType === selfPeer.chatType && node.peer.peerUid === selfPeer.peerUid) return node;
+    const raw = await this.sendNativeElementsToPeer(selfPeer, Array.from(node.raw?.elements || []));
+    return { ...node, raw, peer: selfPeer };
+  }
+  async sendNativeForward(sourcePeer, destinationPeer, nodes) {
+    const previous = this.forwardSendTail;
+    let release;
+    this.forwardSendTail = new Promise((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await this.sendNativeForwardNow(sourcePeer, destinationPeer, nodes);
+    } finally {
+      release();
+    }
+  }
+  async sendNativeForwardNow(sourcePeer, destinationPeer, nodes) {
+    const service = this.getMsgService();
+    const method = requireNativeMethod(service, "multiForwardMsgWithComment", "send_forward_msg");
+    const msgInfos = nodes.map((node) => ({
+      msgId: String(node.raw?.msgId || ""),
+      senderShowName: String(node.senderShowName || this.getSelfNick() || "QQ用户"),
+    }));
+    if (!msgInfos.length || msgInfos.some((item) => !item.msgId)) {
+      throw new OneBotActionError("合并转发没有可用的消息节点", 1400, "send_forward_msg");
+    }
+    const pending = this.waitForSentMessage((raw) => {
+      if (String(raw?.peerUid || "") !== String(destinationPeer.peerUid)) return false;
+      if (this.selfInfo?.uid && raw?.senderUid && String(raw.senderUid) !== String(this.selfInfo.uid)) return false;
+      return Array.from(raw?.elements || []).some((element) => this.forwardArkData(element?.arkElement?.bytesData) || element?.multiForwardMsgElement);
+    });
+    let nativeResult;
+    try {
+      nativeResult = await method(msgInfos, sourcePeer, destinationPeer, [], new Map());
+      checkNativeResult(nativeResult, "发送合并转发消息失败");
+    } catch (error) {
+      pending.cancel();
+      throw error;
+    }
+    if (nativeResult?.msgId && Array.isArray(nativeResult?.elements)) {
+      pending.cancel();
+      return nativeResult;
+    }
+    return pending.promise;
+  }
   async sendOneBotForward(action, params) {
     const type = action === "send_private_forward_msg" || (!params.group_id && params.user_id) ? "private" : "group";
     const target = String(type === "group" ? params.group_id : params.user_id);
@@ -1066,18 +1270,27 @@ class QQInstance {
     if (!nodes.length || nodes.some((node) => String(node.type).toLowerCase() !== "node")) {
       throw new OneBotActionError("合并转发只能包含 node 消息段", 1400, action);
     }
-    const rendered = [];
-    for (const node of nodes) {
-      const data = node.data || {};
-      const nickname = String(data.nickname || data.name || "QQ用户");
-      rendered.push({ type: "text", data: { text: `${rendered.length ? "\n" : ""}${nickname}: ` } });
-      rendered.push(...this.normalizeOneBotMessage(this.forwardNodeContent(node), true));
+    const destinationPeer = this.peerFor(type, type === "private" ? await this.resolveUid(target) : target);
+    let resolved = [];
+    for (const node of nodes) resolved.push(...await this.resolveForwardNode(node, destinationPeer));
+    const source = resolved[0]?.peer;
+    if (!source) throw new OneBotActionError("合并转发没有可用的消息节点", 1400, action);
+    if (resolved.some((node) => node.peer.chatType !== source.chatType || node.peer.peerUid !== source.peerUid)) {
+      const selfPeer = this.peerFor("private", String(this.selfInfo?.uid || await this.resolveUid(this.getSelfUin())));
+      resolved = await Promise.all(resolved.map((node) => this.cloneForwardNode(node, selfPeer)));
     }
-    const result = await this.sendOneBotMessage(type, target, rendered, true);
-    const forwardId = `elaina-forward-${result.message_id}`;
-    this.oneBotForwardMessages.set(forwardId, nodes);
-    this.oneBotForwardMessages.set(String(result.message_id), nodes);
-    return { ...result, res_id: forwardId, forward_id: forwardId };
+    const raw = await this.sendNativeForward(resolved[0].peer, destinationPeer, resolved);
+    const rawId = String(raw.msgId || nativeMessageKey(raw));
+    const messageId = toOneBotMessageId(rawId);
+    const ark = Array.from(raw.elements || []).map((element) => this.forwardArkData(element?.arkElement?.bytesData)).find(Boolean);
+    const forwardElement = Array.from(raw.elements || []).find((element) => element?.multiForwardMsgElement)?.multiForwardMsgElement;
+    const forwardId = String(ark?.meta?.detail?.resid || forwardElement?.resId || rawId);
+    const event = this.toOneBotEvent(raw);
+    this.rememberOneBotMessage(event, rawId, raw);
+    this.rememberForwardReference(raw, [forwardId, messageId]);
+    this.rememberOneBotForward(forwardId, nodes);
+    this.rememberOneBotForward(messageId, nodes);
+    return { message_id: messageId, res_id: forwardId, forward_id: forwardId };
   }
   async forwardOneBotMessage(action, params) {
     const { event, raw, nativeId } = this.getCachedMessage(params.message_id);
@@ -1098,10 +1311,65 @@ class QQInstance {
     checkNativeResult(result, "转发消息失败");
     return null;
   }
-  getOneBotForward(messageId) {
-    const messages = this.oneBotForwardMessages.get(messageId);
-    if (!messages) throw new OneBotActionError(`合并转发不存在或已过期: ${messageId}`, 1404, "get_forward_msg");
+  async getOneBotForward(messageId) {
+    const cached = this.oneBotForwardMessages.get(messageId);
+    if (Array.isArray(cached)) return { messages: cached };
+    let reference = cached;
+    if (!reference) {
+      try {
+        const { raw } = this.getCachedMessage(messageId);
+        reference = raw ? this.forwardReference(raw) : null;
+      } catch {
+      }
+    }
+    if (!reference?.raw) throw new OneBotActionError(`合并转发不存在或已过期: ${messageId}`, 1404, "get_forward_msg");
+    const messages = await this.loadForwardNodes(reference);
+    this.rememberOneBotForward(messageId, messages);
     return { messages };
+  }
+  async loadForwardNodes(reference, depth = 0) {
+    if (depth >= 4) return [];
+    const method = requireNativeMethod(this.getMsgService(), "getMultiMsg", "get_forward_msg");
+    const result = await method(reference.peer, reference.rootMsgId, reference.parentMsgId);
+    checkNativeResult(result, "获取合并转发内容失败");
+    const nodes = [];
+    for (const raw of Array.from(result?.msgList || [])) {
+      const content = [];
+      for (const element of Array.from(raw?.elements || [])) {
+        let segment = this.oneBotElement(element, raw);
+        if (!segment) continue;
+        if (segment.type === "forward" && depth < 3) {
+          const nested = this.forwardReference(raw, reference.peer);
+          nested.rootMsgId = reference.rootMsgId;
+          try {
+            segment = {
+              ...segment,
+              data: { ...segment.data, content: await this.loadForwardNodes(nested, depth + 1) },
+            };
+          } catch {
+          }
+        }
+        content.push(segment);
+      }
+      let senderUin = String(raw.senderUin || "");
+      if ((!senderUin || senderUin === "0") && raw.senderUid) {
+        try {
+          senderUin = String(await this.resolveUin(String(raw.senderUid)));
+        } catch {
+        }
+      }
+      nodes.push({
+        type: "node",
+        data: {
+          user_id: Number(senderUin) || senderUin || 0,
+          nickname: String(raw.sendNickName || raw.sendMemberName || "QQ用户"),
+          content,
+          message: content,
+          time: Number(raw.msgTime || 0),
+        },
+      });
+    }
+    return nodes;
   }
   async queryGroupDetail(groupId) {
     const service = this.session?.getGroupService?.();
@@ -2371,8 +2639,27 @@ class QQInstance {
     await new Promise((resolve) => setTimeout(resolve, 500));
     return this.oneBotOnlineClients;
   }
-  async sendPoke(_params) {
-    throw new OneBotActionError("当前 QQ 原生会话未提供戳一戳发送接口", 1405, "send_poke");
+  async sendPoke(params) {
+    const targetId = String(params.target_id || params.user_id || "");
+    const peerId = String(params.group_id || params.user_id || "");
+    if (!/^\d+$/.test(targetId) || !/^\d+$/.test(peerId)) {
+      throw new OneBotActionError("戳一戳缺少有效的 user_id/group_id", 1400, "send_poke");
+    }
+    const isGroup = Boolean(params.group_id);
+    const inner = Buffer.concat([
+      encodeProtoVarintField(1, BigInt(targetId)),
+      encodeProtoVarintField(isGroup ? 2 : 5, BigInt(peerId)),
+      encodeProtoVarintField(6, 0),
+    ]);
+    const packet = Buffer.concat([
+      encodeProtoVarintField(1, 0xED3),
+      encodeProtoVarintField(2, 1),
+      encodeProtoBytesField(4, inner),
+      encodeProtoVarintField(12, 1),
+    ]);
+    const method = requireNativeMethod(this.getMsgService(), "sendSsoCmdReqByContend", "send_poke");
+    await method("OidbSvcTrpcTcp.0xED3_1", packet);
+    return null;
   }
   async setGroupSpecialTitle(_params) {
     throw new OneBotActionError("当前 QQ 原生会话未提供群头衔设置接口", 1405, "set_group_special_title");
@@ -2506,9 +2793,21 @@ class QQInstance {
       prompt_text: String(result?.promptText || result?.errMsg || "")
     };
   }
-  async sendOneBotMessage(type, target, message, autoEscape = false) {
+  async sendOneBotMessage(type, target, message, autoEscape = false, elementContext = null) {
     if (!target || target === "undefined") throw new OneBotActionError("缺少消息目标", 1400);
     const segments = this.normalizeOneBotMessage(message, autoEscape);
+    const nodeCount = segments.filter((segment) => String(segment?.type || "").toLowerCase() === "node").length;
+    if (nodeCount) {
+      if (nodeCount !== segments.length) {
+        throw new OneBotActionError("合并转发 node 不能和普通消息段混合发送", 1400, "send_msg");
+      }
+      return this.sendOneBotForward(
+        type === "group" ? "send_group_forward_msg" : "send_private_forward_msg",
+        type === "group"
+          ? { group_id: target, messages: segments }
+          : { user_id: target, messages: segments },
+      );
+    }
     const elements = [];
     const temporaryFiles = [];
     try {
@@ -2518,8 +2817,10 @@ class QQInstance {
         if (segmentType === "text") {
           if (data.text !== void 0 && String(data.text)) elements.push(this.textElement(String(data.text)));
         } else if (segmentType === "at") {
-          if (type !== "group") continue;
-          elements.push(await this.atElement(target, String(data.qq || data.user_id || "")));
+          const contextType = String(elementContext?.type || type);
+          const contextTarget = String(elementContext?.target || target);
+          if (contextType !== "group") continue;
+          elements.push(await this.atElement(contextTarget, String(data.qq || data.user_id || "")));
         } else if (segmentType === "reply") {
           elements.push(this.replyElement(data));
         } else if (segmentType === "face") {
@@ -2574,11 +2875,19 @@ class QQInstance {
           if (prepared.temporary) temporaryFiles.push(prepared.path);
         } else if (segmentType === "json") {
           const content = typeof data.data === "string" ? data.data : JSON.stringify(data.data ?? data);
-          elements.push({
-            elementType: 10,
-            elementId: "",
-            arkElement: { bytesData: content, linkInfo: null, subElementType: null }
-          });
+          elements.push(this.arkElement(content));
+        } else if (segmentType === "forward") {
+          const resId = String(data.res_id || data.resid || data.id || "");
+          if (!resId) throw new OneBotActionError("forward 消息段缺少 id", 1400, "send_msg");
+          elements.push(this.arkElement(JSON.stringify(this.forwardArkJson(resId, data))));
+        } else if (segmentType === "contact") {
+          elements.push(await this.contactElement(data));
+        } else if (segmentType === "music") {
+          elements.push(await this.musicElement(data));
+        } else if (segmentType === "miniapp") {
+          const content = typeof data.data === "string" ? data.data : JSON.stringify(data.data ?? data);
+          if (!content) throw new OneBotActionError("miniapp 消息段缺少 data", 1400, "send_msg");
+          elements.push(this.arkElement(content));
         } else if (segmentType === "xml") {
           elements.push({
             elementType: 13,
@@ -2644,7 +2953,7 @@ class QQInstance {
         },
       };
       if (type === "group") event.group_id = Number(target) || target;
-      this.rememberOneBotMessage(event, rawId, result?.msg || result?.message || null);
+      this.rememberOneBotMessage(event, rawId, result?.msgId ? result : result?.msg || result?.message || null);
       return { message_id: messageId };
     } finally {
       for (const file of temporaryFiles) {
@@ -2691,6 +3000,123 @@ class QQInstance {
       elementId: "",
       textElement: { content, atType: 0, atUid: "", atTinyId: "", atNtUid: "" }
     };
+  }
+  arkElement(content) {
+    return {
+      elementType: 10,
+      elementId: "",
+      arkElement: { bytesData: String(content || ""), linkInfo: null, subElementType: null },
+    };
+  }
+  forwardArkJson(resId, data = {}) {
+    const id = String(data.uniseq || data.filename || randomUUID());
+    const news = Array.isArray(data.news) && data.news.length
+      ? data.news
+      : [{ text: String(data.preview || "聊天记录") }];
+    return {
+      app: "com.tencent.multimsg",
+      config: { autosize: 1, forward: 1, round: 1, type: "normal", width: 300 },
+      desc: String(data.prompt || "[聊天记录]"),
+      extra: { filename: id, tsum: Number(data.count || data.tsum || 0) },
+      meta: {
+        detail: {
+          news,
+          resid: String(resId),
+          source: String(data.source || "聊天记录"),
+          summary: String(data.summary || "查看转发消息"),
+          uniseq: id,
+        },
+      },
+      prompt: String(data.prompt || "[聊天记录]"),
+      ver: "0.0.0.5",
+      view: "contact",
+    };
+  }
+  forwardArkData(value) {
+    if (!value) return null;
+    try {
+      const data = typeof value === "string" ? JSON.parse(value) : value;
+      return data?.app === "com.tencent.multimsg" && data?.meta?.detail?.resid ? data : null;
+    } catch {
+      return null;
+    }
+  }
+  async contactElement(data) {
+    const contactType = String(data.type || "qq").toLowerCase();
+    const id = String(data.id || data.user_id || data.group_id || "");
+    if (!id) throw new OneBotActionError("contact 消息段缺少 id", 1400, "send_msg");
+    let result;
+    if (contactType === "group") {
+      const method = requireNativeMethod(this.session?.getGroupService?.(), "getGroupRecommendContactArkJson", "send_msg");
+      result = await method(id);
+    } else if (contactType === "qq" || contactType === "private") {
+      const method = requireNativeMethod(this.session?.getBuddyService?.(), "getBuddyRecommendContactArkJson", "send_msg");
+      result = await method(id, String(data.phone_number || ""));
+    } else {
+      throw new OneBotActionError(`不支持的 contact 类型: ${contactType}`, 1400, "send_msg");
+    }
+    checkNativeResult(result, "生成联系人卡片失败");
+    const content = String(result?.arkMsg || result?.arkJson || result?.data?.arkMsg || result?.data?.arkJson || "");
+    if (!content) throw new OneBotActionError("生成联系人卡片失败: Ark 内容为空", 1500, "send_msg");
+    return this.arkElement(content);
+  }
+  async musicElement(data) {
+    const supported = new Set(["qq", "163", "kugou", "kuwo", "migu", "custom"]);
+    const musicType = String(data.type || "").toLowerCase();
+    if (!supported.has(musicType)) {
+      throw new OneBotActionError(`不支持的音乐平台: ${musicType || "empty"}`, 1400, "send_msg");
+    }
+    if (data.id === undefined && (!data.url || !data.image)) {
+      throw new OneBotActionError("自定义音乐卡片必须提供 url 和 image", 1400, "send_msg");
+    }
+    const payload = data.id === undefined && data.content
+      ? { ...data, singer: data.content, content: undefined }
+      : data;
+    const endpoint = String(process.env["ELAINAQQ_MUSIC_SIGN_URL"] || "https://ss.xingzhige.com/music_card/card");
+    const response = await this.postJson(endpoint, payload);
+    const content = typeof response === "string"
+      ? response
+      : response?.data && typeof response.data === "string"
+        ? response.data
+        : JSON.stringify(response?.data ?? response);
+    if (!content) throw new OneBotActionError("音乐卡片签名服务返回空内容", 1500, "send_msg");
+    return this.arkElement(content);
+  }
+  async postJson(url, data, timeout = 15000) {
+    const payload = JSON.stringify(data ?? {});
+    const client = url.startsWith("https:") ? (await import('https')).default : (await import('http')).default;
+    return new Promise((resolve, reject) => {
+      const request = client.request(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+        },
+      }, (response) => {
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          body += chunk;
+          if (body.length > 8 * 1024 * 1024) request.destroy(new Error("响应内容过大"));
+        });
+        response.on("end", () => {
+          const status = Number(response.statusCode || 0);
+          if (status < 200 || status >= 300) {
+            reject(new OneBotActionError(`音乐卡片签名失败: HTTP ${status}`, 1500, "send_msg"));
+            return;
+          }
+          try {
+            resolve(body ? JSON.parse(body) : "");
+          } catch {
+            resolve(body);
+          }
+        });
+      });
+      request.setTimeout(timeout, () => request.destroy(new Error("音乐卡片签名超时")));
+      request.on("error", reject);
+      request.write(payload);
+      request.end();
+    });
   }
   replyElement(data) {
     let cached;
@@ -2750,10 +3176,86 @@ class QQInstance {
   async sendNativeElements(type, target, elements) {
     if (!this.session) throw new Error("QQ Session 尚未初始化");
     const peerUid = type === "private" ? await this.resolveUid(target) : target;
+    return this.sendNativeElementsToPeer(
+      { chatType: type === "group" ? 2 : 1, peerUid, guildId: "" },
+      elements,
+      type,
+    );
+  }
+  waitForSentMessage(match, timeout = 30000) {
+    let settled = false;
+    let pending;
+    const promise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        this.pendingSentMessages.delete(pending);
+        reject(new OneBotActionError("等待 QQ 消息发送回执超时", 1500, "send_msg"));
+      }, timeout);
+      pending = {
+        match,
+        resolve: (raw) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          this.pendingSentMessages.delete(pending);
+          resolve(raw);
+        },
+        reject: (error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          this.pendingSentMessages.delete(pending);
+          reject(error);
+        },
+        timer,
+      };
+      this.pendingSentMessages.add(pending);
+    });
+    return {
+      promise,
+      cancel: () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(pending?.timer);
+        this.pendingSentMessages.delete(pending);
+      },
+    };
+  }
+  handleSentMessageUpdates(messages) {
+    for (const raw of Array.from(messages || [])) {
+      for (const pending of Array.from(this.pendingSentMessages)) {
+        let matched = false;
+        try {
+          matched = pending.match(raw);
+        } catch (error) {
+          pending.reject(error);
+          continue;
+        }
+        if (matched) pending.resolve(raw);
+      }
+    }
+  }
+  async sendNativeElementsToPeer(peer, elements, logType = "private") {
+    if (!this.session) throw new Error("QQ Session 尚未初始化");
+    const service = this.getMsgService();
+    const send = requireNativeMethod(service, "sendMsg", "send_msg");
+    let uniqueId = "";
+    if (typeof service?.generateMsgUniqueId === "function") {
+      const serverTime = this.session?.getMSFService?.()?.getServerTime?.() || Math.floor(Date.now() / 1000);
+      uniqueId = String(await service.generateMsgUniqueId(Number(peer.chatType), serverTime));
+    }
+    const sendPeer = { ...peer, guildId: uniqueId || String(peer.guildId || "") };
+    const pending = this.waitForSentMessage((raw) => {
+      if (String(raw?.peerUid || "") !== String(sendPeer.peerUid)) return false;
+      if (uniqueId && String(raw?.guildId || "") !== uniqueId) return false;
+      const status = Number(raw?.sendStatus);
+      return !Number.isFinite(status) || status === 2 || status === 3;
+    });
     try {
-      const result = await this.session.getMsgService().sendMsg(
+      const result = await send(
         "0",
-        { chatType: type === "group" ? 2 : 1, peerUid, guildId: "" },
+        sendPeer,
         elements,
         /* @__PURE__ */ new Map()
       );
@@ -2761,9 +3263,14 @@ class QQInstance {
       if (Number.isFinite(resultCode) && resultCode !== 0) {
         throw new Error(result?.errMsg || result?.message || `发送失败 (${resultCode})`);
       }
-      return result || {};
+      if (result?.msgId && Array.isArray(result?.elements)) {
+        pending.cancel();
+        return result;
+      }
+      return await pending.promise;
     } catch (error) {
-      logErr(this.botConfig.id, `${type === "group" ? "群" : "私聊"}消息发送失败:`, error);
+      pending.cancel();
+      logErr(this.botConfig.id, `${logType === "group" ? "群" : "私聊"}消息发送失败:`, error);
       throw error;
     }
   }
@@ -3569,6 +4076,44 @@ class QQInstance {
     listenerImpl.onLineDev = (clients) => {
       self.oneBotOnlineClients = Array.from(clients || []);
     };
+    listenerImpl.onMsgRecall = async (chatType, uid, msgSeq) => {
+      try {
+        const isGroup = Number(chatType) === 2;
+        const matches = [];
+        for (const event of self.oneBotMessages.values()) {
+          if (String(event.message_seq || event.real_seq || event.real_id || "") !== String(msgSeq || "")) continue;
+          matches.push(event);
+        }
+        const recalled = matches.find((event) => !isGroup || String(event.group_id || "") === String(uid || "")) || matches[0] || null;
+        const privateUid = String(uid || recalled?.user_id || "");
+        const resolvedPrivateUin = isGroup ? "" : await self.resolveUin(privateUid);
+        const userId = isGroup
+          ? Number(recalled?.user_id || 0) || recalled?.user_id || 0
+          : Number(resolvedPrivateUin) || resolvedPrivateUin;
+        const event = {
+          time: Math.floor(Date.now() / 1e3),
+          self_id: Number(self.getSelfUin()) || self.getSelfUin(),
+          post_type: "notice",
+          notice_type: isGroup ? "group_recall" : "friend_recall",
+          user_id: userId,
+          message_id: recalled?.message_id || String(msgSeq || ""),
+        };
+        if (isGroup) {
+          const groupId = recalled?.group_id || uid;
+          event.group_id = Number(groupId) || groupId;
+          event.operator_id = userId;
+        }
+        self.oneBotEventCallback?.(event);
+      } catch (error) {
+        logErr(id, "[EVENT] 撤回事件转换失败:", error?.message || error);
+      }
+    };
+    listenerImpl.onMsgInfoListUpdate = (messages) => {
+      self.handleSentMessageUpdates(messages);
+    };
+    listenerImpl.onAddSendMsg = (message) => {
+      self.handleSentMessageUpdates([message]);
+    };
     listenerImpl.onRecvMsg = (msgs) => {
       const gate = self.incomingMessageGate;
       if (!gate) return;
@@ -3598,11 +4143,91 @@ class QQInstance {
       logErr(id, "[MSG] 注册消息监听失败:", e.message);
     }
   }
+  registerEventListeners() {
+    const id = this.botConfig.id;
+    const emit = (event) => this.oneBotEventCallback?.({
+      time: Math.floor(Date.now() / 1e3),
+      self_id: Number(this.getSelfUin()) || this.getSelfUin(),
+      ...event,
+    });
+
+    try {
+      const buddy = new BuddyListener();
+      buddy.onBuddyReqChange = async (payload) => {
+        for (const request of Array.from(payload?.buddyReqs || []).slice(0, Number(payload?.unreadNums || 0))) {
+          if (request?.isInitiator || request?.isDecide || !request?.isUnread) continue;
+          const userId = await this.resolveUin(String(request.friendUid || ""));
+          emit({
+            post_type: "request",
+            request_type: "friend",
+            user_id: Number(userId) || userId,
+            comment: String(request.extWords || ""),
+            flag: String(request.reqTime || request.flag || ""),
+          });
+        }
+      };
+      this.buddyListener = proxied(buddy);
+      this.buddyListenerHandle = this.session?.getBuddyService?.().addKernelBuddyListener?.(this.buddyListener);
+    } catch (error) {
+      logErr(id, "[EVENT] 好友事件监听注册失败:", error?.message || error);
+    }
+
+    try {
+      const group = new GroupListener();
+      group.onGroupNotifiesUpdated = async (_doubt, notifies) => {
+        for (const notify of Array.from(notifies || [])) {
+          const groupId = String(notify?.group?.groupCode || notify?.groupCode || "");
+          const affectedUid = String(notify?.user1?.uid || notify?.actionUser?.uid || "");
+          const affectedUin = affectedUid ? await this.resolveUin(affectedUid) : "";
+          const flag = String(notify?.seq || notify?.flag || "");
+          const type = Number(notify?.type || 0);
+          const status = Number(notify?.status || 0);
+          if (status === 1 && [1, 5, 7].includes(type)) {
+            emit({
+              post_type: "request",
+              request_type: "group",
+              sub_type: type === 1 ? "invite" : "add",
+              group_id: Number(groupId) || groupId,
+              user_id: Number(affectedUin) || affectedUin || 0,
+              comment: String(notify?.postscript || ""),
+              flag,
+            });
+          } else if ([4, 6].includes(type)) {
+            emit({
+              post_type: "notice", notice_type: "group_increase", sub_type: "approve",
+              group_id: Number(groupId) || groupId, user_id: Number(affectedUin) || affectedUin || 0, operator_id: 0,
+            });
+          } else if ([9, 10, 11].includes(type)) {
+            emit({
+              post_type: "notice", notice_type: "group_decrease", sub_type: type === 11 ? "leave" : "kick",
+              group_id: Number(groupId) || groupId, user_id: Number(affectedUin) || affectedUin || 0, operator_id: 0,
+            });
+          } else if ([8, 12, 13].includes(type)) {
+            emit({
+              post_type: "notice", notice_type: "group_admin", sub_type: type === 8 ? "set" : "unset",
+              group_id: Number(groupId) || groupId, user_id: Number(affectedUin) || affectedUin || 0,
+            });
+          }
+        }
+      };
+      this.groupListener = proxied(group);
+      this.groupListenerHandle = this.session?.getGroupService?.().addKernelGroupListener?.(this.groupListener);
+    } catch (error) {
+      logErr(id, "[EVENT] 群事件监听注册失败:", error?.message || error);
+    }
+  }
   handleMessage(msg) {
     const elements = msg.elements || [];
     if (!elements.length) return;
     const event = this.toOneBotEvent(msg);
     this.rememberOneBotMessage(event, nativeMessageKey(msg), msg);
+    const forwardIds = [];
+    for (const element of elements) {
+      const ark = this.forwardArkData(element?.arkElement?.bytesData);
+      if (ark?.meta?.detail?.resid) forwardIds.push(ark.meta.detail.resid);
+      if (element?.multiForwardMsgElement?.resId) forwardIds.push(element.multiForwardMsgElement.resId);
+    }
+    if (forwardIds.length) this.rememberForwardReference(msg, forwardIds);
     this.rememberReplyTargets(msg);
     this.oneBotEventCallback?.(event);
     for (const element of elements) {
@@ -3717,12 +4342,19 @@ class QQInstance {
       };
       this.rememberOneBotFile(file, data);
       if (Number(element.elementType) === 23 || Number(element.elementType) === 30) {
+        const isDir = Number(element.elementType) === 30;
         return {
           type: "onlinefile",
           data: {
             ...data,
             msg_id: String(msg.msgId || ""),
-            is_dir: Number(element.elementType) === 30,
+            element_id: String(element.elementId || ""),
+            is_dir: isDir,
+            msgId: String(msg.msgId || ""),
+            elementId: String(element.elementId || ""),
+            fileName: String(file.fileName || ""),
+            fileSize: String(file.fileSize || ""),
+            isDir,
           },
         };
       }
@@ -3757,6 +4389,12 @@ class QQInstance {
     if (element?.faceElement) {
       const face = element.faceElement;
       const faceIndex = Number(face.faceIndex || 0);
+      if (Number(face.faceType) === 5) {
+        return {
+          type: "poke",
+          data: { type: String(face.pokeType || 0), id: String(face.faceIndex || "") },
+        };
+      }
       if (faceIndex === 358) return { type: "dice", data: { result: String(face.resultId || "") } };
       if (faceIndex === 359) return { type: "rps", data: { result: String(face.resultId || "") } };
       return {
@@ -3780,7 +4418,20 @@ class QQInstance {
         },
       };
     }
-    if (element?.arkElement) return { type: "json", data: { data: String(element.arkElement.bytesData || "") } };
+    if (element?.arkElement) {
+      const content = String(element.arkElement.bytesData || "");
+      const forward = this.forwardArkData(content);
+      if (forward) {
+        return {
+          type: "forward",
+          data: {
+            id: String(toOneBotMessageId(nativeMessageKey(msg))),
+            res_id: String(forward.meta.detail.resid),
+          },
+        };
+      }
+      return { type: "json", data: { data: content } };
+    }
     if (element?.structLongMsgElement) {
       return {
         type: "xml",
@@ -3793,12 +4444,18 @@ class QQInstance {
     if (element?.markdownElement) {
       const markdown = element.markdownElement;
       const fileSetId = String(markdown?.mdExtInfo?.flashTransferInfo?.filesetId || "");
-      if (fileSetId) return { type: "flashtransfer", data: { fileset_id: fileSetId } };
+      if (fileSetId) return { type: "flashtransfer", data: { fileset_id: fileSetId, fileSetId } };
       return { type: "markdown", data: { content: String(markdown.content || "") } };
     }
     if (element?.multiForwardMsgElement) {
       const forward = element.multiForwardMsgElement;
-      return { type: "forward", data: { id: String(forward.resId || msg.msgId || element.elementId || "") } };
+      return {
+        type: "forward",
+        data: {
+          id: String(toOneBotMessageId(nativeMessageKey(msg))),
+          res_id: String(forward.resId || ""),
+        },
+      };
     }
     if (element?.shareLocationElement) {
       const location = element.shareLocationElement;
@@ -3913,6 +4570,7 @@ const MANAGER_URL = process.env["ELAINAQQ_MANAGER_URL"] || "http://127.0.0.1:300
 const EMBEDDED = process.env["ELAINAQQ_EMBEDDED"] === "1";
 let shuttingDown = false;
 const lifecycleKeepAlive = setInterval(() => {}, 60_000);
+if (process.env["ELAINAQQ_WORKER_TEST"] === "1") lifecycleKeepAlive.unref?.();
 const _origLog = console.log.bind(console);
 const _origErr = console.error.bind(console);
 function _ts() {
@@ -3976,72 +4634,27 @@ const keepAliveAgent = new http.Agent({
   maxSockets: 4,
   maxFreeSockets: 2
 });
+let managerReportTail = Promise.resolve();
+function queueManagerReport(path, body, label) {
+  managerReportTail = managerReportTail
+    .catch(() => {})
+    .then(() => managerRequest("POST", path, body, 5e3))
+    .catch((error) => {
+      logErr(BOT_ID, label, error?.message || error);
+    });
+}
 function reportStatus(runtime) {
-  callManager("POST", "/api/embedded/events", { bot_id: BOT_ID, self_id: runtime.loginUin || BOT_ID, runtime }).catch((error) => {
-    logErr(BOT_ID, "[BRIDGE] 状态上报失败:", error?.message || error);
-  });
+  queueManagerReport("/api/embedded/events", { bot_id: BOT_ID, self_id: runtime.loginUin || BOT_ID, runtime }, "[BRIDGE] 状态上报失败:");
 }
 function reportEmbeddedEvent(event) {
-  callManager("POST", "/api/embedded/events", { bot_id: BOT_ID, self_id: event.self_id || BOT_ID, event }).catch((error) => {
-    logErr(BOT_ID, "[BRIDGE] 事件上报失败:", error?.message || error);
-  });
+  queueManagerReport("/api/embedded/events", { bot_id: BOT_ID, self_id: event.self_id || BOT_ID, event }, "[BRIDGE] 事件上报失败:");
 }
 function reportRedPacket(packet) {
-  callManager("POST", "/api/embedded/red-packets", {
+  queueManagerReport("/api/embedded/red-packets", {
     bot_id: BOT_ID,
     self_id: instance?.getSelfUin() || BOT_ID,
     red_packet: packet
-  }).catch((error) => {
-    logErr(BOT_ID, "[BRIDGE] 红包上报失败:", error?.message || error);
-  });
-}
-function callManager(method, path, body) {
-  return callManagerRaw(method, path, stringifyJson(body));
-}
-function callManagerRaw(method, apiPath, payload) {
-  return new Promise((resolve, reject) => {
-    try {
-      const url = new URL(apiPath, MANAGER_URL);
-      const req = http.request({
-        agent: keepAliveAgent,
-        hostname: url.hostname,
-        port: url.port,
-        path: url.pathname,
-        method,
-        headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) },
-        timeout: 2e3
-        // 本地桥接服务无需长轮询。
-      }, (res) => {
-        let responseBody = "";
-        res.setEncoding("utf8");
-        res.on("data", (chunk) => {
-          if (responseBody.length < 32768) responseBody += chunk;
-        });
-        res.on("end", () => {
-          const statusCode = Number(res.statusCode || 500);
-          if (statusCode >= 200 && statusCode < 300) {
-            resolve({ statusCode, body: responseBody });
-            return;
-          }
-          let message = `HTTP ${statusCode}`;
-          try {
-            const data = responseBody ? JSON.parse(responseBody) : {};
-            message = data.error || data.message || message;
-          } catch {
-          }
-          reject(new Error(message));
-        });
-      });
-      req.on("error", reject);
-      req.on("timeout", () => {
-        req.destroy(new Error("本地桥接请求超时"));
-      });
-      req.write(payload);
-      req.end();
-    } catch (error) {
-      reject(error);
-    }
-  });
+  }, "[BRIDGE] 红包上报失败:");
 }
 function managerRequest(method, apiPath, body = null, timeout = 3e4) {
   return new Promise((resolve, reject) => {
@@ -4169,7 +4782,9 @@ process.on("unhandledRejection", (reason) => {
   console.error("[Worker] 未处理 Promise 异常:", reason?.stack || reason);
 });
 process.on("beforeExit", (code) => {
-  if (!shuttingDown) console.error("[Worker] 事件循环意外结束，退出码: " + code);
+  if (!shuttingDown && process.env["ELAINAQQ_WORKER_TEST"] !== "1") {
+    console.error("[Worker] 事件循环意外结束，退出码: " + code);
+  }
 });
 if (process.env["ELAINAQQ_WORKER_TEST"] !== "1") {
   main().catch((e) => {

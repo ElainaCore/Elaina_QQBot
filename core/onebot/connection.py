@@ -337,14 +337,17 @@ class ConnectionManager:
                 echo = data.get('echo')
                 if echo and adapter.resolve_api_response(echo, data):
                     continue
-                event = adapter.parse_event(data)
-                if not event:
-                    continue
-                sid = str(getattr(event, 'self_id', '') or '')
+                sid = str(data.get('self_id') or '')
+                if not sid and str(conn.get('_self_id') or '').startswith('forward:'):
+                    sid = ''
+                elif not sid:
+                    sid = str(conn.get('_self_id') or '')
                 if sid and conn.get('_self_id') != sid:
                     self._rekey_forward(conn, sid, ws)
                     self._set_status(conn['name'], connected=True, error='', self_id=sid)
-                self._app.submit_event(event)
+                if not await self._app.ingest_event(data, sid):
+                    logger.warning('拒绝无效或无法入队的 OneBot 正向 WebSocket 事件: %s', conn['name'])
+                    continue
             elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
                 break
 

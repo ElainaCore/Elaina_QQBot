@@ -19,23 +19,52 @@ _HTTP_RESPONSE_LIMIT = 32 * 1024 * 1024
 class OneBotAdapter:
     """OneBot v11 协议适配器"""
 
-    def __init__(self):
+    def __init__(self, action_result_handler=None):
         self.bots: dict[str, Any] = {}
         self.websockets: dict[str, Any] = {}
         self.api_responses: dict[str, asyncio.Future] = {}
         self._api_response_owners: dict[str, Any] = {}
         self.http_clients: dict[str, dict[str, str]] = {}  # 名称映射到地址和令牌
         self.local_actions: dict[str, Any] = {}
+        self.identity_aliases: dict[str, str] = {}
         # 鉴权按端口和路径隔离，避免不同连接误用令牌或签名密钥。
         self.reverse_ws_tokens: dict[tuple, str] = {}
         self.reverse_http_secrets: dict[tuple, str] = {}
         self._http_session: aiohttp.ClientSession | None = None
+        self.action_result_handler = action_result_handler
 
     def register_local_bot(self, self_id: str, action):
         """注册由框架直接 Hook 的本机 QQ 账号。"""
         self_id = str(self_id)
         self.local_actions[self_id] = action
         self.bots[self_id] = {'self_id': self_id, 'type': 'embedded'}
+
+    def register_identity_alias(self, alias: str, self_id: str) -> None:
+        """登记配置编号到真实 OneBot self_id 的稳定映射。"""
+        alias, self_id = str(alias or '').strip(), str(self_id or '').strip()
+        if alias and self_id and alias != self_id:
+            self.identity_aliases[alias] = self_id
+
+    def unregister_identity_alias(self, alias: str) -> None:
+        self.identity_aliases.pop(str(alias or ''), None)
+
+    def resolve_self_id(self, self_id: str | None) -> str | None:
+        """将内置 QQ 的临时编号解析为标准 self_id。"""
+        if self_id is None:
+            return None
+        current = str(self_id)
+        seen = set()
+        while current in self.identity_aliases and current not in seen:
+            seen.add(current)
+            current = self.identity_aliases[current]
+        return current
+
+    def allows_self_id(self, allowed: set[str] | frozenset[str] | None, self_id: str) -> bool:
+        """使用同一身份规则判断插件账号绑定。"""
+        if allowed is None:
+            return True
+        actual = self.resolve_self_id(self_id)
+        return any(self.resolve_self_id(candidate) == actual for candidate in allowed)
 
     def unregister_local_bot(self, self_id: str):
         self_id = str(self_id)
@@ -50,6 +79,7 @@ class OneBotAdapter:
         params: dict | None = None,
         self_id: str | None = None,
     ):
+        self_id = self.resolve_self_id(self_id)
         handler = self.local_actions.get(str(self_id)) if self_id else None
         if self_id and handler is None:
             return None
@@ -58,6 +88,13 @@ class OneBotAdapter:
         if handler is None:
             return None
         return await handler(action, params or {})
+
+    def default_self_id(self) -> str | None:
+        """按本机、WebSocket、已登记账号的顺序选择默认机器人。"""
+        for registry in (self.local_actions, self.websockets, self.bots):
+            if registry:
+                return str(next(iter(registry)))
+        return None
 
     def expected_ws_token(self, port=None, path=None) -> str:
         """返回指定 (端口, 路径) 反向 WS 入口应校验的 token; 找不到则不校验"""
@@ -98,37 +135,46 @@ class OneBotAdapter:
             return False
         return hmac.compare_digest(parts[1], token)
 
-    def parse_event(self, data: dict) -> OneBotEvent | None:
-        """解析 OneBot 事件"""
-        return parse_event(data)
+    def parse_event(self, data: dict, default_self_id: str = '') -> OneBotEvent | None:
+        """解析事件，并把全部账号别名收敛为标准 self_id。"""
+        if not isinstance(data, dict):
+            return None
+        payload = dict(data)
+        supplied_self_id = payload.get('self_id') or default_self_id
+        canonical_self_id = self.resolve_self_id(str(supplied_self_id)) if supplied_self_id else ''
+        if canonical_self_id:
+            payload['self_id'] = canonical_self_id
+        return parse_event(payload, canonical_self_id or default_self_id)
 
-    def handle_http_callback(self, body: bytes, headers: dict, port=None, path=None) -> tuple:
-        """处理 HTTP 回调"""
+    def decode_http_event(self, body: bytes, headers: dict, port=None, path=None) -> tuple[dict | None, int]:
+        """校验并解码 HTTP 上报，事件解析统一交给 Application。"""
         self_id = headers.get('x-self-id') or headers.get('X-Self-ID')
         if not self_id:
-            return False, None
+            return None, 400
 
         signature = headers.get('x-signature') or headers.get('X-Signature')
         if not self._check_signature(body, signature, self.expected_http_secret(port, path)):
-            return False, None
+            return None, 401
 
         try:
             json_data = json.loads(body)
         except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
-            return False, None
+            return None, 400
         if not isinstance(json_data, dict):
-            return False, None
-
-        event = self.parse_event(json_data)
-        if not event:
-            return False, None
+            return None, 400
+        body_self_id = str(json_data.get('self_id') or '')
+        if body_self_id and body_self_id != str(self_id):
+            return None, 400
+        json_data['self_id'] = str(self_id)
+        if 'post_type' not in json_data and 'postType' not in json_data:
+            return None, 400
 
         self_id = str(self_id)
         if self_id not in self.bots:
             self.bots[self_id] = {'self_id': self_id, 'type': 'http'}
             logger.info(f'Bot {self_id} HTTP 连接')
 
-        return True, event
+        return json_data, 204
 
     def validate_websocket_headers(self, headers: dict, port=None, path=None) -> tuple:
         """验证 WebSocket 连接头 (按 端口+路径 选取该连接配置的 token)"""
@@ -217,6 +263,7 @@ class OneBotAdapter:
 
     def get_bot_ws(self, self_id: str | None = None):
         """获取 bot WebSocket 连接"""
+        self_id = self.resolve_self_id(self_id)
         if self_id:
             return self.websockets.get(self_id)
         # 未指定账号时返回首个可用连接。

@@ -43,8 +43,13 @@ class PluginManager(_LoaderMixin, _WatcherMixin, _DispatchMixin, _PluginBotsMixi
         self._owner_ids: list[str] = []
         self._base_dir = os.path.dirname(self._dir)
         self._plugin_bots = {}
+        self._bot_identity_matcher = None
         self._load_plugin_bots()
         self._load_disabled_plugins()
+
+    def set_bot_identity_matcher(self, matcher) -> None:
+        """设置事件与插件账号绑定共用的身份判断器。"""
+        self._bot_identity_matcher = matcher
 
     @property
     def plugins(self) -> dict:
