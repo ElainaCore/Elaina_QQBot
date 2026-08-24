@@ -1706,9 +1706,12 @@ class QQInstance {
     const method = requireNativeMethod(service, "getRecentContactListSnapShot", "get_recent_contact");
     const result = await method(Math.min(100, Math.max(1, Number(params.count || 10))));
     checkNativeResult(result, "获取最近会话失败");
-    const contacts = result?.info?.changedList || result?.changedList || [];
-    return Promise.all(Array.from(contacts).map(async (contact) => {
-      const peer = { chatType: Number(contact.chatType || 1), peerUid: String(contact.peerUid || ""), guildId: "" };
+    const contacts = Array.from(result?.info?.changedList || result?.changedList || [])
+      .filter((contact) => [1, 2].includes(Number(contact?.chatType)));
+    return Promise.all(contacts.map(async (contact) => {
+      const chatType = Number(contact.chatType || 0);
+      const guildId = String(contact.guildId || contact.channelId || "");
+      const peer = { chatType, peerUid: String(contact.peerUid || ""), guildId };
       let latestMsg;
       try {
         const messageResult = await this.getMsgService()?.getMsgsByMsgId?.(peer, [String(contact.msgId || "")]);
@@ -1719,15 +1722,38 @@ class QQInstance {
       return {
         lastestMsg: latestMsg,
         peerUin: String(contact.peerUin || await this.resolveUin(contact.peerUid)),
-        remark: String(contact.remark || ""),
+        peerUid: String(contact.peerUid || ""),
+        guildId,
+        remark: this.displayText(contact.remark),
         msgTime: String(contact.msgTime || ""),
-        chatType: Number(contact.chatType || 0),
+        chatType,
         msgId: String(contact.msgId || ""),
-        sendNickName: String(contact.sendNickName || ""),
-        sendMemberName: String(contact.sendMemberName || ""),
-        peerName: String(contact.peerName || ""),
+        sendNickName: this.displayText(contact.sendNickName),
+        sendMemberName: this.displayText(contact.sendMemberName),
+        peerName: this.displayText(contact.peerName),
       };
     }));
+  }
+  displayText(value, seen = new Set()) {
+    if (value === undefined || value === null) return "";
+    if (["string", "number", "bigint"].includes(typeof value)) {
+      const text = String(value).trim();
+      return ["[object Map]", "[object Object]", "undefined", "null"].includes(text) ? "" : text;
+    }
+    if (typeof value !== "object" || seen.has(value)) return "";
+    seen.add(value);
+    const entries = value instanceof Map ? Array.from(value.entries()) : Object.entries(value);
+    const preferred = ["remark", "name", "nickname", "nick", "card", "text", "value"];
+    for (const key of preferred) {
+      const item = entries.find(([entryKey]) => String(entryKey) === key);
+      const display = item ? this.displayText(item[1], seen) : "";
+      if (display) return display;
+    }
+    for (const [, item] of entries) {
+      const display = this.displayText(item, seen);
+      if (display) return display;
+    }
+    return "";
   }
   async getOnlineFileMessages(params) {
     const uid = await this.resolveUid(String(params.user_id || ""));
@@ -3509,8 +3535,8 @@ class QQInstance {
       const uin = await this.resolveUin(uid);
       return {
         user_id: Number(uin) || uin,
-        nickname: String(service.getBuddyNick?.(uid) || ""),
-        remark: String(service.getBuddyRemark?.(uid) || ""),
+        nickname: this.displayText(service.getBuddyNick?.(uid)),
+        remark: this.displayText(service.getBuddyRemark?.(uid)),
       };
     }));
     return friends.filter((friend) => /^\d+$/.test(String(friend.user_id)));
@@ -4547,18 +4573,19 @@ class QQInstance {
       font: 0,
       sender: {
         user_id: Number(msg.senderUin) || msg.senderUin || 0,
-        nickname: msg.sendNickName || msg.sendMemberName || "",
-        card: msg.sendMemberName || "",
+        nickname: this.displayText(msg.sendNickName) || this.displayText(msg.sendMemberName),
+        card: this.displayText(msg.sendMemberName),
         sex: String(msg.sex || "unknown"),
         age: Number(msg.age || 0),
         role: Number(msg.roleType) === 4 ? "owner" : Number(msg.roleType) === 3 ? "admin" : "member",
         title: String(msg.memberSpecialTitle || ""),
       },
       _peer_uid: String(msg.peerUid || ""),
+      _chat_type: Number(msg.chatType || 0),
     };
     if (isGroup) {
       event.group_id = Number(msg.peerUin) || msg.peerUin;
-      event.group_name = String(msg.peerName || msg.groupName || "");
+      event.group_name = this.displayText(msg.peerName) || this.displayText(msg.groupName);
     }
     if (inlineKeyboard.length) event._elaina_inline_keyboard = inlineKeyboard;
     return event;

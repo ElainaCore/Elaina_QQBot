@@ -76,6 +76,22 @@ def _format_message_content(message) -> str:
     return ''.join(parts) or '[空消息]'
 
 
+def _is_channel_message(event: MessageEvent) -> bool:
+    """频道消息仍交给插件处理，但不写入普通群聊/私聊消息记录。"""
+    raw = event.raw_data if isinstance(event.raw_data, dict) else {}
+    if str(raw.get('message_type') or '').lower() in {'guild', 'channel'}:
+        return True
+    if any(raw.get(key) not in (None, '', 0, '0') for key in ('guild_id', 'guildId', 'channel_id', 'channelId')):
+        return True
+    chat_type = raw.get('_chat_type', raw.get('chatType', raw.get('chat_type')))
+    if chat_type in (None, ''):
+        return False
+    try:
+        return int(chat_type) not in (1, 2)
+    except (TypeError, ValueError):
+        return str(chat_type).lower() in {'guild', 'channel'}
+
+
 def get_app():
     return _app
 
@@ -445,6 +461,8 @@ class Application:
     async def _log_event(self, event):
         """记录事件日志"""
         if isinstance(event, MessageEvent):
+            if _is_channel_message(event):
+                return
             msg_type = '群聊' if event.is_group else '私聊'
             sender = event.sender_card or event.sender_nickname or str(event.user_id)
             location = f'群({event.group_id})' if event.is_group else f'私聊({event.user_id})'
