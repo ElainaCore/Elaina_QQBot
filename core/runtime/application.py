@@ -24,6 +24,7 @@ from core.protocols.onebot.protocol import action_succeeded
 from core.runtime.embedded.manager import EmbeddedQQManager
 from core.runtime.extensions.hook import HookManager
 from core.runtime.extensions.manager import ModuleManager
+from core.runtime.layout import purge_legacy_core_layout
 from core.services.config_watcher import ConfigWatcherService
 from core.services.logs import LogService
 from core.transport.http import HttpServer
@@ -173,6 +174,9 @@ class Application:
         fw_name = cfg.get('settings', 'web.framework_name', PRODUCT_NAME)
         setup_logger(framework_name=fw_name)
         log.info(f'{"=" * 5} {fw_name} 启动中 {"=" * 5}')
+        removed_legacy = await asyncio.to_thread(purge_legacy_core_layout, self._base_dir)
+        if removed_legacy:
+            log.info('已清理废弃框架路径: %s', ', '.join(removed_legacy))
 
         # 2) OneBot 适配器 (每条连接自带 token/secret, 无需全局配置)
         self._adapter = OneBotAdapter(self.log_sent_message)

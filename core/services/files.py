@@ -5,11 +5,52 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
 T = TypeVar('T')
+
+
+def replace_directory(
+    staged: str | os.PathLike[str],
+    target: str | os.PathLike[str],
+    *,
+    preserve: tuple[str, ...] = ('data',),
+) -> None:
+    """Atomically replace a directory while retaining selected runtime data."""
+    staged_path = Path(os.path.abspath(staged))
+    target_path = Path(os.path.abspath(target))
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if target_path.exists():
+        for name in preserve:
+            source = target_path / name
+            destination = staged_path / name
+            if source.is_dir():
+                shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=True)
+            elif source.is_file():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+
+    backup = Path(tempfile.mkdtemp(prefix=f'.{target_path.name}-backup-', dir=target_path.parent))
+    backup.rmdir()
+    had_target = target_path.exists()
+    if had_target:
+        shutil.move(str(target_path), str(backup))
+    try:
+        shutil.move(str(staged_path), str(target_path))
+    except Exception:
+        if had_target and backup.exists() and not target_path.exists():
+            shutil.move(str(backup), str(target_path))
+        raise
+    else:
+        if backup.is_dir():
+            shutil.rmtree(backup)
+        elif backup.exists():
+            backup.unlink()
 
 
 async def run_sync(func: Callable[..., T], /, *args, **kwargs) -> T:

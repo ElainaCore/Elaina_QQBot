@@ -12,12 +12,8 @@ import types
 from core.foundation.logging import PLUGIN, get_logger, report_error
 from core.plugins.context import PluginContext, PluginInfo, plugin_scope
 from core.plugins.decorators import (
-    _pending_api_interceptors,
-    _pending_handler_filters,
-    _pending_handlers,
-    _pending_interceptors,
-    _pending_on_load,
-    _pending_on_unload,
+    PluginRegistrations,
+    registration_scope,
 )
 from core.protocols.onebot.api import api_call_source
 
@@ -25,33 +21,30 @@ log = get_logger(PLUGIN, 'manager')
 _ENTRY_FILE = 'main.py'
 
 
-def _clear_pending() -> None:
-    _pending_handlers.clear()
-    _pending_on_load.clear()
-    _pending_on_unload.clear()
-    _pending_interceptors.clear()
-    _pending_handler_filters.clear()
-    _pending_api_interceptors.clear()
-
-
-def _collect_pending():
-    return (
-        list(_pending_handlers),
-        list(_pending_on_load),
-        list(_pending_on_unload),
-        list(_pending_interceptors),
-        list(_pending_handler_filters),
-        list(_pending_api_interceptors),
-    )
-
-
-async def _run_hooks(funcs, plugin_name: str, context: PluginContext) -> None:
+async def _run_hooks(
+    funcs,
+    plugin_name: str,
+    context: PluginContext,
+    *,
+    phase: str,
+    continue_on_error: bool = False,
+) -> None:
     for func in funcs:
         try:
             with plugin_scope(context), api_call_source(plugin_name):
                 await func()
         except Exception as error:
-            report_error(PLUGIN, plugin_name, error)
+            if continue_on_error:
+                report_error(
+                    PLUGIN,
+                    plugin_name,
+                    error,
+                    context={'phase': phase, 'hook': func.__qualname__},
+                )
+                continue
+            raise RuntimeError(
+                f'plugin [{plugin_name}] {phase} hook [{func.__qualname__}] failed: {error}'
+            ) from error
 
 
 def _submodule_key(func, plugin_name: str) -> str:
@@ -95,7 +88,7 @@ class _LoaderMixin:
             self._configuration_loaded = True
         names = await asyncio.to_thread(_discover_plugins, self._dir)
         self._discovered_plugins = set(names)
-        loaded = skipped = 0
+        loaded = skipped = failed = 0
         for name in names:
             if name in self._disabled_plugins:
                 skipped += 1
@@ -105,13 +98,15 @@ class _LoaderMixin:
                 await self.load(name)
                 loaded += 1
             except Exception as error:
-                report_error(PLUGIN, name, error)
+                failed += 1
+                report_error(PLUGIN, name, error, context={'phase': 'load'})
         self._rebuild_handler_list()
         await asyncio.to_thread(self._snapshot_all_mtimes)
         log.info(
-            'plugins loaded: %d/%d (disabled %d), %d handlers',
+            'plugins loaded: %d/%d (failed %d, disabled %d), %d handlers',
             loaded,
             len(names),
+            failed,
             skipped,
             self.handler_count,
         )
@@ -125,19 +120,36 @@ class _LoaderMixin:
         async with self._lock:
             if name in self._plugins:
                 await self._unload_plugin(name)
-            _clear_pending()
             plugin_context = PluginContext(name, plugin_dir)
             await plugin_context.prepare()
             started = time.perf_counter()
+            registrations = PluginRegistrations()
             try:
-                with plugin_scope(plugin_context), api_call_source(name):
+                with (
+                    plugin_scope(plugin_context),
+                    registration_scope(registrations),
+                    api_call_source(name),
+                ):
                     module = await asyncio.to_thread(
                         self._import_plugin,
                         name,
                         plugin_dir,
                         entry_path,
                     )
-                handlers, on_load, on_unload, interceptors, filters, api_interceptors = _collect_pending()
+                    from core.plugins.web_pages import has_resources_by_owner
+
+                    if registrations.count == 0 and not has_resources_by_owner(name):
+                        raise RuntimeError(
+                            f'plugin [{name}] registered no capabilities; '
+                            'import decorators from the public core.plugins API'
+                        )
+                    await _run_hooks(
+                        list(registrations.on_load),
+                        name,
+                        plugin_context,
+                        phase='on_load',
+                    )
+                handlers, on_load, on_unload, interceptors, filters, api_interceptors = registrations.snapshot()
                 for registry in (handlers, interceptors, filters, api_interceptors):
                     for item in registry:
                         item['_file'] = _submodule_key(item['func'], name).removeprefix(f'{name}/')
@@ -158,20 +170,31 @@ class _LoaderMixin:
                     api_interceptors,
                     started,
                 )
-                await _run_hooks(plugin.on_load_funcs, name, plugin_context)
                 self._plugins[name] = plugin
                 self._discovered_plugins.add(name)
                 self._rebuild_handler_list()
-                get_logger(PLUGIN, name).info(
-                    'loaded (%d handlers, %.2fs)',
+                log.info(
+                    'plugin [%s] loaded (%d handlers, %d interceptors, %.2fs)',
+                    name,
                     len(plugin.handlers),
+                    len(plugin.interceptors),
                     plugin.load_time,
                 )
-            except Exception:
+            except Exception as error:
+                from core.plugins.web_pages import clear_resources_by_owner
+
+                await _run_hooks(
+                    list(registrations.on_unload),
+                    name,
+                    plugin_context,
+                    phase='rollback',
+                    continue_on_error=True,
+                )
+                clear_resources_by_owner(name)
                 self._drop_modules(name)
-                raise
-            finally:
-                _clear_pending()
+                if isinstance(error, RuntimeError) and str(error).startswith(f'plugin [{name}]'):
+                    raise
+                raise RuntimeError(f'plugin [{name}] load failed: {error}') from error
 
     def _filter_disabled(self, plugin_name: str, items: list[dict]) -> list[dict]:
         return [
@@ -198,10 +221,16 @@ class _LoaderMixin:
         plugin = self._plugins.pop(name, None)
         if plugin is None:
             return
-        await _run_hooks(plugin.on_unload_funcs, name, plugin.ctx)
-        from core.plugins.web_pages import clear_routes_by_owner
+        await _run_hooks(
+            plugin.on_unload_funcs,
+            name,
+            plugin.ctx,
+            phase='on_unload',
+            continue_on_error=True,
+        )
+        from core.plugins.web_pages import clear_resources_by_owner
 
-        clear_routes_by_owner(name)
+        clear_resources_by_owner(name)
         self._drop_modules(name)
 
     @staticmethod
@@ -213,10 +242,12 @@ class _LoaderMixin:
 
     @staticmethod
     def _import_plugin(name: str, plugin_dir: str, entry_path: str):
-        if 'plugins' not in sys.modules:
+        package_root = os.path.dirname(plugin_dir)
+        package = sys.modules.get('plugins')
+        if package is None:
             package = types.ModuleType('plugins')
-            package.__path__ = [os.path.dirname(plugin_dir)]
             sys.modules['plugins'] = package
+        package.__path__ = [package_root]
 
         module_name = f'plugins.{name}'
         spec = importlib.util.spec_from_file_location(

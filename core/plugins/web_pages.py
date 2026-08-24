@@ -20,6 +20,9 @@ def register_page(
     icon: str = '',
 ):
     """注册侧边栏自定义页面 (html 优先于 html_file)"""
+    from core.plugins.context import current_plugin
+
+    context = current_plugin()
     _registry[key] = {
         'key': key,
         'label': label,
@@ -28,6 +31,7 @@ def register_page(
         'html': html,
         'html_file': html_file,
         'icon': icon,
+        'owner': context.name,
     }
 
 
@@ -38,7 +42,8 @@ def unregister_page(key: str):
 
 def get_pages() -> list:
     """获取所有已注册页面 (不含 html 内容)"""
-    return [{k: v for k, v in p.items() if k not in ('html', 'html_file')} for p in _registry.values()]
+    hidden = {'html', 'html_file', 'owner'}
+    return [{k: v for k, v in p.items() if k not in hidden} for p in _registry.values()]
 
 
 async def get_page_html(key: str) -> str | None:
@@ -114,3 +119,18 @@ def clear_routes_by_owner(owner: str) -> int:
     for k in keys:
         _routes.pop(k, None)
     return len(keys)
+
+
+def clear_resources_by_owner(owner: str) -> int:
+    """Remove every page and route owned by one plugin."""
+    page_keys = [key for key, value in _registry.items() if value.get('owner') == owner]
+    for key in page_keys:
+        _registry.pop(key, None)
+    return len(page_keys) + clear_routes_by_owner(owner)
+
+
+def has_resources_by_owner(owner: str) -> bool:
+    """Return whether a plugin registered any page or HTTP route."""
+    return any(value.get('owner') == owner for value in _registry.values()) or any(
+        value.get('owner') == owner for value in _routes.values()
+    )

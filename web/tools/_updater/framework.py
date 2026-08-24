@@ -14,6 +14,7 @@ from pathlib import Path
 import aiohttp as _aiohttp
 
 from core.foundation.archives import safe_extractall
+from core.runtime.layout import purge_legacy_core_layout
 from web.tools._updater.mirror import detect_environment
 from web.tools._updater.shared import (
     DEFAULT_SKIP,
@@ -434,12 +435,17 @@ class FrameworkUpdater:
                     shutil.copy2(src, dst)
                     result['updated'] += 1
 
+            removed_legacy = purge_legacy_core_layout(self.base_dir)
+
             shutil.rmtree(temp, ignore_errors=True)
             if os.path.exists(zip_file):
                 os.remove(zip_file)
 
             result['success'] = True
-            result['message'] = f'更新成功！更新 {result["updated"]} 个文件，跳过 {result["skipped"]} 个'
+            result['message'] = (
+                f'更新成功！更新 {result["updated"]} 个文件，跳过 {result["skipped"]} 个，'
+                f'清理 {len(removed_legacy)} 个废弃路径'
+            )
             self._report('completed', result['message'], 100, result['config_diff'])
         except Exception as e:
             result['message'] = f'更新失败: {e}'

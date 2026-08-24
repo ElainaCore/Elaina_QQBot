@@ -1,15 +1,68 @@
 """Strictly asynchronous plugin registration decorators."""
 
+import contextvars
 import inspect
 import re
 from collections.abc import Callable
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 
-_pending_handlers: list[dict] = []
-_pending_on_load: list[Callable] = []
-_pending_on_unload: list[Callable] = []
-_pending_interceptors: list[dict] = []
-_pending_handler_filters: list[dict] = []
-_pending_api_interceptors: list[dict] = []
+
+@dataclass(slots=True)
+class PluginRegistrations:
+    handlers: list[dict] = field(default_factory=list)
+    on_load: list[Callable] = field(default_factory=list)
+    on_unload: list[Callable] = field(default_factory=list)
+    interceptors: list[dict] = field(default_factory=list)
+    handler_filters: list[dict] = field(default_factory=list)
+    api_interceptors: list[dict] = field(default_factory=list)
+
+    @property
+    def count(self) -> int:
+        return sum(
+            len(items)
+            for items in (
+                self.handlers,
+                self.on_load,
+                self.on_unload,
+                self.interceptors,
+                self.handler_filters,
+                self.api_interceptors,
+            )
+        )
+
+    def snapshot(self):
+        return (
+            list(self.handlers),
+            list(self.on_load),
+            list(self.on_unload),
+            list(self.interceptors),
+            list(self.handler_filters),
+            list(self.api_interceptors),
+        )
+
+
+_registrations: contextvars.ContextVar[PluginRegistrations | None] = contextvars.ContextVar(
+    'plugin_registrations',
+    default=None,
+)
+
+
+@contextmanager
+def registration_scope(registrations: PluginRegistrations | None = None):
+    current = registrations or PluginRegistrations()
+    token = _registrations.set(current)
+    try:
+        yield current
+    finally:
+        _registrations.reset(token)
+
+
+def _current_registrations() -> PluginRegistrations:
+    current = _registrations.get()
+    if current is None:
+        raise RuntimeError('plugin decorators may only be used while a plugin is loading')
+    return current
 
 
 def _async_only(func: Callable, role: str) -> Callable:
@@ -36,7 +89,7 @@ def handler(
 
     def decorator(func):
         _async_only(func, 'handler')
-        _pending_handlers.append(
+        _current_registrations().handlers.append(
             {
                 'func': func,
                 'pattern': pattern,
@@ -59,18 +112,18 @@ def handler(
 
 
 def on_load(func):
-    _pending_on_load.append(_async_only(func, 'on_load'))
+    _current_registrations().on_load.append(_async_only(func, 'on_load'))
     return func
 
 
 def on_unload(func):
-    _pending_on_unload.append(_async_only(func, 'on_unload'))
+    _current_registrations().on_unload.append(_async_only(func, 'on_unload'))
     return func
 
 
 def interceptor(priority=100):
     def decorator(func):
-        _pending_interceptors.append({'func': _async_only(func, 'interceptor'), 'priority': priority})
+        _current_registrations().interceptors.append({'func': _async_only(func, 'interceptor'), 'priority': priority})
         return func
 
     return decorator
@@ -78,7 +131,7 @@ def interceptor(priority=100):
 
 def handler_filter(priority=100):
     def decorator(func):
-        _pending_handler_filters.append({'func': _async_only(func, 'handler_filter'), 'priority': priority})
+        _current_registrations().handler_filters.append({'func': _async_only(func, 'handler_filter'), 'priority': priority})
         return func
 
     return decorator
@@ -86,7 +139,7 @@ def handler_filter(priority=100):
 
 def api_interceptor(priority=100):
     def decorator(func):
-        _pending_api_interceptors.append({'func': _async_only(func, 'api_interceptor'), 'priority': priority})
+        _current_registrations().api_interceptors.append({'func': _async_only(func, 'api_interceptor'), 'priority': priority})
         return func
 
     return decorator

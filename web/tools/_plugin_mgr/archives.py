@@ -14,6 +14,7 @@ from typing import cast
 from aiohttp import BodyPartReader, web
 
 from core.foundation.archives import is_within, safe_extractall, validate_archive
+from core.services.files import replace_directory
 
 MAX_SOURCE_UPLOAD = 2 * 1024 * 1024
 MAX_ARCHIVE_UPLOAD = 128 * 1024 * 1024
@@ -48,21 +49,6 @@ async def _save_part(field: BodyPartReader, suffix: str, limit: int) -> tuple[st
         return path, size
     except Exception:
         await asyncio.to_thread(_remove_path, path)
-        raise
-
-
-def _replace_tree(staged: str, target: str) -> None:
-    backup = target + '.bak'
-    if os.path.exists(backup):
-        shutil.rmtree(backup) if os.path.isdir(backup) else os.remove(backup)
-    had_target = os.path.exists(target)
-    if had_target:
-        shutil.move(target, backup)
-    try:
-        shutil.move(staged, target)
-    except Exception:
-        if had_target and os.path.exists(backup) and not os.path.exists(target):
-            shutil.move(backup, target)
         raise
 
 
@@ -117,7 +103,7 @@ def _install_plugin_archive(upload_path: str, plugins_root: str, filename: str) 
         target = os.path.join(plugins_root, plugin_name)
         if not is_within(plugins_root, target):
             raise ValueError('无效插件路径')
-        _replace_tree(staged, target)
+        replace_directory(staged, target)
         return plugin_name
     finally:
         shutil.rmtree(extraction_root, ignore_errors=True)
@@ -143,7 +129,7 @@ def _install_module_archive(upload_path: str, modules_root: str, module_name: st
         target = os.path.join(modules_root, module_name)
         if not is_within(modules_root, target):
             raise ValueError('无效模块路径')
-        _replace_tree(staged, target)
+        replace_directory(staged, target)
     finally:
         shutil.rmtree(extraction_root, ignore_errors=True)
 

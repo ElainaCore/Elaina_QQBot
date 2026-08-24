@@ -5,11 +5,13 @@ import asyncio
 import io
 import os
 import shutil
+import tempfile
 import zipfile
 
 from aiohttp import web
 
 from core.foundation.archives import is_within, validate_archive
+from core.services.files import replace_directory
 from web.protocol import json_body
 from web.tools._market.fetch import (
     _download_file,
@@ -243,6 +245,9 @@ def _extract_zip_subset(content, plugin_name, subdir_path=''):
     plugins_dir = _plugins_dir()
     safe = _safe_name(plugin_name) or 'unknown'
     dest_dir = os.path.join(plugins_dir, safe)
+    os.makedirs(plugins_dir, exist_ok=True)
+    staging_root = tempfile.mkdtemp(prefix=f'.{safe}-install-', dir=plugins_dir)
+    staged_dir = os.path.join(staging_root, safe)
     try:
         with zipfile.ZipFile(io.BytesIO(content), 'r') as zf:
             validate_archive(zf, max_size=512 * 1024 * 1024)
@@ -258,7 +263,7 @@ def _extract_zip_subset(content, plugin_name, subdir_path=''):
                 return {'success': False, 'message': f'仓库内未找到: {subdir_path}'}
             selected = [f for f in flist if f.startswith(strip_prefix) and not f.endswith('/')]
 
-            os.makedirs(dest_dir, exist_ok=True)
+            os.makedirs(staged_dir, exist_ok=True)
             extracted = []
             for fp in selected:
                 if '__pycache__' in fp or '/.git/' in fp:
@@ -266,8 +271,8 @@ def _extract_zip_subset(content, plugin_name, subdir_path=''):
                 rel = fp[len(strip_prefix) :] if fp.startswith(strip_prefix) else fp
                 if not rel:
                     continue
-                dest = os.path.join(dest_dir, rel)
-                if not is_within(dest_dir, dest):
+                dest = os.path.join(staged_dir, rel)
+                if not is_within(staged_dir, dest):
                     log.warning(f'跳过越界成员 (疑似路径穿越): {fp!r}')
                     continue
                 os.makedirs(os.path.dirname(dest) or dest_dir, exist_ok=True)
@@ -276,6 +281,9 @@ def _extract_zip_subset(content, plugin_name, subdir_path=''):
                 extracted.append(rel)
             if not extracted:
                 return {'success': False, 'message': '未找到要安装的文件'}
+            if not os.path.isfile(os.path.join(staged_dir, 'main.py')):
+                return {'success': False, 'message': '插件目录缺少 main.py'}
+            replace_directory(staged_dir, dest_dir)
             py_count = sum(1 for f in extracted if f.endswith('.py'))
             total = len(extracted)
             log.info(f'插件 {safe} 安装完成: {total} 个文件 ({py_count} 个 .py)')
@@ -287,6 +295,8 @@ def _extract_zip_subset(content, plugin_name, subdir_path=''):
             }
     except Exception as e:
         return {'success': False, 'message': str(e)}
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
 
 
 def _clean_module_dir(dest_dir):
