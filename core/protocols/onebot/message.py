@@ -14,9 +14,13 @@ def _cq_decode(value: str) -> str:
 
 
 def _cq_encode(value: Any) -> str:
-    if isinstance(value, (dict, list)):
+    if isinstance(value, (dict, list, bool)):
         value = json.dumps(value, ensure_ascii=False, separators=(',', ':'))
     return str(value).replace('&', '&amp;').replace('[', '&#91;').replace(']', '&#93;').replace(',', '&#44;')
+
+
+def _cq_encode_text(value: Any) -> str:
+    return str(value).replace('&', '&amp;').replace('[', '&#91;').replace(']', '&#93;')
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -78,9 +82,9 @@ def message_to_cq(message: Any) -> str:
         segment_type = segment['type']
         data = segment['data']
         if segment_type == 'text':
-            parts.append(str(data.get('text') or ''))
+            parts.append(_cq_encode_text(data.get('text') or ''))
             continue
-        fields = ','.join(f'{key}={_cq_encode(value)}' for key, value in data.items() if value is not None)
+        fields = ','.join(f'{key}={encoded}' for key, value in data.items() if value is not None and (encoded := _cq_encode(value)))
         parts.append(f'[CQ:{segment_type}{"," if fields else ""}{fields}]')
     return ''.join(parts)
 

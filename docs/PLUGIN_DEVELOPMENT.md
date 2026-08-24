@@ -1,715 +1,815 @@
 # ElainaQQ 插件开发文档
 
-> 面向开发者的完整插件开发指南 — 从最简单的 "Hello World" 到多文件插件、主动消息推送、Web 面板扩展、生命周期钩子等。本框架基于 **OneBot v11** 协议，纯异步架构。
+本文档说明如何为 ElainaQQ 编写可热重载的异步插件。所有示例均以 `core.plugins` 公开接口和当前 OneBot v11 事件模型为准。
 
----
+> 开发前请先按项目根目录的 [README](../README.md) 启动框架、登录至少一个 QQ 账号，并确认该账号能正常收发消息。
 
 ## 目录
 
 - [1. 快速开始](#1-快速开始)
-- [2. 插件目录结构](#2-插件目录结构)
-- [3. 核心装饰器](#3-核心装饰器)
-  - [3.1 `@handler` 消息处理器](#31-handler-消息处理器)
-  - [3.2 `@on_load` / `@on_unload` 生命周期钩子](#32-on_load--on_unload-生命周期钩子)
-  - [3.3 `@interceptor` 消息拦截器](#33-interceptor-消息拦截器)
-  - [3.4 `@handler_filter` 目标插件过滤器](#34-handler_filter-目标插件过滤器)
-  - [3.5 `@api_interceptor` 出站 API 中间件](#35-api_interceptor-出站-api-中间件)
-- [4. Event 事件对象](#4-event-事件对象)
-- [5. 消息发送 API](#5-消息发送-api)
-- [6. OneBot API 调用](#6-onebot-api-调用)
-- [7. 插件上下文 `ctx`](#7-插件上下文-ctx)
-- [8. 插件元数据 `__plugin_meta__`](#8-插件元数据-__plugin_meta__)
+- [2. 插件结构与元数据](#2-插件结构与元数据)
+  - [2.1 唯一入口](#21-唯一入口)
+  - [2.2 热重载](#22-热重载)
+  - [2.3 第三方依赖](#23-第三方依赖)
+- [3. 公开 API 与插件上下文](#3-公开-api-与插件上下文)
+  - [3.1 统一导入入口](#31-统一导入入口)
+  - [3.2 插件元数据](#32-插件元数据)
+  - [3.3 插件上下文](#33-插件上下文)
+- [4. 事件与处理器](#4-事件与处理器)
+  - [4.1 handler 装饰器](#41-handler-装饰器)
+  - [4.2 消息匹配顺序](#42-消息匹配顺序)
+  - [4.3 优先级、阻断与冷却](#43-优先级阻断与冷却)
+  - [4.4 事件类型](#44-事件类型)
+- [5. Event 事件对象](#5-event-事件对象)
+  - [5.1 MessageEvent](#51-messageevent)
+  - [5.2 NoticeEvent](#52-noticeevent)
+  - [5.3 RequestEvent](#53-requestevent)
+  - [5.4 MetaEvent](#54-metaevent)
+- [6. 生命周期与中间件](#6-生命周期与中间件)
+  - [6.1 加载与卸载](#61-加载与卸载)
+  - [6.2 消息拦截器](#62-消息拦截器)
+  - [6.3 目标插件过滤器](#63-目标插件过滤器)
+  - [6.4 出站 API 中间件](#64-出站-api-中间件)
+- [7. 消息发送与 OneBot 调用](#7-消息发送与-onebot-调用)
+- [8. 配置、日志与阻塞操作](#8-配置日志与阻塞操作)
 - [9. Web 面板扩展](#9-web-面板扩展)
-- [10. 配置读取与日志](#10-配置读取与日志)
-- [11. 调试与最佳实践](#11-调试与最佳实践)
-- [12. 完整示例](#12-完整示例)
+- [10. 多账号与插件绑定](#10-多账号与插件绑定)
+- [11. 完整示例](#11-完整示例)
+- [12. 调试与发布检查](#12-调试与发布检查)
 
 ---
 
 ## 1. 快速开始
 
-在 `plugins/` 下新建文件 `plugins/hello/main.py`：
+创建以下目录和入口文件：
 
-```python
-"""Hello 插件 — 最小示例"""
+~~~text
+plugins/
+└── hello/
+    └── main.py
+~~~
+
+`plugins/hello/main.py`：
+
+~~~python
 from core.plugins import handler
 
 
 @handler(r'^你好$', name='打招呼', desc='回复一句问候')
 async def say_hello(event, match):
-    await event.reply("你好!")
-```
+    await event.reply('你好！')
+~~~
 
-**完成。** 框架启动时会自动扫描 `plugins/` 目录加载插件，文件改动会触发热重载，无需重启。
+框架会在启动时加载该插件。运行期间保存插件包中的 Python 文件，文件监视器通常会在数秒内重载整个插件。
 
-| 元素 | 说明 |
-| --- | --- |
-| `@handler(r'^你好$')` | 正则匹配用户消息文本 |
-| `event` | 当前消息事件对象 (`core.protocols.onebot.event.MessageEvent`) |
-| `match` | `re.Match` 对象 (匹配结果) |
-| `event.reply(...)` | 回复当前会话 (自动判断群聊/私聊) |
-
-> 处理函数签名固定为 `async def func(event, match)`。新版框架不再接受同步 handler。
+处理器使用正则表达式的 `search()` 匹配 `event.content`。示例使用 `^` 和 `$` 限制整条消息，避免在普通聊天中误触发。
 
 ---
 
-## 2. 插件目录结构
+## 2. 插件结构与元数据
 
-每个插件是 `plugins/` 下的一个**子目录**，框架只导入该目录的 `main.py`。以 `_` 或 `.` 开头的目录会被忽略。
+### 2.1 唯一入口
 
-### 2.1 简单插件 (单文件)
+框架只发现符合以下结构的插件：
 
-```
+~~~text
+plugins/<插件目录名>/main.py
+~~~
+
+`index.py`、`app.py`、`plugins/` 根目录中的单个 Python 文件，以及没有 `main.py` 的目录都不会作为插件加载。目录名以 `_` 或 `.` 开头时也会被忽略。
+
+一个实用的包式插件可以这样组织：
+
+~~~text
 plugins/
-└── hello/
-    ├── main.py            # 入口文件
-    └── data/              # 持久化数据 (可选, 由 ctx 自动创建)
-```
+└── weather/
+    ├── main.py
+    ├── handlers.py
+    ├── client.py
+    ├── assets/
+    │   └── panel.html
+    ├── data/
+    │   └── state.json
+    └── requirements.txt
+~~~
 
-### 2.2 大型插件 (多文件 + 子模块)
+框架只主动执行 `main.py`。需要注册子模块中的处理器时，在入口中显式导入：
 
-```
-plugins/
-└── my_plugin/
-    ├── main.py            # 入口 (在此 import 子模块即可生效)
-    ├── services/          # 业务服务
-    │   └── commands.py
-    ├── storage/           # 持久化实现
-    ├── web/               # Web 路由
-    ├── assets/            # 页面和静态资源
-    ├── data/              # 数据存储 (ctx 管理)
-    └── requirements.txt   # 依赖 (可选, 框架可自动 pip install)
-```
+~~~python
+# plugins/weather/main.py
+from . import handlers  # noqa: F401
+~~~
 
-> **子目录访问**：`from .services.commands import xxx` (相对导入)。
-> **自由组织**：框架只导入入口文件，内部结构、文件数量和命名完全自由，只需在入口文件中 import 即可生效。
+插件以 `plugins.<目录名>` 包加载，因此可以使用相对导入。不要修改 `sys.path`，也不要依赖当前工作目录解析资源。
+
+### 2.2 热重载
+
+文件监视器递归检查已加载插件目录中的 Python 文件：
+
+- 修改已有的非下划线 Python 文件会触发重载。
+- 新增非下划线 Python 文件会触发重载。
+- 重载前执行旧插件的 `@on_unload`，随后重新导入整个包。
+- HTML、JSON、图片等资源变化本身不会触发 Python 热重载。
+- 新建插件目录后，最可靠的加载方式是在 Web 面板操作或重启框架。
+
+重载会丢弃模块级内存状态。需要跨重载保留的数据应写入插件 `data/` 目录。
+
+### 2.3 第三方依赖
+
+可以在插件目录放置 `requirements.txt` 供安装器和插件市场使用，但当前插件加载器不会因为手动复制了插件目录就自动执行 `pip install`。本地开发时应在框架使用的 Python 环境中显式安装依赖：
+
+~~~bash
+python -m pip install -r plugins/weather/requirements.txt
+~~~
+
+发布插件时固定合理的版本范围，并避免把密钥、Cookie、账号数据或生成文件打包进仓库。
 
 ---
 
-## 3. 核心装饰器
+## 3. 公开 API 与插件上下文
 
-插件只能从公共入口 `core.plugins` 导入框架能力：
+### 3.1 统一导入入口
 
-```python
-from core.plugins import handler, interceptor, on_load, on_unload
-```
+插件应从 `core.plugins` 导入稳定的公开能力：
 
-### 3.1 `@handler` 消息处理器
-
-**签名**：
-
-```python
-@handler(pattern, *, name='', desc='', priority=0,
-         owner_only=False, group_only=False, private_only=False,
-         event_types=None, cooldown=0, block=False, fallback=False)
-```
-
-| 参数 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `pattern` | `str` | — | 正则表达式 (使用 `re.DOTALL` 编译, 对消息文本做 `search`) |
-| `name` | `str` | 函数名 | 处理器显示名称 (Web 面板 / 日志) |
-| `desc` | `str` | `''` | 功能描述 |
-| `priority` | `int` | `0` | 优先级 (数字越大越先匹配) |
-| `owner_only` | `bool` | `False` | 仅主人可触发 (主人 QQ 配置于 `settings.yaml` 的 `owner.ids`) |
-| `group_only` | `bool` | `False` | 仅群聊 |
-| `private_only` | `bool` | `False` | 仅私聊 |
-| `event_types` | `list[str]` | `None` | 仅响应指定事件类型 (见下表) |
-| `cooldown` | `int` | `0` | 同一用户冷却时间 (秒, 0 = 无冷却) |
-| `block` | `bool` | `False` | 命中后是否拦截后续处理器 (见 3.1.1) |
-| `fallback` | `bool \| Callable[[Event], bool]` | `False` | 仅在普通处理器完成原文和加/去 `/` 匹配后仍未命中时参与 |
-
-**事件类型常量** (`event_types` 可选值)：
-
-| 取值 | 含义 |
+| 分类 | 公开名称 |
 | --- | --- |
-| `message` | 消息事件 (群聊 + 私聊) |
-| `notice.<notice_type>` | 通知事件, 如 `notice.group_increase` (入群)、`notice.group_decrease` (退群)、`notice.group_ban` (禁言)、`notice.friend_add` 等 |
-| `request.<request_type>` | 请求事件, 如 `request.friend` (加好友)、`request.group` (加群) |
-| `meta_event.lifecycle` | OneBot 连接生命周期事件 |
+| 注册 | `handler`、`interceptor`、`handler_filter`、`api_interceptor`、`on_load`、`on_unload` |
+| 上下文 | `current_plugin`、`PluginContext`、`get_app` |
+| OneBot | `get_api`、`OneBotAPI`、`ApiCallRequest`、`bypass_api_interceptors` |
+| 文件 | `ensure_dir`、`read_text`、`write_text`、`read_json`、`write_json`、`run_sync` |
+| 日志 | `PLUGIN`、`get_logger`、`report_error` |
+| Web | `register_page`、`unregister_page`、`register_route`、`unregister_route` |
+| 配置 | `config` |
 
-> 不传 `event_types` 时默认只处理消息事件。处理通知/请求事件时需显式指定，且正则会对 `event_type` 字符串匹配，常用 `r'.*'` 全匹配。
+不要从 `core.plugins._loader`、`core.plugins._dispatch` 或 OneBot 适配器内部模块导入对象。以下划线开头的模块和成员属于实现细节。
 
-**示例**：
+所有注册回调都必须使用 `async def`。同步处理器、生命周期函数、中间件或插件 HTTP 路由会在加载阶段直接报错。
 
-```python
-@handler(r'^/?菜单$', name='主菜单', desc='显示功能列表', priority=10)
-async def menu(event, match):
-    await event.reply("📋 功能列表:\n1. 签到\n2. 抽卡")
+### 3.2 插件元数据
 
+在 `main.py` 顶层声明 `__plugin_meta__`：
 
-@handler(r'^踢\s+(\d+)$', name='踢人', owner_only=True, group_only=True)
-async def kick(event, match):
-    await event.call_api('set_group_kick', {
-        'group_id': event.group_id, 'user_id': int(match.group(1))})
-    await event.reply("✅ 已踢出")
+~~~python
+__plugin_meta__ = {
+    'name': '天气查询',
+    'author': 'YourName',
+    'description': '查询城市天气并发送预报',
+    'version': '1.0.0',
+    'github': 'https://github.com/example/elaina-weather',
+    'homepage': 'https://example.com/weather',
+    'license': 'MIT',
+}
+~~~
 
+框架只读取 `name`、`author`、`description`、`version`、`github`、`homepage` 和 `license`。这些值会转换为字符串并显示在 Web 面板；其他字段会被忽略。
 
-@handler(r'.*', name='入群欢迎', event_types=['notice.group_increase'])
-async def welcome(event, match):
-    await event.call_api('send_group_msg', {
-        'group_id': event.group_id,
-        'message': f"欢迎新成员 {event.user_id}!"})
+插件必须至少通过装饰器注册一项能力，或注册一个 Web 页面/路由。处理器、生命周期钩子、拦截器、过滤器和 API 中间件都计入注册能力；完全没有注册能力的包会被判定为加载失败。
 
+### 3.3 插件上下文
 
-@handler(r'(?s)^(.+)$', name='自然对话', priority=-50, fallback=True)
-async def chat(event, match):
-    await event.reply(await ask_model(match.group(1)))
-```
+插件导入、处理器、生命周期以及插件路由执行期间都存在当前插件上下文：
 
-`fallback=True` 用于 AI 对话等真正的兜底正则。框架先匹配普通指令的原文与加/去 `/` 兼容文本，最后才让兜底处理器匹配原始消息，避免宽泛正则阻止其他插件触发。
+~~~python
+from core.plugins import current_plugin
 
-娱乐聚合器等需要与其他插件同时执行的逻辑应使用 `@interceptor`，处理完成后返回 `False`。这样无需注册宽泛正则，也不会阻断普通处理器：
+ctx = current_plugin()
+STATE_FILE = ctx.get_data_path('state.json')
+PANEL_FILE = ctx.get_resource_path('assets/panel.html')
+~~~
 
-```python
-@interceptor(priority=-40)
-async def entertainment(event):
-    await try_handle_entertainment(event)
-    return False
-```
+| 成员 | 说明 |
+| --- | --- |
+| `ctx.name` | 插件目录名 |
+| `ctx.plugin_dir` / `ctx.root` | 插件根目录，分别为字符串和 `Path` |
+| `ctx.data_dir` / `ctx.data` | 插件 `data/` 目录，分别为字符串和 `Path` |
+| `ctx.get_data_path(name)` | 返回 `data/` 下的路径 |
+| `ctx.get_resource_path(name)` | 返回插件根目录下的资源路径 |
+| `ctx.log` | 以插件名命名的 logger |
 
-#### 3.1.1 `block` 放行 / 拦截
+框架在加载插件前创建 `data/`。路径方法只负责拼接路径，不会校验传入文件名是否越过插件目录；插件应只使用自己控制的相对文件名。
 
-多个插件注册相同指令时, `block=False` (默认) 放行让所有命中处理器按 `priority` 顺序执行, `block=True` 命中即拦截后续低优先级处理器。
+异步读写 JSON：
 
-```python
-@handler(r'^状态$', name='系统状态', priority=10, block=True)  # 命中即拦截, 只有它响应
-async def status(event, match):
-    await event.reply("✅ 系统正常")
+~~~python
+from core.plugins import current_plugin, read_json, write_json
 
-
-@handler(r'^状态$', name='天气状态', priority=0)  # 被上面 block 拦截, 不会触发
-async def weather(event, match):
-    await event.reply("☀️ 今天晴")
-```
-
-### 3.2 `@on_load` / `@on_unload` 生命周期钩子
-
-```python
-from core.plugins import on_load, on_unload
+ctx = current_plugin()
+STATE_FILE = ctx.get_data_path('state.json')
 
 
-@on_load
-async def init():
-    """插件加载完成时执行。"""
-    print("插件已加载")
+async def increment(user_id: int) -> int:
+    data = await read_json(STATE_FILE, default={})
+    key = str(user_id)
+    data[key] = int(data.get(key, 0)) + 1
+    await write_json(STATE_FILE, data)
+    return data[key]
+~~~
 
+`write_text` 和 `write_json` 会创建父目录；`write_text` 默认使用临时文件替换目标文件。若多个处理器可能同时修改同一文件，仍应使用 `asyncio.Lock` 保护“读取、修改、写入”这一整个事务。
 
-@on_unload
-async def cleanup():
-    """插件卸载/重载时执行 — 清理资源"""
-    print("插件已卸载")
-```
+---
 
-> **使用场景**：启动后台任务、连接数据库、注册 Web 页面、注销定时器等。热重载会先执行旧实例的 `on_unload` 再加载新代码。
+## 4. 事件与处理器
 
-### 3.3 `@interceptor` 消息拦截器
+### 4.1 handler 装饰器
 
-拦截器在所有 handler 之前执行，可用于全局过滤、黑名单、统计等。
+`handler` 的签名为：
 
-```python
-@interceptor(priority=100)
-async def filter_keywords(event):
-    """返回 True 阻止后续 handler 匹配, 否则继续"""
-    if '违禁词' in (event.content or ''):
-        await event.reply("⛔ 消息包含违禁词")
-        return True
-    return False
-```
+~~~text
+@handler(
+    pattern,
+    *,
+    name='',
+    desc='',
+    priority=0,
+    owner_only=False,
+    group_only=False,
+    private_only=False,
+    event_types=None,
+    cooldown=0,
+    block=False,
+    fallback=False,
+)
+~~~
 
 | 参数 | 说明 |
 | --- | --- |
-| `priority` | 拦截器优先级 (数字越大越先执行, 默认 100) |
-| 返回值 | `True` 阻止后续处理, 其他值继续 |
+| `pattern` | 使用 `re.DOTALL` 编译的正则表达式，通过 `search()` 匹配 |
+| `name` | 面板和日志中的名称，默认使用函数名 |
+| `desc` | 命令说明 |
+| `priority` | 数字越大越先匹配、先执行 |
+| `owner_only` | 仅消息发送者在 `owner.ids` 中时执行 |
+| `group_only` | 仅群消息执行 |
+| `private_only` | 仅私聊消息执行 |
+| `event_types` | 订阅指定事件类型；不传时默认处理普通消息 |
+| `cooldown` | 冷却秒数，按插件、处理器、机器人、会话和用户隔离 |
+| `block` | 命中后不再收集后续低优先级处理器 |
+| `fallback` | 只在普通命令和斜杠兼容匹配均失败后参与；也可传同步判断函数 |
 
-### 3.4 `@handler_filter` 目标插件过滤器
+`group_only` 和 `private_only` 不应同时设置。`owner_only`、会话限制和冷却只在消息分发路径上应用；通知和请求事件需要在处理器内自行进行权限和字段校验。
 
-目标插件过滤器在 handler 匹配前执行，适合按目标插件实现租户隔离、权限策略或审计规则。返回 `True` 时只跳过当前目标插件，不影响其他插件处理同一事件。
+### 4.2 消息匹配顺序
 
-```python
+对于 `message` 和 `message_sent`，框架按以下顺序匹配：
+
+1. 普通处理器匹配原始 `event.content`。
+2. 如果没有命中，自动尝试增加或移除开头的 `/`。
+3. 仍未命中时，运行 `fallback=True` 的处理器。
+
+因此 `r'^帮助$'` 同时兼容“帮助”和“/帮助”。宽泛的自然语言处理器应设置 `fallback=True`：
+
+~~~python
+@handler(r'(?s)^(.+)$', name='自然对话', priority=-50, fallback=True)
+async def chat(event, match):
+    answer = await ask_model(match.group(1))
+    await event.reply(answer)
+~~~
+
+`fallback` 也可以是接收事件的同步函数：
+
+~~~python
+def fallback_enabled(event):
+    return event.is_private
+
+
+@handler(r'(?s)^(.+)$', fallback=fallback_enabled)
+async def private_chat(event, match):
+    await event.reply('私聊兜底回复')
+~~~
+
+### 4.3 优先级、阻断与冷却
+
+默认 `block=False`，所以多个匹配的处理器会按优先级依次执行。设置 `block=True` 后，匹配阶段停止收集后续处理器：
+
+~~~python
+@handler(r'^状态$', priority=100, block=True)
+async def authoritative_status(event, match):
+    await event.reply('运行正常')
+~~~
+
+冷却命中时框架会静默跳过该处理器，不自动发送提示。需要显示剩余时间或持久化限流时，应在插件中实现业务级限流。
+
+### 4.4 事件类型
+
+消息事件使用：
+
+- `message`：收到的群聊或私聊消息。
+- `message_sent`：机器人自身发出的消息；必须显式写入 `event_types` 才会收到。
+
+非消息事件使用带分类前缀的名称：
+
+| 类别 | 写法 | 示例 |
+| --- | --- | --- |
+| 通知 | `notice.<notice_type>` | `notice.group_increase`、`notice.group_ban`、`notice.notify` |
+| 请求 | `request.<request_type>` | `request.friend`、`request.group` |
+| 元事件 | `meta_event.<meta_event_type>` | `meta_event.lifecycle`、`meta_event.heartbeat` |
+
+`event_types` 必须精确包含目标类型：
+
+~~~python
+@handler(r'.*', event_types=['notice.group_increase'])
+async def welcome(event, match):
+    await get_api().send_group_msg(
+        event.group_id,
+        f'欢迎新成员 {event.user_id}',
+        self_id=event.self_id,
+    )
+~~~
+
+非消息事件没有文本正文时，正则匹配对应的事件类型字符串，所以通常使用 `r'.*'`。不传 `event_types` 的处理器不会接收通知、请求和元事件。
+
+---
+
+## 5. Event 事件对象
+
+所有事件都继承自 `OneBotEvent`，公共字段如下：
+
+| 字段 | 说明 |
+| --- | --- |
+| `event.raw_data` | 规范化后的完整事件字典 |
+| `event.time` | Unix 时间戳 |
+| `event.self_id` | 接收或产生事件的机器人账号 |
+| `event.post_type` | `message`、`message_sent`、`notice`、`request` 或 `meta_event` |
+| `event.event_type` | 上游提供的扩展事件标识；缺省时等于 `post_type` |
+| `event.content` | 消息纯文本；其他事件为空字符串 |
+| `event.to_dict()` | 返回 `raw_data` |
+
+上游提供但未列为固定属性的字段可以通过 `event.<字段名>` 访问；缺失字段会抛出 `AttributeError`。对扩展字段应使用 `getattr(event, 'field', default)`。
+
+### 5.1 MessageEvent
+
+| 字段或属性 | 说明 |
+| --- | --- |
+| `message_type` | `group` 或 `private` |
+| `sub_type` | 消息子类型 |
+| `message_id` | 消息 ID |
+| `message_seq` / `real_seq` | 消息序号，具体含义由实现决定 |
+| `user_id` | 发送者 QQ 号 |
+| `group_id` / `group_name` | 群号和群名，私聊可能为空 |
+| `target_id` | 部分自身消息事件中的目标账号 |
+| `message` | 规范化后的 OneBot 消息段数组 |
+| `raw_message` | CQ 字符串表示 |
+| `sender` | 发送者原始字典 |
+| `sender_nickname` / `sender_card` | 昵称和群名片便捷属性 |
+| `content` | 拼接所有 `text` 段并去除首尾空白后的文本 |
+| `is_group` / `is_private` | 会话类型判断 |
+| `is_sent` | 是否为机器人自身发出的消息 |
+
+消息事件提供：
+
+~~~python
+await event.reply('文本')
+await event.reply_text('文本')
+await event.reply_image('https://example.com/image.png')
+await event.call_api('get_group_info', {'group_id': event.group_id})
+~~~
+
+`reply()` 会保持当前事件的 `self_id`，群消息调用 `send_group_msg`，私聊调用 `send_private_msg`。发送能力和消息段格式见 [OneBot API 参考](ONEBOT_API.md)。
+
+### 5.2 NoticeEvent
+
+固定字段包括 `notice_type`、`sub_type`、`user_id`、`group_id` 和 `operator_id`。不同通知还可能在 `raw_data` 中提供 `message_id`、`duration`、`target_id` 等扩展字段。
+
+### 5.3 RequestEvent
+
+固定字段包括 `request_type`、`sub_type`、`user_id`、`group_id`、`comment`、`flag`、`approve` 和 `reason`。
+
+处理请求时使用全局 API，并明确传入当前机器人账号：
+
+~~~python
+from core.plugins import get_api, handler
+
+
+@handler(r'.*', event_types=['request.friend'])
+async def friend_request(event, match):
+    await get_api().set_friend_add_request(
+        event.flag,
+        approve=True,
+        self_id=event.self_id,
+    )
+~~~
+
+只有 `MessageEvent` 定义 `reply()` 和 `call_api()`。通知、请求和元事件应使用 `get_api()`。
+
+### 5.4 MetaEvent
+
+固定字段包括 `meta_event_type`、`status` 和 `interval`。心跳事件频率较高，不应在处理器中执行耗时操作或写入大量日志。
+
+---
+
+## 6. 生命周期与中间件
+
+### 6.1 加载与卸载
+
+~~~python
+import asyncio
+from contextlib import suppress
+
+from core.plugins import on_load, on_unload
+
+worker = None
+
+
+async def background_worker():
+    while True:
+        await asyncio.sleep(60)
+
+
+@on_load
+async def start_worker():
+    global worker
+    worker = asyncio.create_task(background_worker(), name='my-plugin-worker')
+
+
+@on_unload
+async def stop_worker():
+    if worker is None:
+        return
+    worker.cancel()
+    with suppress(asyncio.CancelledError):
+        await worker
+~~~
+
+`@on_load` 在插件导入并完成注册收集后执行。任一加载钩子失败会回滚本次加载，执行已注册的卸载钩子并清理插件 Web 资源。
+
+`@on_unload` 在禁用、重载和框架退出时执行。每个插件必须在这里取消任务并关闭 HTTP 客户端、数据库连接、文件句柄等资源。
+
+### 6.2 消息拦截器
+
+拦截器在处理器匹配前按优先级运行。返回值严格为 `True` 时停止本次事件分发：
+
+~~~python
+from core.plugins import interceptor
+
+
+@interceptor(priority=100)
+async def reject_keyword(event):
+    if event.post_type == 'message' and '禁用词' in event.content:
+        await event.reply('该内容不可用')
+        return True
+    return False
+~~~
+
+拦截器会收到所有分发事件，因此访问 `is_group`、`reply` 等消息专有成员前应先检查 `post_type`。
+
+### 6.3 目标插件过滤器
+
+`handler_filter` 在处理器匹配前决定是否跳过某个目标插件：
+
+~~~python
 from core.plugins import handler_filter
 
 
 @handler_filter(priority=100)
-async def restrict_plugin(event, target_plugin):
-    if target_plugin == 'admin_tools' and str(event.user_id) != '123456':
-        return True
-    return False
-```
+async def restrict_admin_tools(event, target_plugin):
+    return target_plugin == 'admin_tools' and str(getattr(event, 'user_id', '')) != '123456'
+~~~
 
-框架会按目标插件缓存一次事件中的过滤结果，因此过滤器不应依赖具体 handler。
+返回 `True` 只会阻止当前目标插件，不会阻止其他插件。结果按“当前事件 + 目标插件”缓存，因此过滤逻辑不应依赖某个具体处理器。
 
-### 3.5 `@api_interceptor` 出站 API 中间件
+### 6.4 出站 API 中间件
 
-API 中间件在插件调用到达 OneBot 适配器前执行，可以修改参数、接管调用或放行到下一个中间件。只有调用并返回 `await call_next()` 时，调用才会继续发送。
+`api_interceptor` 可以检查、修改或接管插件发起的 OneBot 调用：
 
-```python
-from core.plugins import api_interceptor, bypass_api_interceptors, get_api
+~~~python
+from core.plugins import api_interceptor
 
 
 @api_interceptor(priority=100)
 async def append_source(request, call_next):
     if request.action == 'send_group_msg':
-        request.params['message'] = str(request.params.get('message', '')) + ' [plugin]'
+        request.params['message'].append({
+            'type': 'text',
+            'data': {'text': ' [weather]'},
+        })
     return await call_next()
+~~~
 
-
-async def send_without_interception(group_id, message, self_id):
-    with bypass_api_interceptors():
-        return await get_api().call_api(
-            'send_group_msg',
-            {'group_id': group_id, 'message': message},
-            self_id=self_id,
-        )
-```
-
-`request` 是可变的 `ApiCallRequest`，常用字段如下：
+`ApiCallRequest` 的主要字段：
 
 | 字段 | 说明 |
 | --- | --- |
-| `action` | OneBot action 名称 |
-| `params` | 可直接修改的参数字典 |
-| `self_id` | 本次调用路由到的 QQ 账号 |
-| `source_plugin` | 发起调用的插件目录名；框架外调用为空 |
-| `context` | 来源事件中的账号、用户、群和事件类型 |
-| `local` | 目标是否为框架内置 QQ |
+| `action` | 规范化后的 OneBot 动作名 |
+| `params` | 可原地修改的参数字典 |
+| `self_id` | 目标机器人账号，可能为空 |
+| `source_plugin` | 发起调用的插件目录名 |
+| `context` | 来源事件中的账号、用户、群和消息类型 |
+| `local` | 目标是否由内置 QQ 本地动作处理 |
 
-中间件可直接返回 OneBot 风格结果以接管调用。调用原始 API 时应使用 `bypass_api_interceptors()`，避免递归进入自身。
+只有调用并返回 `await call_next()` 才会继续后续中间件和传输层。同一个中间件不能重复调用 `call_next()`。直接返回 OneBot 风格字典可以接管调用。
 
-框架会自动标记消息处理器、插件导入与生命周期钩子、由这些入口创建的异步后台任务，以及 `/api/ext/` 插件路由中的 API 调用。中间件可据此使用 `source_plugin` 按插件目录名拦截框架内插件发送；只有框架执行上下文之外的调用才会留空。
+中间件内部如需调用原始 API，应绕过中间件链，避免递归：
 
----
+~~~python
+from core.plugins import bypass_api_interceptors, get_api
 
-## 4. Event 事件对象
 
-`event` 是所有 handler 的第一个参数。框架根据 `post_type` 解析为不同子类。
-
-### 4.1 消息事件 `MessageEvent` (`post_type == 'message'`)
-
-| 字段 / 属性 | 类型 | 说明 |
-| --- | --- | --- |
-| `event.user_id` | `int` | 发送者 QQ 号 |
-| `event.group_id` | `int` / `None` | 群号 (仅群聊) |
-| `event.message_type` | `str` | `'group'` / `'private'` |
-| `event.sub_type` | `str` | 子类型 (如 `normal` / `friend`) |
-| `event.message_id` | `int` | 消息 ID (用于撤回/引用) |
-| `event.message` | `list[dict]` | 消息段数组 (OneBot 标准, 见 5.3) |
-| `event.raw_message` | `str` | 原始消息 (CQ 码形式) |
-| `event.content` | `str` | 提取出的纯文本 (已拼接所有 text 段并 strip) |
-| `event.sender` | `dict` | 发送者信息原始字典 |
-| `event.sender_nickname` | `str` | 发送者昵称 |
-| `event.sender_card` | `str` | 群名片 |
-| `event.self_id` | `int` | 收到该消息的机器人 QQ 号 |
-| `event.time` | `int` | 事件时间戳 |
-| `event.raw_data` | `dict` | 完整原始事件字典 |
-
-**场景判断**：
-
-| 属性 | 说明 |
-| --- | --- |
-| `event.is_group` | 是否群聊 |
-| `event.is_private` | 是否私聊 |
-
-### 4.2 其他事件类型
-
-| 类 | `post_type` | 关键字段 |
-| --- | --- | --- |
-| `NoticeEvent` | `notice` | `notice_type` / `sub_type` / `user_id` / `group_id` / `operator_id` |
-| `RequestEvent` | `request` | `request_type` / `sub_type` / `user_id` / `group_id` / `comment` / `flag` |
-| `MetaEvent` | `meta_event` | `meta_event_type` (心跳/生命周期, 一般无需处理) |
-
-> 通知/请求事件没有 `content`，handler 用 `event_types` 精确订阅，并通过 `event.call_api(...)` 进行处理 (如同意加群)。
+async def raw_status(self_id):
+    with bypass_api_interceptors():
+        return await get_api().get_status(self_id=self_id)
+~~~
 
 ---
 
-## 5. 消息发送 API
+## 7. 消息发送与 OneBot 调用
 
-### 5.1 回复当前会话
+回复当前消息优先使用 `event.reply()`。后台任务、通知/请求处理器或跨会话发送使用 `get_api()`：
 
-`event.reply()` 自动根据来源选择 `send_group_msg` / `send_private_msg`。
-
-```python
-# 纯文本
-await event.reply("Hello!")
-await event.reply_text("等价写法")
-
-# 图片 (URL / 本地路径 / base64, 取决于 OneBot 实现的支持)
-await event.reply_image("https://i.elaina.vin/1.png")
-await event.reply_image("file:///path/to/local.png")
-await event.reply_image("base64://...")
-
-# 消息段数组 (混合文本/图片/@等)
-await event.reply([
-    {'type': 'text', 'data': {'text': '看图: '}},
-    {'type': 'image', 'data': {'file': 'https://i.elaina.vin/1.png'}},
-])
-```
-
-### 5.2 主动发送 / 发往指定目标
-
-通过 `event.call_api`(见第 6 节) 或框架 API 对象向任意群/用户推送 (不依赖当前消息)：
-
-```python
-# 发往指定群
-await event.call_api('send_group_msg', {
-    'group_id': 123456, 'message': '定时通知'})
-
-# 发往指定用户 (私聊)
-await event.call_api('send_private_msg', {
-    'user_id': 10001, 'message': '私信内容'})
-```
-
-没有 `event` 时 (定时任务、`@on_load` 后台循环)，取全局 API 对象直接调用：
-
-```python
+~~~python
 from core.plugins import get_api
 
 api = get_api()
-await api.send_group_msg(123456, "后台推送")
-await api.send_private_msg(10001, "后台私信")
-```
 
-### 5.3 消息段 (CQ 数组格式)
+await api.send_group_msg(
+    123456,
+    [{'type': 'text', 'data': {'text': '定时通知'}}],
+    self_id='10001',
+)
+~~~
 
-OneBot v11 的消息是「消息段」数组，常用类型：
+调用未封装的动作：
 
-| `type` | `data` 字段 | 说明 |
-| --- | --- | --- |
-| `text` | `{'text': '...'}` | 纯文本 |
-| `image` | `{'file': 'url/path/base64'}` | 图片 |
-| `at` | `{'qq': 10001}` 或 `{'qq': 'all'}` | @某人 / @全体 |
-| `face` | `{'id': 1}` | QQ 表情 |
-| `reply` | `{'id': message_id}` | 引用回复 |
-| `record` | `{'file': '...'}` | 语音 |
-| `video` | `{'file': '...'}` | 视频 |
-| `file` / `onlinefile` | `{'file': '...'}` | 文件 / 在线文件 |
-| `json` / `miniapp` | `{'data': '...'}` | Ark JSON / 小程序 Ark 数据 |
-| `xml` | `{'data': '...'}` | XML 长消息 |
-| `markdown` | `{'content': '...'}` | Markdown |
-| `music` | `{'type': 'qq', 'id': '...'}` | 音乐卡片；可用 `ELAINAQQ_MUSIC_SIGN_URL` 配置签名服务 |
-| `mface` | `{'emoji_package_id': 1, 'emoji_id': '...', 'key': '...', 'summary': '...'}` | 商城表情 |
-| `dice` / `rps` | `{'result': '...'}` | 骰子 / 猜拳 |
-| `contact` | `{'type': 'qq', 'id': '10001'}` | 好友或群联系人卡片 |
-| `location` | `{'lat': 31.2, 'lon': 121.5}` | 位置 |
-| `flashtransfer` | `{'fileSetId': '...'}` | QQ 闪传 |
-| `node` | `{'nickname': '...', 'content': [...]}` | 合并转发节点；一条消息必须全部为 `node` |
-| `forward` | `{'id': 'res_id'}` | 已有合并转发卡片；收到的段同时提供 `res_id` |
-| `poke` | `{'type': '...', 'id': '...'}` | 接收解析；发送应调用 `send_poke`，依赖协议能力 |
+~~~python
+result = await get_api().call_api(
+    'custom_action',
+    {'key': 'value'},
+    self_id=event.self_id,
+)
+~~~
 
-内置 QQ 会把收到的 `poke`、`onlinefile`、`flashtransfer` 和合并转发解析为独立消息段。收到合并转发后，可把 `forward.data.id` 传给 `get_forward_msg` 读取节点；发送已有转发卡片时优先使用 `forward.data.res_id`。
+也可用动态关键字调用：
 
-```python
-# @发送者 + 文本
-await event.reply([
-    {'type': 'at', 'data': {'qq': event.user_id}},
-    {'type': 'text', 'data': {'text': ' 你被点名了'}},
-])
+~~~python
+result = await get_api().custom_action(
+    key='value',
+    self_id=event.self_id,
+)
+~~~
 
-# 引用回复
-await event.reply([
-    {'type': 'reply', 'data': {'id': event.message_id}},
-    {'type': 'text', 'data': {'text': '收到'}},
-])
-```
+成功与否应检查 `status` 和 `retcode`，不要只判断返回值是否为真：
 
-> `reply()` 传入字符串时框架会自动包装为一个 `text` 段；需要图文混排或 @ 时请直接传消息段数组。
+~~~python
+if result.get('status') != 'ok' or result.get('retcode') != 0:
+    ctx.log.warning('调用失败: %s', result.get('message'))
+~~~
+
+完整说明见 [OneBot API 参考](ONEBOT_API.md)。
 
 ---
 
-## 6. OneBot API 调用
+## 8. 配置、日志与阻塞操作
 
-任何 OneBot v11 标准动作都可通过 `event.call_api(action, params)` 调用 (无 event 时用 `get_api().call_api(...)`)：
+### 8.1 读取框架配置
 
-```python
-# 获取群成员信息
-info = await event.call_api('get_group_member_info', {
-    'group_id': event.group_id, 'user_id': event.user_id})
+`core.plugins.config` 是全局配置对象：
 
-# 禁言 30 分钟
-await event.call_api('set_group_ban', {
-    'group_id': event.group_id, 'user_id': 10001, 'duration': 1800})
+~~~python
+from core.plugins import config
 
-# 同意加好友请求 (在 request.friend 事件中)
-await event.call_api('set_friend_add_request', {
-    'flag': event.flag, 'approve': True})
-```
+port = config.get('settings', 'server.port', 5201)
+owners = config.get('settings', 'owner.ids', [])
+connections = config.get_raw('connections')
+~~~
 
-框架在 `core.protocols.onebot.api.OneBotAPI` 中封装了常用动作 (插件应经 `event.call_api` 或 `get_api()` 间接使用)：
+`config.get(file, 'a.b.c', default)` 使用点路径读取 YAML。插件通常只应读取框架配置；插件自己的可变数据应保存在插件 `data/`，以免与框架升级和其他插件冲突。
 
-| 方法 | 对应动作 |
-| --- | --- |
-| `send_group_msg` / `send_private_msg` / `send_msg` | 发送消息 |
-| `delete_msg` / `get_msg` | 撤回 / 获取消息 |
-| `get_login_info` / `get_stranger_info` | 账号 / 陌生人信息 |
-| `get_friend_list` / `get_group_list` / `get_group_info` | 列表与信息 |
-| `get_group_member_list` / `get_group_member_info` | 群成员 |
-| `set_group_kick` / `set_group_ban` / `set_group_whole_ban` | 群管理 |
-| `set_group_card` / `set_group_name` / `set_group_admin` / `set_group_special_title` / `set_group_leave` | 群资料/成员管理 |
-| `set_group_portrait` / `set_group_sign` / `get_group_at_all_remain` / `get_group_honor_info` / `get_group_system_msg` | 群扩展 |
-| `get_essence_msg_list` / `set_essence_msg` / `delete_essence_msg` | 群精华消息 |
-| `set_friend_add_request` / `set_group_add_request` | 处理请求 |
-| `send_forward_msg` / `send_group_forward_msg` / `send_private_forward_msg` / `get_forward_msg` | 合并转发 |
-| `get_group_msg_history` / `get_friend_msg_history` / `mark_group_msg_as_read` / `mark_private_msg_as_read` | 历史/已读 |
-| `set_msg_emoji_like` / `send_poke` | 表情回应 / 戳一戳 |
-| `send_like` / `delete_friend` / `set_qq_avatar` / `set_qq_profile` / `get_unidirectional_friend_list` / `ocr_image` | 用户/账号 |
-| `upload_group_file` / `upload_private_file` / `get_group_root_files` / `get_group_files_by_folder` / `get_group_file_url` / `delete_group_file` / `create_group_file_folder` | 文件 |
-| `get_version_info` / `get_status` / `can_send_image` / `can_send_record` / `get_cookies` / `get_csrf_token` / `clean_cache` | 系统 |
+### 8.2 日志与错误上报
 
-> 表中为通用动作名 (各 OneBot v11 实现普遍支持)；个别实现可能未实现某动作。任何未封装的动作都可用 `call_api(action, params)` 直接调用。API 调用默认 30 秒超时，无可用连接时返回 `None`。
+~~~python
+from core.plugins import PLUGIN, get_logger, report_error
 
----
+log = get_logger(PLUGIN, '天气查询')
 
-## 7. 插件上下文 `ctx`
 
-插件执行期间可通过 `current_plugin()` 取得上下文。入口导入发生在插件作用域内，因此可在模块顶层捕获：
+async def update_cache():
+    try:
+        log.info('开始更新天气缓存')
+        await fetch_weather()
+    except Exception as exc:
+        report_error(PLUGIN, '天气查询', exc, context={'phase': 'update_cache'})
+~~~
 
-```python
-from core.plugins import current_plugin, read_json, write_json
+处理器未捕获的异常会由框架记录到错误日志。只有在插件需要补充业务上下文、进行降级处理或继续运行时才自行捕获异常。
 
-ctx = current_plugin()
+### 8.3 不要阻塞事件循环
 
-# data/ 下文件的绝对路径 (目录已自动创建)
-path = ctx.get_data_path('counter.json')
+网络请求应使用异步客户端；文件读写使用公开的异步文件工具。无法替换的同步库通过 `run_sync` 执行：
 
-# 插件根目录下的资源文件
-res = ctx.get_resource_path('template.html')
+~~~python
+from core.plugins import run_sync
 
-# 异步读写示例 (应在 handler 或生命周期函数中调用)
-data = await read_json(path, default={})
-data['count'] = data.get('count', 0) + 1
-await write_json(path, data)
-```
+result = await run_sync(blocking_library_call, argument)
+~~~
 
-| 成员 | 说明 |
-| --- | --- |
-| `ctx.name` | 插件名 (目录名) |
-| `ctx.plugin_dir` | 插件根目录绝对路径 |
-| `ctx.data_dir` | `data/` 目录绝对路径 (自动创建) |
-| `ctx.get_data_path(filename)` | 返回 `data/` 下文件路径 |
-| `ctx.get_resource_path(filename)` | 返回插件根目录下文件路径 |
-| `ctx.log` | 该插件的 logger |
-
----
-
-## 8. 插件元数据 `__plugin_meta__`
-
-在入口模块顶层声明，**Web 面板将展示这些信息**：
-
-```python
-__plugin_meta__ = {
-    'name': '我的插件',
-    'author': 'YourName',
-    'description': '插件功能说明',
-    'version': '1.0.0',
-    'github': 'https://github.com/xxx/repo',
-    'homepage': 'https://example.com',
-    'license': 'MIT',
-}
-```
-
-仅 `name` / `author` / `description` / `version` / `github` / `homepage` / `license` 这几个字段会被读取，其余忽略。
+框架为每次处理器执行设置 300 秒超时。超时后任务被取消并记录错误，但这不是用来代替正常的网络超时和资源清理的。
 
 ---
 
 ## 9. Web 面板扩展
 
-### 9.1 注册侧边栏页面
+### 9.1 注册页面
 
-```python
-from core.plugins import on_unload, register_page, unregister_page
+~~~python
+from core.plugins import current_plugin, register_page
 
+ctx = current_plugin()
 
-# 内联 HTML
 register_page(
-    key='my-page',            # 唯一标识 (路由 /custom/<key>)
-    label='我的页面',          # 侧边栏显示名
+    key='weather-panel',
+    label='天气配置',
     source='plugin',
-    source_name='my_plugin',
-    html='<h1>Hello Panel</h1>',
+    source_name=ctx.name,
+    html_file=ctx.get_resource_path('assets/panel.html'),
+    icon='cloud-sun',
 )
+~~~
 
-# 或指定 HTML 文件
-register_page(key='my-page', label='我的页面',
-              html_file='/abs/path/to/page.html')
+`html` 与 `html_file` 二选一，`html` 优先。`key` 必须在所有插件中唯一，后注册的同名页面会覆盖先注册的页面。
 
+插件卸载或加载回滚时，框架会按所有者自动清理页面和路由。也可以使用 `unregister_page(key)` 提前注销。
 
-@on_unload
-async def _cleanup():
-    unregister_page('my-page')
-```
+### 9.2 注册 HTTP 路由
 
-### 9.2 注册自定义 HTTP 路由
-
-路径**必须以 `/api/ext/` 开头** (建议 `/api/ext/{插件名}/` 避免冲突)。默认 `auth=True` 复用后台登录 token；设 `auth=False` 则免验证 (如对外回调、健康检查)。插件卸载时框架会自动注销其全部路由。
-
-```python
+~~~python
 from aiohttp import web
 from core.plugins import register_route
 
 
-# 免验证路由
-@register_route('GET', '/api/ext/myplugin/ping', auth=False)
-async def ping(request):
-    return web.json_response({'ok': True})
+@register_route('GET', '/api/ext/weather/status')
+async def weather_status(request):
+    return web.json_response({'ok': True, 'provider': 'example'})
+~~~
 
+约束如下：
 
-# 默认要求已经登录 Web 面板；插件页面会自动携带 HttpOnly 会话 Cookie
-@register_route('POST', '/api/ext/myplugin/echo')
-async def echo(request):
-    from web.protocol import json_body, ok
+- 路径必须以 `/api/ext/` 开头，建议包含插件目录名。
+- 路由按“HTTP 方法 + 完整路径”精确匹配，不支持路径参数。
+- 可变参数放在查询字符串或请求体中。
+- 处理函数必须使用 `async def` 并返回 `aiohttp.web.StreamResponse`。
+- `HEAD` 未单独注册时会回退到同路径的 `GET`。
+- 默认 `auth=True`，要求有效的面板登录会话。
 
-    body = await json_body(request)
-    return ok(you_sent=body)
-```
+公开回调可以关闭面板鉴权：
 
-| 参数 | 说明 |
-| --- | --- |
-| `method` | `'GET'` / `'POST'` / `'PUT'` / `'DELETE'` 等 |
-| `path` | 必须以 `/api/ext/` 开头 (精确匹配, 不支持路径参数; 可变部分走查询串/请求体) |
-| `handler` | `async def handler(request)`, 返回 `web.json_response(...)` |
-| `auth` | 是否要求登录 token, 默认 `True` |
+~~~python
+@register_route('POST', '/api/ext/weather/callback', auth=False)
+async def callback(request):
+    body = await request.json()
+    return web.json_response({'received': bool(body)})
+~~~
 
-> 也可非装饰器写法：`register_route('POST', '/api/ext/x/do', handler)`。路由热重载即时生效。
+`auth=False` 表示任何能访问该端口的人都可调用。此时插件必须自行验证签名、限制请求体大小、校验内容并配置速率限制。
 
----
-
-## 10. 配置读取与日志
-
-### 10.1 读取框架配置
-
-框架配置在 `config/settings.yaml`，通过全局 `cfg` 读取 (支持热加载)：
-
-```python
-from core.plugins import config
-
-# cfg.get(文件名, '点路径', 默认值)
-port = config.get('settings', 'server.port', 5201)
-owner_ids = config.get('settings', 'owner.ids', [])
-```
-
-`server.port` 是 Web 面板和公开 OneBot 入口端口。内置 QQ 的账号桥接端口由框架管理，默认从 `embedded_qq.bridge_port_start=30010` 开始递增，并且只监听 `127.0.0.1`。插件不应连接或占用这些内部端口；调用 QQ 能力时始终使用 `event.reply(...)` 或 `core.plugins.get_api()`。
-
-### 10.2 日志与异常上报
-
-```python
-from core.plugins import PLUGIN, get_logger, report_error
-
-log = get_logger(PLUGIN, '我的插件')
-
-
-@handler(r'^风险操作$')
-async def risky(event, match):
-    try:
-        log.info('开始处理')
-        await do_something()
-    except Exception as e:
-        report_error(PLUGIN, '我的插件', e)   # 上报到面板错误日志
-        await event.reply("❌ 操作失败")
-```
+页面脚本调用受保护路由时，浏览器会携带面板的 HttpOnly 会话 Cookie。不要把面板密码或 Token 写入页面源码。
 
 ---
 
-## 11. 调试与最佳实践
+## 10. 多账号与插件绑定
 
-### 11.1 超时与异步
+消息处理器中的 `event.reply()` 和 `event.call_api()` 自动使用事件的 `self_id`。使用全局 API 时应显式传入：
 
-- 框架对每个 handler 强制 **300 秒超时**，超时会自动取消并记录错误。
-- `handler`、生命周期、拦截器、过滤器和插件 HTTP 路由必须使用 `async def`。同步函数会在注册时直接报错。
-- 不要在异步函数里执行同步文件、SQLite、网络或子进程操作。优先用 `read_json` / `write_json` / `read_text` / `write_text`，其他阻塞库用 `run_sync` 包装。
+~~~python
+await get_api().send_private_msg(
+    event.user_id,
+    '处理完成',
+    self_id=event.self_id,
+)
+~~~
 
-### 11.2 命名与正则
+没有 `self_id` 时，适配器可能选择默认账号；没有可确定的唯一账号或连接时，调用可能失败。
 
-| 规则 | 推荐 |
-| --- | --- |
-| handler 函数名 | snake_case, 体现功能 |
-| `name=` 参数 | 中文短名, 用于面板/日志展示 |
-| `desc=` 参数 | 一句话描述功能 |
-| 正则锚定 | 尽量使用 `^` / `$` 避免误匹配 (pattern 用 `search` 匹配) |
-| 资源清理 | 在 `@on_unload` 中关闭文件/连接/页面/定时器 |
+Web 面板可以把整个插件或插件子模块绑定到指定机器人。绑定在处理器、拦截器、过滤器和 API 中间件分发前生效。插件代码不应读取或修改内部的 `data/plugin_bots.yaml`，应由面板维护绑定关系。
 
-### 11.3 性能
-
-- **延迟导入**：体积大的依赖在 handler 内 `import`，加快插件加载。
-- **冷却限流**：高频指令加 `cooldown=N`。
-- **大型插件**：按 `services/`、`storage/`、`web/`、`assets/` 划分职责，由 `main.py` 显式导入。
+后台任务如果服务多个账号，应在创建任务时复制必要的 `self_id`，不要依赖之后可能变化的默认路由。
 
 ---
 
-## 12. 完整示例
+## 11. 完整示例
 
-一个具备 **元数据 + 数据持久化 + 多 handler + 生命周期 + Web 页面** 的签到插件 `plugins/checkin/main.py`：
+下面的 `plugins/checkin/main.py` 展示元数据、并发安全的数据文件、两个命令、生命周期和页面路由：
 
-```python
-"""签到插件 — 积分 + 数据持久化 + Web 页面"""
-
-import random
+~~~python
+import asyncio
 import time
 
+from aiohttp import web
+
 from core.plugins import (
-    PLUGIN,
     current_plugin,
-    get_logger,
     handler,
     on_load,
     on_unload,
     read_json,
     register_page,
-    unregister_page,
+    register_route,
     write_json,
 )
 
 __plugin_meta__ = {
-    'name': '签到插件',
+    'name': '签到',
     'author': 'YourName',
-    'description': '每日签到 + 积分系统',
+    'description': '每日签到计数示例',
     'version': '1.0.0',
     'license': 'MIT',
 }
 
-log = get_logger(PLUGIN, '签到')
 ctx = current_plugin()
-_DATA = ctx.get_data_path('checkin.json')
+DATA_FILE = ctx.get_data_path('checkin.json')
+data_lock = asyncio.Lock()
+
+
+async def load_data():
+    data = await read_json(DATA_FILE, default={})
+    return data if isinstance(data, dict) else {}
 
 
 @on_load
-async def init():
-    log.info("签到插件已加载")
+async def setup():
     register_page(
-        key='checkin-stats', label='签到统计',
-        source='plugin', source_name='checkin',
-        html='<h1>签到统计</h1><p>开发中...</p>',
+        key='checkin-stats',
+        label='签到统计',
+        source='plugin',
+        source_name=ctx.name,
+        html='<main><h1>签到统计</h1><p id="total">加载中</p></main>',
     )
+    ctx.log.info('签到插件已加载')
 
 
 @on_unload
-async def cleanup():
-    unregister_page('checkin-stats')
-    log.info("签到插件已卸载")
+async def teardown():
+    ctx.log.info('签到插件已卸载')
 
 
-@handler(r'^签到$', name='签到', desc='每日签到领积分')
+@handler(r'^签到$', name='签到', desc='每天签到一次', cooldown=2)
 async def check_in(event, match):
-    data = await read_json(_DATA, default={})
-    uid = str(event.user_id)
     today = time.strftime('%Y-%m-%d')
-    rec = data.get(uid, {'last': '', 'points': 0})
-    if rec['last'] == today:
-        await event.reply(f"今天已签到啦, 当前积分: {rec['points']}")
-        return
-    gain = random.randint(10, 100)
-    rec['points'] += gain
-    rec['last'] = today
-    data[uid] = rec
-    await write_json(_DATA, data)
-    await event.reply(f"✅ 签到成功! +{gain} 积分, 共 {rec['points']} 分")
+    key = str(event.user_id)
+
+    async with data_lock:
+        data = await load_data()
+        record = data.get(key, {'last': '', 'total': 0})
+        if record['last'] == today:
+            total = record['total']
+            already = True
+        else:
+            record = {'last': today, 'total': int(record['total']) + 1}
+            data[key] = record
+            await write_json(DATA_FILE, data)
+            total = record['total']
+            already = False
+
+    if already:
+        await event.reply(f'今天已经签到，累计 {total} 天')
+    else:
+        await event.reply(f'签到成功，累计 {total} 天')
 
 
-@handler(r'^积分$', name='查积分')
-async def my_points(event, match):
-    data = await read_json(_DATA, default={})
-    rec = data.get(str(event.user_id), {'points': 0})
-    await event.reply(f"你的积分: {rec['points']}")
-```
+@handler(r'^签到次数$', name='签到次数')
+async def checkin_total(event, match):
+    async with data_lock:
+        data = await load_data()
+    total = int(data.get(str(event.user_id), {}).get('total', 0))
+    await event.reply(f'累计签到 {total} 天')
+
+
+@register_route('GET', '/api/ext/checkin/stats')
+async def stats(request):
+    async with data_lock:
+        data = await load_data()
+    return web.json_response({
+        'users': len(data),
+        'checkins': sum(int(item.get('total', 0)) for item in data.values()),
+    })
+~~~
+
+这个页面示例只注册了 HTML 和数据接口。实际前端应处理接口失败、转义动态文本，并遵守面板现有样式和交互约定。
 
 ---
 
-更多问题欢迎加入交流群 **[164178653](https://qm.qq.com/q/nepv1UcwRE)** 讨论。
+## 12. 调试与发布检查
+
+### 12.1 常见加载失败
+
+| 现象 | 检查项 |
+| --- | --- |
+| 面板找不到插件 | 路径是否为 `plugins/<name>/main.py`，目录名是否以 `_` 或 `.` 开头 |
+| 装饰器报上下文错误 | 是否从 `core.plugins` 导入，是否在插件加载期间注册 |
+| 提示没有注册能力 | 是否实际导入了包含装饰器的子模块 |
+| 相对导入失败 | 是否使用包内相对导入，是否手动修改了 `sys.path` |
+| 修改后未重载 | 修改的是否为 Python 文件，插件当前是否已加载 |
+| API 返回未连接 | 目标账号是否在线，`self_id` 是否正确，连接是否启用 |
+| 通知处理器不触发 | `event_types` 是否使用 `notice.*`、`request.*` 等精确类型 |
+
+### 12.2 发布前清单
+
+- 所有回调使用 `async def`，同步 I/O 已移出事件循环。
+- 正则尽量使用 `^`、`$`，宽泛处理器使用 `fallback=True`。
+- 后台任务、客户端和句柄在 `@on_unload` 中释放。
+- 多账号主动调用明确传入 `self_id`。
+- `data/`、密钥、Cookie、账号信息和日志未进入发布包。
+- `requirements.txt` 只包含必要依赖和合理版本范围。
+- Web 公开路由具备独立鉴权、输入校验和限流。
+- 在群聊、私聊、重载、禁用和框架退出场景完成测试。
+
+OneBot 动作、消息段和响应处理请继续阅读 [OneBot API 参考](ONEBOT_API.md)。

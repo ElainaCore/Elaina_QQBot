@@ -340,8 +340,12 @@ class OneBotAPI:
         self_id: str | None = None,
     ) -> dict | None:
         """通过指定账号的 OneBot WebSocket/HTTP 连接调用任意 action。"""
+        params = dict(params or {})
+        route_id = params.pop('_self_id', None)
+        if route_id is None:
+            route_id = params.pop('self_id', None)
         if self_id is None:
-            self_id = _routed_self_id.get()
+            self_id = route_id if route_id is not None else _routed_self_id.get()
         if not self._adapter:
             return action_failed('OneBot 适配器未初始化', 1500)
         self_id = self._adapter.default_self_id() if self_id is None else self._adapter.resolve_self_id(self_id)

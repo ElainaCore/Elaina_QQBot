@@ -1048,7 +1048,7 @@ class EmbeddedQQManager:
             log.exception('内置 QQ 红包监听异常: %s [%s]', owner, self_id)
 
     async def handle_red_packet(self, payload: dict[str, Any]) -> bool:
-        """将内置红包转换为标准通知后，再执行原生能力回调。"""
+        """执行内置 QQ 的原生红包能力回调，不向 OneBot 注入私有事件。"""
         bot_id = str(payload.get('bot_id') or '').strip()
         bot = self.bots.get(bot_id)
         packet = payload.get('red_packet')
@@ -1056,18 +1056,6 @@ class EmbeddedQQManager:
             return False
         bot.last_seen = time.time()
         self_id = str(payload.get('self_id') or bot.uin or bot_id)
-        event = {
-            'time': int(time.time()),
-            'self_id': self_id,
-            'post_type': 'notice',
-            'notice_type': 'elaina_red_packet',
-            'sub_type': 'receive',
-            'user_id': packet.get('sender_id') or 0,
-            'group_id': packet.get('group_id') or None,
-            'red_packet': dict(packet),
-        }
-        if not await self.app.ingest_event(event, self_id):
-            return False
         for owner, callback in tuple(self._red_packet_listeners.items()):
             task = asyncio.create_task(
                 self._run_red_packet_listener(
@@ -1180,7 +1168,6 @@ class EmbeddedQQManager:
 
         runtime = payload.get('runtime')
         if isinstance(runtime, dict):
-            previous_status = bot.status
             previous_uin = bot.uin
             incoming_uin = str(runtime.get('loginUin') or runtime.get('uin') or bot.uin)
             if previous_uin and incoming_uin and previous_uin != incoming_uin:
@@ -1217,18 +1204,6 @@ class EmbeddedQQManager:
             elif bot.uin and bot.status in {'offline', 'error'}:
                 self._unregister_bot_aliases(bot)
             await self._save_accounts()
-
-            if bot.status != previous_status and bot.status in {'online', 'offline', 'error'}:
-                status_event = {
-                    'time': int(time.time()),
-                    'self_id': bot.uin or bot_id,
-                    'post_type': 'meta_event',
-                    'meta_event_type': 'lifecycle',
-                    'sub_type': 'connect' if bot.status == 'online' else 'disconnect',
-                    'status': bot.status,
-                }
-                if not await self.app.ingest_event(status_event, bot.uin or bot_id):
-                    return False
 
         event = payload.get('event')
         return not isinstance(event, dict) or await self.app.ingest_event(event, bot.uin or bot_id)

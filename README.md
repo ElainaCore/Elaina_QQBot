@@ -1,100 +1,76 @@
-# ElainaQQ
+<p>
+<img src="https://download.nature.qq.com/SnsShare/SocialProfile/1779098988_1264b08a.png" width="200" align="left" style="border-radius:50%; margin-right:16px" />
 
-ElainaQQ 是一个基于 Python 的异步 QQ 机器人框架，内置 QQNT 启动、扫码登录、多账号隔离、插件热重载和 Web 面板管理，并提供 OneBot v11 协议兼容接口。
+<h1>ElainaQQ</h1>
 
-[![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white)](https://python.org)
-[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
-[![QQ群](https://img.shields.io/badge/QQ交流群-164178653-blue)](https://qm.qq.com/q/nepv1UcwRE)
+ElainaQQ 是一个基于 Python 的异步 QQ 机器人框架，内置 QQNT 启动与扫码登录，支持多账号隔离、OneBot v11 网络接入、插件热重载和 Web 面板管理。
 
-- **纯异步架构**：基于 aiohttp，支持 WebSocket 与 HTTP 网络接入。
-- **内置 QQ**：直接管理 QQ 安装、扫码登录、版本切换与多账号会话。
-- **插件系统**：支持插件热重载、模块扩展、机器人绑定和在线配置。
-- **Web 管理面板**：提供运行监控、消息记录、插件管理和框架配置。
+[![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white)](https://python.org) [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE) [![QQ群](https://img.shields.io/badge/QQ交流群-164178653-blue)](https://qm.qq.com/q/nepv1UcwRE)
 
-> 项目仅供学习交流使用，严禁用于非法行为。
+- **纯异步架构** — 基于 aiohttp，事件分发、网络连接和插件接口均采用异步模型
+- **内置 QQ 运行时** — 支持 QQ 安装、扫码登录、版本选择和多账号数据隔离
+- **OneBot v11 接入** — 支持反向 / 正向 WebSocket、HTTP 上报和 HTTP API 客户端
+- **Web 管理面板** — 提供账号、网络、插件、配置、日志、消息记录和框架更新管理
 
-## 交流群
+</p>
+<br clear="left" />
 
-**ElainaQQ 框架交流群：[164178653](https://qm.qq.com/q/nepv1UcwRE)**
+> 项目仅供学习交流使用，请遵守所在地法律、QQ 平台规则及相关服务条款。交流群：[164178653](https://qm.qq.com/q/nepv1UcwRE)。
 
-## 快速开始
+## 🚀 快速开始
 
-### 环境要求
-
-- Python 3.11+
-- Git
-- QQNT 内置运行时，所有账号共用一份 QQ 安装文件
-
-运行框架和内置 QQ 不需要服务器预装 Node.js。只有开发或重新构建 Web 前端时才需要 Node.js。
-
-### 安装
+要求：Python 3.11+、Git、可运行 QQNT 的系统环境。
 
 ```bash
 git clone https://github.com/ElainaCore/Elaina_QQBot.git ElainaQQ
 cd ElainaQQ
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 python main.py
 ```
 
-首次启动会自动从 `config/*.example.yaml` 生成 `config/settings.yaml` 与 `config/connections.yaml`。配置文件均支持**热加载**，修改后无需重启。
+首次启动会从 `config/*.example.yaml` 生成 `config/settings.yaml` 和 `config/connections.yaml`。启动后访问 [Web 面板](http://localhost:5201/web/) 完成配置，默认密码为 `admin`。
 
-启动后访问 Web 面板完成配置：
+内置 QQ 可直接在面板中创建账号并扫码登录；使用外部 OneBot 实现时，在“网络配置”中创建对应连接。
 
-```
-http://localhost:5201/web/
-```
-
-> 默认端口为 `5201`，首次登录使用 `config/settings.yaml` 中的 `web.admin_password`。主人 QQ 号填在 `owner.ids`。
-
-内置 QQ 为每个账号分配独立的本机桥接端口，默认从 `30010` 开始递增。桥接端口只绑定 `127.0.0.1`，无需在防火墙或安全组中开放；可通过 `embedded_qq.bridge_port_start` 修改起始值。主面板和公开 OneBot 入口仍使用 `server.port`。
-
-### 网络接入
-
-在 Web 面板启用反向 WebSocket 网络接入后，框架通过配置的端口与路径接受 OneBot v11 连接。例如：
-
-```
-ws://127.0.0.1:5201/OneBotv11
-```
-
-关闭网络接入会主动断开该类外部连接，并让对应机器人立即离线。其他网络连接也可直接在 Web 面板中创建和维护。
-
-## Web 管理面板
-
-启动框架后访问：
-
-```
-http://localhost:5201/web/
-```
-
-面板提供：实时消息与日志、系统状态监控、插件启停/热重载、插件市场、配置编辑、网络连接管理等。
-
-前端源码独立维护在 [Elaina_QQBot_web](https://github.com/ElainaCore/Elaina_QQBot_web)。后端仓库保留可直接运行的 `web/dist` 构建产物。
-
-前端仓库设置 `ELAINAQQ_BACKEND_DIR` 后，构建产物会直接写入后端的 `web/dist`。后端也可通过 `ELAINAQQ_WEB_DIST` 加载外部构建目录。
-
-## 项目结构
+## 📁 框架结构
 
 ```
 ElainaQQ/
 ├── main.py          # 主程序入口
-├── config/          # 配置文件 (settings.yaml / connections.yaml)
+├── config/          # 框架与 OneBot 网络配置
 ├── core/            # 核心框架
-│   ├── foundation/  #   配置、日志与基础设施
-│   ├── plugins/     #   严格异步插件 API、加载与分发
-│   ├── protocols/   #   OneBot v11 事件、API 与连接
-│   ├── runtime/     #   应用、模块和内置 QQ 运行时
-│   ├── services/    #   异步文件与日志服务
-│   └── transport/   #   HTTP / WebSocket 传输
-├── plugins/         # 插件目录 (热加载)
-└── web/             # Web 面板 (后端 + 前端 dist)
+│   ├── foundation/  # 配置、日志与基础设施
+│   ├── plugins/     # 插件加载、分发与公开 API
+│   ├── protocols/   # OneBot v11 事件、消息和动作
+│   ├── runtime/     # 应用、模块与内置 QQ 运行时
+│   ├── services/    # 文件、日志和配置监视服务
+│   └── transport/   # HTTP / WebSocket 传输
+├── plugins/         # 插件目录（运行时按需创建）
+├── modules/         # 模块目录（运行时按需创建）
+├── data/            # 账号、日志、媒体和运行数据
+├── web/             # Web 面板后端与 dist 构建产物
+└── docs/            # 开发文档
 ```
 
-## 开发文档
+`plugins/`、`modules/` 和 `data/` 可能在首次运行或安装扩展后生成。不要提交账号数据、Token、Cookie、日志或插件私有数据。
 
-- [插件开发指南](docs/PLUGIN_DEVELOPMENT.md)
-- [OneBot API 参考](docs/ONEBOT_API.md)
+## 🔗 机器人接入
 
-最简插件 `plugins/hello/main.py`：
+- **内置 QQ** — 保持 `embedded_qq.enabled: true`，在 Web 面板创建机器人并扫码登录。每个账号使用独立数据目录和本机桥接端口。
+- **反向 WebSocket** — 框架作为服务端，默认主入口为 `ws://127.0.0.1:5201/OneBotv11`；必须先在面板启用对应连接。
+- **正向 WebSocket** — 框架主动连接外部 OneBot WebSocket 服务。
+- **HTTP 接入** — 支持接收 OneBot HTTP 事件上报，以及调用外部 OneBot HTTP API。
+
+内置 QQ 桥接端口默认从 `30010` 开始，只监听 `127.0.0.1`，属于框架内部通信端口，不应暴露到公网或由插件直接连接。生产环境应为网络连接配置 Token / Secret，并通过可信反向代理启用 TLS。
+
+## 🔌 开发与扩展
+
+- **开发文档** — [文档目录](docs/README.md)汇总插件开发、事件模型、消息发送和 OneBot API。
+- **插件开发** — [插件开发文档](docs/PLUGIN_DEVELOPMENT.md)包含插件结构、上下文、处理器、生命周期、中间件、多账号和 Web 扩展。
+- **OneBot API** — [API 参考文档](docs/ONEBOT_API.md)包含账号路由、消息段、常用动作、响应结构与错误处理。
+- **Web 前端** — 前端源码位于 [Elaina_QQBot_web](https://github.com/ElainaCore/Elaina_QQBot_web)，本仓库保留可直接运行的 `web/dist` 构建产物。
+
+最简插件入口为 `plugins/hello/main.py`：
 
 ```python
 from core.plugins import handler
@@ -102,28 +78,35 @@ from core.plugins import handler
 
 @handler(r'^你好$', name='打招呼', desc='回复一句问候')
 async def say_hello(event, match):
-    await event.reply("你好!")
+    await event.reply('你好！')
 ```
 
-## 插件市场
+框架只识别包含 `main.py` 的 `plugins/<插件名>/` 目录。保存插件包中的 Python 文件后，文件监视器会自动热重载。
 
-框架内置插件市场，从 [ElainaCore/Elaina-plugins](https://github.com/ElainaCore/Elaina-plugins) 的 `onebot_plugins.json` 获取插件列表。
+## 🛒 插件市场
 
-- **Web 面板** — 在线浏览、搜索、一键安装/更新
-- **镜像加速** — 自动选用可用的 GitHub 镜像下载
+框架从 [Elaina-plugins](https://github.com/ElainaCore/Elaina-plugins) 的 `onebot_plugins.json` 获取插件和模块列表，支持在 Web 面板中浏览、安装、更新、卸载和镜像加速；插件开发者可向该仓库提交 PR，将插件加入市场。
 
-**插件开发者** 可前往 [Elaina-plugins](https://github.com/ElainaCore/Elaina-plugins) 提交 PR，将你的插件加入市场。
+## ⚙️ 常用配置
 
-## 开源协议
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `server.host` | `0.0.0.0` | Web 面板与主 OneBot 服务监听地址 |
+| `server.port` | `5201` | Web 面板与主 OneBot 服务端口 |
+| `web.admin_password` | `admin` | 面板管理员密码，部署后必须修改 |
+| `owner.ids` | 空列表 | `owner_only=True` 处理器允许的 QQ 号 |
+| `embedded_qq.enabled` | `true` | 是否启用内置 QQ 管理 |
+| `embedded_qq.bridge_port_start` | `30010` | 内置账号桥接端口起点 |
+| `logging.retention_days` | `30` | 日志保留天数 |
+
+`config/settings.yaml` 和 `config/connections.yaml` 支持运行时热加载。修改监听地址、端口或底层 QQ 启动参数后，应观察控制台与面板状态，确认相关服务是否需要重启。
+
+## 🤝 反馈与贡献
+
+遇到问题或有功能建议，请前往 [Issues](https://github.com/ElainaCore/Elaina_QQBot/issues) 提交 Issue；欢迎通过 [Pull Requests](https://github.com/ElainaCore/Elaina_QQBot/pulls) 提交 PR，参与项目改进。
+
+提交问题时请附上 Python 版本、操作系统、连接类型、相关日志和最小复现步骤，并先删除 QQ 号、Token、Cookie 等敏感信息。
+
+## 📄 开源协议
 
 本项目采用 MIT 协议开源，详见 [LICENSE](LICENSE) 文件。
-
-## 免责声明
-
-本项目仅供学习交流使用，使用本框架所产生的一切后果由使用者自行承担，与开发者无关。请勿将本框架用于任何违法违规用途。
-
----
-
-如果这个项目对你有帮助，欢迎 Star。
-
-ElainaQQ 团队

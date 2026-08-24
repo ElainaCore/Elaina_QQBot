@@ -72,13 +72,16 @@ function uint32Uin(value) {
 
 /** Convert a QQNT text element to the same OneBot segment shape used by NapCat. */
 export async function oneBotTextSegment(textElement, resolveUin) {
-  const content = String(textElement?.content || "");
+  let content = String(textElement?.content || "");
+  if (!content.includes("\n") && !content.includes("\r\n")) {
+    content = content.replace(/\r/g, "\n");
+  }
   const atType = Number(textElement?.atType || AT_TYPE_UNKNOWN);
   if (atType === AT_TYPE_UNKNOWN) {
     return content ? { type: "text", data: { text: content } } : null;
   }
   if (atType === AT_TYPE_ALL) {
-    return { type: "at", data: { qq: "all", name: content.replace(/^@/, "") } };
+    return { type: "at", data: { qq: "all" } };
   }
 
   let qq = uint32Uin(textElement?.atUid);
@@ -91,8 +94,30 @@ export async function oneBotTextSegment(textElement, resolveUin) {
 
   return {
     type: "at",
-    data: { qq, name: content.replace(/^@/, "") },
+    data: { qq },
   };
+}
+
+function escapeCqText(value) {
+  return String(value ?? "").replace(/&/g, "&amp;").replace(/\[/g, "&#91;").replace(/]/g, "&#93;");
+}
+
+function escapeCqAttribute(value) {
+  return escapeCqText(value).replace(/,/g, "&#44;");
+}
+
+/** Encode an array message exactly like NapCat's encodeCQCode helper. */
+export function encodeOneBotCqMessage(message) {
+  return Array.from(message || []).map((segment) => {
+    if (segment?.type === "text") return escapeCqText(segment?.data?.text);
+    let result = "[CQ:" + String(segment?.type || "unknown");
+    for (const [name, value] of Object.entries(segment?.data || {})) {
+      if (value === undefined) continue;
+      const rendered = typeof value === "object" ? JSON.stringify(value) : String(value);
+      if (rendered) result += "," + name + "=" + escapeCqAttribute(rendered);
+    }
+    return result + "]";
+  }).join("");
 }
 
 export { uint32Uin };

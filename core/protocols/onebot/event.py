@@ -193,7 +193,6 @@ def normalize_event(data: dict, default_self_id: str = '') -> dict | None:
     if post_type in {'meta', 'metaevent'}:
         post_type = 'meta_event'
     if post_type in {'message_sent', 'message_sent_event'}:
-        normalized['event_type'] = 'message_sent'
         normalized.setdefault('message_sent_type', 'self')
         post_type = 'message_sent'
     if not post_type:
@@ -216,13 +215,13 @@ def normalize_event(data: dict, default_self_id: str = '') -> dict | None:
         if message_type in {'friend', 'user', 'c2c', 'dm'}:
             message_type = 'private'
         elif message_type in {'temp', 'temporary', 'temp_group'}:
-            message_type = 'group'
+            message_type = 'private'
             normalized.setdefault('sub_type', 'group')
         normalized['message_type'] = message_type or 'private'
         normalized.setdefault('sub_type', 'normal' if message_type == 'group' else 'friend')
         normalized.setdefault('message_format', 'array')
         normalized.setdefault('font', 14)
-        normalized.setdefault('message_seq', normalized.get('real_seq', normalized.get('message_id', 0)))
+        normalized.setdefault('message_seq', normalized.get('message_id', 0))
         normalized.setdefault('real_id', normalized.get('message_id', 0))
         normalized.setdefault('real_seq', normalized.get('message_seq', 0))
         if not normalized.get('raw_message'):

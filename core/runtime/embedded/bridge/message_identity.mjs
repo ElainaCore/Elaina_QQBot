@@ -1,29 +1,24 @@
-const MAX_SAFE_MESSAGE_ID = 9007199254740991n;
-const HASH_OFFSET = 1469598103934665603n;
-const HASH_PRIME = 1099511628211n;
+import { createHash } from "crypto";
 
 function usableId(value) {
   const text = String(value ?? "").trim();
   return text && text !== "0" ? text : "";
 }
 
-function stableHash(value) {
-  let hash = HASH_OFFSET;
-  for (const character of value) {
-    hash ^= BigInt(character.codePointAt(0));
-    hash = hash * HASH_PRIME % MAX_SAFE_MESSAGE_ID;
-  }
-  return hash || 1n;
+function messagePeer(peerOrMessage = {}, fallbackChatType = 0, fallbackPeerUid = "") {
+  return {
+    chatType: Number(peerOrMessage?.chatType || fallbackChatType || 0),
+    peerUid: String(peerOrMessage?.peerUid || peerOrMessage?.peerUin || fallbackPeerUid || ""),
+  };
 }
 
-/** 将 QQ 原生消息标识稳定映射为 OneBot 可安全传输的整数。 */
-export function toOneBotMessageId(value) {
-  const text = usableId(value) || String(value ?? "");
-  if (/^[1-9]\d*$/.test(text)) {
-    const numeric = BigInt(text);
-    if (numeric <= MAX_SAFE_MESSAGE_ID) return Number(numeric);
-  }
-  return Number(stableHash(text));
+/** Use NapCat's MessageUnique.createUniqueMsgId wire-level algorithm. */
+export function toOneBotMessageId(value, peerOrMessage = {}, fallbackChatType = 0, fallbackPeerUid = "") {
+  const msgId = usableId(value) || String(value ?? "");
+  const peer = messagePeer(peerOrMessage, fallbackChatType, fallbackPeerUid);
+  const digest = createHash("md5").update(msgId + "|" + peer.chatType + "|" + peer.peerUid).digest();
+  digest[0] &= 0x7f;
+  return digest.readInt32BE(0);
 }
 
 /** 获取原生消息的稳定标识；缺少 msgId 时使用会话与序号组合兜底。 */
@@ -67,7 +62,7 @@ export function resolveReplyReference(element, message) {
   ].map((item) => String(item ?? "")).join(":");
   const key = nativeId || fallbackKey;
   return {
-    messageId: toOneBotMessageId(key),
+    messageId: toOneBotMessageId(key, message),
     nativeId,
     sequence: realSequence,
     record,

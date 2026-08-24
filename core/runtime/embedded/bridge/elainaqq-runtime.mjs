@@ -17,7 +17,9 @@ import {
 } from './session_adapters.mjs';
 import { IncomingMessageGate } from './message_gate.mjs';
 import { nativeMessageKey, resolveReplyReference, toOneBotMessageId } from './message_identity.mjs';
-import { asOneBotBoolean, normalizeOneBotMessage, oneBotTextSegment } from './onebot_message.mjs';
+import { asOneBotBoolean, encodeOneBotCqMessage, normalizeOneBotMessage, oneBotTextSegment } from './onebot_message.mjs';
+import { createHeartbeatEvent, createLifecycleEvent, createOneBotEvent } from './onebot_event.mjs';
+import { decodeNapCatSystemNotice, parseEmojiLikeGrayTip, parseEssenceGrayTip } from './onebot_notice.mjs';
 import { buildGroupSpecialTitlePacket, normalizePacketRequest, normalizePacketResponse } from './onebot_packet.mjs';
 import { NativePacketBackend } from './packet_backend.mjs';
 import {
@@ -418,6 +420,9 @@ class QQInstance {
   oneBotRawMessages = /* @__PURE__ */ new Map();
   oneBotForwardMessages = /* @__PURE__ */ new Map();
   oneBotNoticeKeys = /* @__PURE__ */ new Map();
+  oneBotGroupCards = /* @__PURE__ */ new Map();
+  oneBotGroupOperators = /* @__PURE__ */ new Map();
+  oneBotHeartbeatTimer = null;
   pendingSentMessages = /* @__PURE__ */ new Set();
   pendingNativeEvents = /* @__PURE__ */ new Map();
   forwardSendTail = Promise.resolve();
@@ -543,6 +548,8 @@ class QQInstance {
         loginUin: this.selfInfo.uin,
         nickname: this.botConfig.nickname,
       });
+      this.oneBotEventCallback?.(createLifecycleEvent(this.getSelfUin()));
+      this.startOneBotHeartbeat();
       log(id, "=== 启动完成, 已上线 ===");
     } catch (e) {
       logErr(id, "=== 启动失败 ===", e.message, e.stack);
@@ -662,6 +669,8 @@ class QQInstance {
   }
   async stop() {
     try {
+      if (this.oneBotHeartbeatTimer) clearInterval(this.oneBotHeartbeatTimer);
+      this.oneBotHeartbeatTimer = null;
       for (const pending of Array.from(this.pendingSentMessages)) {
         pending.reject(new OneBotActionError("QQ 会话已停止", 1500, "send_msg"));
       }
@@ -706,6 +715,14 @@ class QQInstance {
     } catch (e) {
       logErr(this.botConfig.id, "停止失败:", e.message);
     }
+  }
+  startOneBotHeartbeat(interval = 30000) {
+    if (this.oneBotHeartbeatTimer) clearInterval(this.oneBotHeartbeatTimer);
+    this.oneBotHeartbeatTimer = setInterval(() => {
+      const online = this.runtime.status === "online";
+      this.oneBotEventCallback?.(createHeartbeatEvent(this.getSelfUin(), interval, online, true));
+    }, interval);
+    this.oneBotHeartbeatTimer.unref?.();
   }
   getMsgService() {
     return this.session?.getMsgService();
@@ -1114,7 +1131,7 @@ class QQInstance {
   }
   peerForEvent(event, raw = null) {
     const target = event.message_type === "private"
-      ? raw?.peerUid || event._peer_uid || event.user_id
+      ? raw?.peerUid || event.target_id || event.user_id
       : event.group_id;
     return this.peerFor(event.message_type, target);
   }
@@ -1147,7 +1164,7 @@ class QQInstance {
     }, null);
     return {
       messages,
-      next_cursor: String(oldest?.message_seq || oldest?.real_seq || ""),
+      next_cursor: String(oldest?.real_seq || oldest?.message_seq || ""),
     };
   }
   async markAllOneBotMessagesRead() {
@@ -1216,7 +1233,7 @@ class QQInstance {
     const keys = [
       ...ids,
       raw.msgId,
-      toOneBotMessageId(nativeMessageKey(raw)),
+      toOneBotMessageId(nativeMessageKey(raw), raw),
     ].map((value) => String(value || "")).filter(Boolean);
     for (const key of new Set(keys)) this.rememberOneBotForward(key, reference);
   }
@@ -1358,7 +1375,7 @@ class QQInstance {
     }
     const raw = await this.sendNativeForward(resolved[0].peer, destinationPeer, resolved);
     const rawId = String(raw.msgId || nativeMessageKey(raw));
-    const messageId = toOneBotMessageId(rawId);
+    const messageId = toOneBotMessageId(rawId, raw);
     const ark = Array.from(raw.elements || []).map((element) => this.forwardArkData(element?.arkElement?.bytesData)).find(Boolean);
     const forwardElement = Array.from(raw.elements || []).find((element) => element?.multiForwardMsgElement)?.multiForwardMsgElement;
     const forwardId = String(ark?.meta?.detail?.resid || forwardElement?.resId || rawId);
@@ -1824,7 +1841,10 @@ class QQInstance {
         sender_nick: String(item.senderNick || item.sender_nick || ""),
         operator_id: Number(item.operatorUin || item.add_digest_uin || 0),
         operator_nick: String(item.operatorNick || item.add_digest_nick || ""),
-        message_id: toOneBotMessageId(String(item.msgId || groupId + ":" + seq + ":" + random)),
+        message_id: toOneBotMessageId(
+          String(item.msgId || groupId + ":" + seq + ":" + random),
+          { chatType: 2, peerUid: groupId },
+        ),
         operator_time: Number(item.operatorTime || item.add_digest_time || 0),
         content: item.content || item.msg_content || [],
       };
@@ -2074,7 +2094,8 @@ class QQInstance {
       }]);
       checkNativeResult(result, isFolder ? "发送在线文件夹失败" : "发送在线文件失败");
       const rawId = String(result?.msgId || result?.messageId || result?.msg_id || Date.now());
-      const messageId = toOneBotMessageId(rawId);
+      const privatePeerUid = String(result?.peerUid || await this.resolveUid(userId));
+      const messageId = toOneBotMessageId(rawId, result, 1, privatePeerUid);
       this.oneBotNativeMessageIds.set(String(messageId), rawId);
       return { message_id: messageId, element_id: String(result?.elementId || "") };
     } finally {
@@ -3309,21 +3330,20 @@ class QQInstance {
       if (!elements.length) throw new Error("消息内容为空");
       const result = await this.sendNativeElements(type, target, elements);
       const rawId = String(result?.msgId || result?.messageId || result?.msg_id || Date.now());
-      const messageId = toOneBotMessageId(rawId);
+      const fallbackPeerUid = type === "private" ? await this.resolveUid(target) : target;
+      const messageId = toOneBotMessageId(rawId, result, type === "group" ? 2 : 1, fallbackPeerUid);
       this.oneBotNativeMessageIds.set(String(messageId), rawId);
-      const event = {
-        time: Math.floor(Date.now() / 1000),
-        self_id: Number(this.getSelfUin()) || this.getSelfUin(),
-        post_type: "message_sent",
+      const event = createOneBotEvent(this.getSelfUin(), "message_sent", {
+        time: Date.now(),
         message_type: type,
         sub_type: type === "group" ? "normal" : "friend",
         message_id: messageId,
-        message_seq: Number(result?.msgSeq || 0),
-        real_id: String(result?.msgSeq || ""),
+        message_seq: messageId,
+        real_id: messageId,
         real_seq: String(result?.msgSeq || ""),
         user_id: Number(this.getSelfUin()) || this.getSelfUin(),
         message: segments,
-        raw_message: this.toOneBotRawMessage(segments),
+        raw_message: this.toOneBotRawMessage(segments).trim(),
         message_format: "array",
         message_sent_type: "self",
         font: 14,
@@ -3332,9 +3352,10 @@ class QQInstance {
           nickname: this.getSelfNick(),
           card: this.getSelfNick(),
         },
-      };
+      });
       if (type === "group") event.group_id = Number(target) || target;
       else event.target_id = Number(target) || target;
+      if (type === "group") event.target_id = Number(target) || target;
       const emitted = this.oneBotMessages.has(String(messageId));
       this.rememberOneBotMessage(event, rawId, result?.msgId ? result : result?.msg || result?.message || null);
       if (!emitted) this.oneBotEventCallback?.(event);
@@ -4518,39 +4539,40 @@ class QQInstance {
     };
     listenerImpl.onMsgRecall = async (chatType, uid, msgSeq) => {
       try {
-        const isGroup = Number(chatType) === 2;
-        const matches = [];
-        for (const event of self.oneBotMessages.values()) {
-          if (String(event.message_seq || event.real_seq || event.real_id || "") !== String(msgSeq || "")) continue;
-          matches.push(event);
+        const service = self.getMsgService();
+        if (typeof service?.queryMsgsWithFilterEx !== "function") {
+          log(id, `[EVENT] 撤回回调暂无法查询灰条，等待消息更新: ${chatType}/${uid}/${msgSeq}`);
+          return;
         }
-        const recalled = matches.find((event) => !isGroup || String(event.group_id || "") === String(uid || "")) || matches[0] || null;
-        const privateUid = String(uid || recalled?.user_id || "");
-        const resolvedPrivateUin = isGroup ? "" : await self.resolveUin(privateUid);
-        const userId = isGroup
-          ? Number(recalled?.user_id || 0) || recalled?.user_id || 0
-          : Number(resolvedPrivateUin) || resolvedPrivateUin;
-        const event = {
-          time: Math.floor(Date.now() / 1e3),
-          self_id: Number(self.getSelfUin()) || self.getSelfUin(),
-          post_type: "notice",
-          notice_type: isGroup ? "group_recall" : "friend_recall",
-          user_id: userId,
-          message_id: recalled?.message_id || String(msgSeq || ""),
-        };
-        if (isGroup) {
-          const groupId = recalled?.group_id || uid;
-          event.group_id = Number(groupId) || groupId;
-          event.operator_id = userId;
-        }
-        self.oneBotEventCallback?.(event);
+        const peer = { chatType: Number(chatType), peerUid: String(uid || ""), guildId: "" };
+        const result = await service.queryMsgsWithFilterEx("0", "0", String(msgSeq || "0"), {
+          chatInfo: peer,
+          filterMsgType: [],
+          filterSendersUid: [],
+          filterMsgToTime: "0",
+          filterMsgFromTime: "0",
+          isReverseOrder: false,
+          isIncludeCurrent: true,
+          pageLimit: 1,
+        });
+        const recalled = collectionValues(result?.msgList || result)
+          .find((message) => self.getRecallElement(message));
+        if (recalled) await self.emitRecallNotice(recalled);
+        else log(id, `[EVENT] 撤回回调暂未查询到灰条，等待消息更新: ${chatType}/${uid}/${msgSeq}`);
       } catch (error) {
-        logErr(id, "[EVENT] 撤回事件转换失败:", error?.message || error);
+        logErr(id, "[EVENT] 查询撤回消息失败:", error?.message || error);
       }
     };
     listenerImpl.onMsgInfoListUpdate = (messages) => {
       self.emitNativeEvent("message_update", messages);
       self.handleSentMessageUpdates(messages);
+      self.incomingMessageTail = self.incomingMessageTail
+        .catch(() => {})
+        .then(async () => {
+          for (const message of Array.from(messages || [])) {
+            if (self.isCurrentRecallUpdate(message)) await self.emitRecallNotice(message);
+          }
+        });
     };
     listenerImpl.onAddSendMsg = (message) => {
       self.handleSentMessageUpdates([message]);
@@ -4576,9 +4598,9 @@ class QQInstance {
           notice_type: "notify",
           sub_type: "input_status",
           user_id: Number(userId) || userId || 0,
+          group_id: 0,
           event_type: Number(data?.eventType || 0),
           status_text: String(data?.statusText || ""),
-          interval: Number(data?.interval || 0),
         });
       } catch (error) {
         logErr(id, "[EVENT] 输入状态事件转换失败:", error?.message || error);
@@ -4599,16 +4621,15 @@ class QQInstance {
       const raw = args.find((value) => value && typeof value === "object") || {};
       self.handleSentMessageUpdates([{ ...raw, sendStatus: 0 }]);
     };
-    const emitKernelNotice = (subType, rawInfo) => self.emitOneBotEvent({
-      post_type: "notice",
-      notice_type: "notify",
-      sub_type: subType,
-      raw_info: rawInfo,
-    });
-    listenerImpl.onMsgDelete = (contact, messages) => emitKernelNotice("message_delete", { contact, messages });
-    listenerImpl.onMsgEventListUpdate = (events) => emitKernelNotice("message_event", events);
-    listenerImpl.onSysMsgNotification = (payload) => emitKernelNotice("system_message", payload);
-    listenerImpl.onRecvSysMsg = (payload) => emitKernelNotice("system_message", payload);
+    listenerImpl.onMsgDelete = (contact, messages) => self.emitNativeEvent("message_delete", contact, messages);
+    listenerImpl.onMsgEventListUpdate = (events) => self.emitNativeEvent("message_event", events);
+    listenerImpl.onSysMsgNotification = (payload) => self.emitNativeEvent("system_message", payload);
+    listenerImpl.onRecvSysMsg = (payload) => {
+      self.emitNativeEvent("system_message", payload);
+      self.incomingMessageTail = self.incomingMessageTail
+        .catch(() => {})
+        .then(() => self.handleSystemNotice(payload));
+    };
     this.msgListener = proxied(listenerImpl);
     try {
       this.session.getMsgService().addKernelMsgListener(this.msgListener);
@@ -4645,18 +4666,14 @@ class QQInstance {
   }
   registerEventListeners() {
     const id = this.botConfig.id;
-    const emit = (event) => this.oneBotEventCallback?.({
-      time: Math.floor(Date.now() / 1e3),
-      self_id: Number(this.getSelfUin()) || this.getSelfUin(),
-      ...event,
-    });
+    const emit = (event) => this.emitOneBotEvent(event);
 
     try {
       const buddy = new BuddyListener();
       buddy.onBuddyReqChange = async (payload) => {
         this.emitNativeEvent("buddy_requests", payload);
         for (const request of Array.from(payload?.buddyReqs || []).slice(0, Number(payload?.unreadNums || 0))) {
-          if (request?.isInitiator || request?.isDecide || !request?.isUnread) continue;
+          if (request?.isInitiator || (request?.isDecide && Number(request?.reqType) !== 13) || !request?.isUnread) continue;
           const userId = await this.resolveUin(String(request.friendUid || ""));
           emit({
             post_type: "request",
@@ -4669,16 +4686,6 @@ class QQInstance {
       };
       buddy.onDoubtBuddyReqChange = async (payload) => {
         this.emitNativeEvent("doubt_buddy_requests", payload);
-        for (const request of Array.from(payload?.doubtList || [])) {
-          const userId = await this.resolveUin(String(request?.uid || ""));
-          emit({
-            post_type: "request", request_type: "friend", sub_type: "doubt",
-            user_id: Number(userId) || userId || 0,
-            comment: String(request?.msg || request?.reason || ""),
-            flag: String(request?.reqId || request?.reqTime || payload?.cookie || ""),
-            source: String(request?.source || ""),
-          });
-        }
       };
       this.buddyListener = proxied(buddy);
       this.buddyListenerHandle = this.session?.getBuddyService?.().addKernelBuddyListener?.(this.buddyListener);
@@ -4691,13 +4698,21 @@ class QQInstance {
       const handleGroupNotifies = async (_doubt, notifies) => {
         for (const notify of Array.from(notifies || [])) {
           const groupId = String(notify?.group?.groupCode || notify?.groupCode || "");
-          const affectedUid = String(notify?.user1?.uid || notify?.actionUser?.uid || "");
-          const affectedUin = affectedUid ? await this.resolveUin(affectedUid) : "";
-          const operatorUid = String(notify?.actionUser?.uid || notify?.user2?.uid || "");
-          const operatorUin = operatorUid ? await this.resolveUin(operatorUid) : "";
-          const flag = String(notify?.seq || notify?.flag || "");
           const type = Number(notify?.type || 0);
           const status = Number(notify?.status || 0);
+          const notifyTime = Number(notify?.seq || 0) / 1e6;
+          if (Number.isFinite(notifyTime) && notifyTime > 0 && notifyTime < Number(this.incomingMessageGate?.startedAt || 0)) continue;
+          const requestUid = type === 1 ? notify?.user2?.uid : notify?.user1?.uid;
+          const affectedUid = String(requestUid || notify?.actionUser?.uid || "");
+          const affectedUin = affectedUid ? await this.resolveUin(affectedUid) : "";
+          const operatorUid = String(notify?.actionUser?.uid || notify?.user2?.uid || "");
+          if (groupId && affectedUid && operatorUid) {
+            this.oneBotGroupOperators.set(groupId + ":" + affectedUid, operatorUid);
+            while (this.oneBotGroupOperators.size > 1000) {
+              this.oneBotGroupOperators.delete(this.oneBotGroupOperators.keys().next().value);
+            }
+          }
+          const flag = String(notify?.seq || notify?.flag || "");
           if (status === 1 && [1, 5, 7].includes(type)) {
             emit({
               post_type: "request",
@@ -4707,31 +4722,6 @@ class QQInstance {
               user_id: Number(affectedUin) || affectedUin || 0,
               comment: String(notify?.postscript || ""),
               flag,
-            });
-          } else if ([4, 6].includes(type)) {
-            emit({
-              post_type: "notice", notice_type: "group_increase", sub_type: "approve",
-              group_id: Number(groupId) || groupId, user_id: Number(affectedUin) || affectedUin || 0,
-              operator_id: Number(operatorUin) || operatorUin || 0,
-            });
-          } else if ([9, 10, 11].includes(type)) {
-            emit({
-              post_type: "notice", notice_type: "group_decrease", sub_type: type === 11 ? "leave" : "kick",
-              group_id: Number(groupId) || groupId, user_id: Number(affectedUin) || affectedUin || 0,
-              operator_id: Number(operatorUin) || operatorUin || 0,
-            });
-          } else if ([8, 12, 13].includes(type)) {
-            emit({
-              post_type: "notice", notice_type: "group_admin", sub_type: type === 8 ? "set" : "unset",
-              group_id: Number(groupId) || groupId, user_id: Number(affectedUin) || affectedUin || 0,
-            });
-          } else {
-            emit({
-              post_type: "notice", notice_type: "notify", sub_type: "group_notify",
-              group_id: Number(groupId) || groupId,
-              user_id: Number(affectedUin) || affectedUin || 0,
-              operator_id: Number(operatorUin) || operatorUin || 0,
-              notify_type: type, status, flag, raw_info: notify,
             });
           }
         }
@@ -4746,30 +4736,15 @@ class QQInstance {
       };
       group.onGroupDetailInfoChange = (detail) => {
         this.emitNativeEvent("group_detail", detail);
-        const groupId = String(detail?.groupCode || detail?.groupUin || "");
-        emit({
-          post_type: "notice", notice_type: "notify", sub_type: "group_info",
-          group_id: Number(groupId) || groupId,
-          group_name: String(detail?.groupName || ""), raw_info: detail,
-        });
       };
       group.onMemberInfoChange = async (groupCode, _source, members) => {
         this.emitNativeEvent("member_info", groupCode, _source, members);
-        const values = members instanceof Map ? Array.from(members.values()) : Array.from(members || []);
-        for (const member of values) {
-          const userId = String(member?.uin || await this.resolveUin(String(member?.uid || "")));
-          emit({
-            post_type: "notice", notice_type: "group_member_info",
-            group_id: Number(groupCode) || groupCode,
-            user_id: Number(userId) || userId || 0,
-            card_new: String(member?.cardName || ""), nickname: String(member?.nick || ""),
-            role: Number(member?.role) === 4 ? "owner" : Number(member?.role) === 3 ? "admin" : "member",
-            title: String(member?.memberSpecialTitle || ""), raw_info: member,
-          });
-        }
+        for (const member of collectionValues(members)) this.rememberGroupCard(groupCode, member);
       };
       group.onMemberListChange = (...args) => {
         this.emitNativeEvent("member_list", ...args);
+        const [groupCode, members] = args;
+        for (const member of collectionValues(members)) this.rememberGroupCard(groupCode, member);
       };
       group.onShutUpMemberListChanged = (groupCode, members) => {
         this.emitNativeEvent("group_shut_list", groupCode, members);
@@ -4781,10 +4756,69 @@ class QQInstance {
     }
   }
   emitOneBotEvent(event) {
-    this.oneBotEventCallback?.({
-      time: Math.floor(Date.now() / 1e3),
-      self_id: Number(this.getSelfUin()) || this.getSelfUin(),
-      ...event,
+    if (!event?.post_type) return;
+    const { post_type, ...fields } = event;
+    this.oneBotEventCallback?.(createOneBotEvent(this.getSelfUin(), post_type, fields));
+  }
+  async handleSystemNotice(payload) {
+    try {
+      const event = decodeNapCatSystemNotice(payload);
+      if (!event) return false;
+      const memberUid = String(event.member_uid || "");
+      const groupId = String(event.group_id || "");
+      let operatorUid = String(event.operator_uid || "");
+      if (!operatorUid && groupId && memberUid) {
+        operatorUid = String(this.oneBotGroupOperators.get(groupId + ":" + memberUid) || "");
+      }
+      if (memberUid) {
+        const userId = await this.resolveUin(memberUid);
+        event.user_id = Number(userId) || userId || 0;
+      }
+      if (operatorUid) {
+        const operatorId = await this.resolveUin(operatorUid);
+        event.operator_id = Number(operatorId) || operatorId || 0;
+      } else if (["group_increase", "group_decrease"].includes(event.notice_type)) {
+        event.operator_id = 0;
+      }
+      delete event.member_uid;
+      delete event.operator_uid;
+      const rawPayload = Buffer.isBuffer(payload) || payload instanceof Uint8Array || Array.isArray(payload)
+        ? Buffer.from(payload)
+        : Buffer.from(stringifyJson(payload) || "");
+      const key = "system:" + createHash("sha1").update(rawPayload).digest("hex");
+      if (!this.rememberNotice(key)) return true;
+      this.emitOneBotEvent(event);
+      return true;
+    } catch (error) {
+      logErr(this.botConfig.id, "[EVENT] 系统消息转换失败:", error?.message || error);
+      return false;
+    }
+  }
+  async rememberGroupCard(groupCode, member, emitChange = true) {
+    const groupId = String(groupCode || member?.groupCode || "");
+    let userId = String(member?.uin || member?.user_id || "");
+    if (!userId && member?.uid) userId = String(await this.resolveUin(String(member.uid)) || "");
+    if (!groupId || !userId) return false;
+    const card = this.displayText(member?.cardName ?? member?.card ?? "");
+    const key = groupId + ":" + userId;
+    const previous = this.oneBotGroupCards.get(key);
+    this.oneBotGroupCards.set(key, card);
+    while (this.oneBotGroupCards.size > 5000) this.oneBotGroupCards.delete(this.oneBotGroupCards.keys().next().value);
+    if (!emitChange || previous === undefined || previous === card) return false;
+    const noticeKey = "card:" + key + ":" + card;
+    if (!this.rememberNotice(noticeKey)) return true;
+    this.emitOneBotEvent({
+      post_type: "notice", notice_type: "group_card",
+      group_id: Number(groupId) || groupId, user_id: Number(userId) || userId,
+      card_new: card, card_old: previous,
+    });
+    return true;
+  }
+  async detectMessageGroupCard(msg) {
+    if (Number(msg?.chatType) !== 2 || !msg?.senderUin || String(msg.senderUin) === "0") return false;
+    return this.rememberGroupCard(msg.peerUid || msg.peerUin, {
+      uin: msg.senderUin,
+      cardName: msg.sendMemberName ?? "",
     });
   }
   waitForNativeEvent(key, trigger, matcher = () => true, directMatcher = () => false, timeout = 5000) {
@@ -4851,6 +4885,40 @@ class QQInstance {
     while (this.oneBotNoticeKeys.size > 1000) this.oneBotNoticeKeys.delete(this.oneBotNoticeKeys.keys().next().value);
     return true;
   }
+  getRecallElement(message) {
+    if (Number(message?.msgType || 0) !== 5) return null;
+    return Array.from(message?.elements || []).find((item) => item?.grayTipElement?.revokeElement) || null;
+  }
+  isCurrentRecallUpdate(message) {
+    if (!this.getRecallElement(message)) return false;
+    const recallTime = Number(message?.recallTime || 0);
+    if (!Number.isFinite(recallTime) || recallTime <= 0) return false;
+    const seconds = recallTime > 1e10 ? recallTime / 1000 : recallTime;
+    const startedAt = Number(this.incomingMessageGate?.startedAt || Math.floor(Date.now() / 1000));
+    return seconds >= startedAt - 5;
+  }
+  async emitRecallNotice(message) {
+    const element = this.getRecallElement(message);
+    const revoke = element?.grayTipElement?.revokeElement;
+    if (!revoke?.operatorUid) return false;
+    const chatType = Number(message?.chatType || 0);
+    if (![1, 2].includes(chatType)) return false;
+    const key = "recall:" + chatType + ":" + String(message?.peerUid || message?.peerUin || "") + ":" + nativeMessageKey(message);
+    if (!this.rememberNotice(key)) return true;
+    const event = {
+      post_type: "notice",
+      notice_type: chatType === 2 ? "group_recall" : "friend_recall",
+      user_id: Number(message?.senderUin || 0) || 0,
+      message_id: toOneBotMessageId(nativeMessageKey(message), message),
+    };
+    if (chatType === 2) {
+      const operatorId = await this.resolveUin(String(revoke.operatorUid));
+      event.group_id = Number(message?.peerUin || message?.peerUid || 0) || 0;
+      event.operator_id = Number(operatorId) || operatorId || 0;
+    }
+    this.emitOneBotEvent(event);
+    return true;
+  }
   async grayTipNotice(element, msg) {
     const gray = element?.grayTipElement;
     if (!gray) return null;
@@ -4865,16 +4933,18 @@ class QQInstance {
       };
     }
     if (group && Number(group.type || 0) === 8 && group.shutUp) {
-      const userId = await this.resolveUin(String(group.shutUp?.member?.uid || group.memberUid || ""));
+      const memberUid = String(group.shutUp?.member?.uid || group.memberUid || "");
+      const userId = memberUid ? await this.resolveUin(memberUid) : "0";
       const operatorId = await this.resolveUin(String(group.shutUp?.admin?.uid || group.adminUid || ""));
-      const duration = Math.max(0, Number(group.shutUp?.duration || 0));
+      let duration = Math.max(0, Number(group.shutUp?.duration || 0));
+      if (!memberUid && duration > 0) duration = -1;
       return {
-        post_type: "notice", notice_type: "group_ban", sub_type: duration ? "ban" : "lift_ban",
+        post_type: "notice", notice_type: "group_ban", sub_type: duration !== 0 ? "ban" : "lift_ban",
         group_id: Number(groupId) || groupId, user_id: Number(userId) || userId || 0,
         operator_id: Number(operatorId) || operatorId || 0, duration,
       };
     }
-    if (group && Number(group.type || 0) === 1) {
+    if (group && Number(group.type || 0) === 1 && String(group.memberUid || "") === String(this.selfInfo?.uid || "")) {
       const userId = await this.resolveUin(String(group.memberUid || group.memberAdd?.otherAdd?.uid || ""));
       const operatorId = await this.resolveUin(String(group.adminUid || ""));
       return {
@@ -4892,12 +4962,15 @@ class QQInstance {
         const uids = Array.from(rawInfo?.items || []).map((item) => String(item?.uid || "")).filter(Boolean);
         if (uids.length >= 2) {
           const identities = await Promise.all([this.resolveUin(uids[0]), this.resolveUin(uids[1])]);
+          const isGroup = Number(msg?.chatType) === 2;
+          const peerId = isGroup ? "" : await this.resolveUin(String(msg?.peerUid || ""));
           return {
             post_type: "notice", notice_type: "notify", sub_type: "poke",
-            user_id: Number(identities[0]) || identities[0] || 0,
+            user_id: isGroup ? Number(identities[0]) || identities[0] || 0 : Number(peerId) || peerId || 0,
             target_id: Number(identities[1]) || identities[1] || 0,
-            group_id: Number(msg?.chatType) === 2 ? Number(groupId) || groupId : undefined,
-            sender_id: Number(identities[0]) || identities[0] || 0, raw_info: rawInfo,
+            group_id: isGroup ? Number(groupId) || groupId : undefined,
+            sender_id: isGroup ? undefined : Number(identities[0]) || identities[0] || 0,
+            raw_info: Array.from(rawInfo?.items || []),
           };
         }
       }
@@ -4905,23 +4978,106 @@ class QQInstance {
         const userId = await this.resolveUin(String(msg?.peerUid || msg?.senderUid || ""));
         return { post_type: "notice", notice_type: "friend_add", user_id: Number(userId) || userId || 0 };
       }
+      if (Number(msg?.chatType) !== 2) return null;
+      if (businessId === "2401") {
+        const essence = parseEssenceGrayTip(rawInfo);
+        return essence ? await this.createEssenceNotice(essence) : null;
+      }
+      const grayItems = Array.from(rawInfo?.items || []);
+      const grayType = String(grayItems.at(-1)?.txt || "");
+      if (grayType === "头衔") {
+        const memberUin = String(grayItems[1]?.param?.[0] || "");
+        const title = grayItems[3]?.txt;
+        if (memberUin && title !== undefined) {
+          return {
+            post_type: "notice", notice_type: "notify", sub_type: "title",
+            group_id: Number(groupId) || groupId, user_id: Number(memberUin) || memberUin, title: String(title),
+          };
+        }
+        return null;
+      }
+      if (grayType === "移出" || !(Number(msg?.senderUin || 0) || 0)) return null;
       return {
         post_type: "notice", notice_type: "notify", sub_type: "gray_tip",
         group_id: Number(msg?.chatType) === 2 ? Number(groupId) || groupId : undefined,
-        user_id: Number(msg?.senderUin || 0) || 0, busi_id: businessId, raw_info: rawInfo,
+        user_id: Number(msg?.senderUin || 0) || 0,
+        message_id: toOneBotMessageId(nativeMessageKey(msg), msg),
+        busi_id: businessId,
+        content: String(jsonTip.jsonStr || ""),
+        raw_info: { msgSeq: msg?.msgSeq, msgTime: msg?.msgTime, msgId: msg?.msgId, json: rawInfo },
       };
     }
+    if (Number(msg?.chatType) === 2 && String(gray.xmlElement?.templId || "") === "10382") {
+      const like = parseEmojiLikeGrayTip(gray.xmlElement?.content);
+      return like ? await this.createGroupEmojiLikeNotice(groupId, like) : null;
+    }
     return null;
+  }
+  async queryGroupMessageBySeq(groupId, sequence, reverse = true) {
+    const service = this.getMsgService();
+    const peer = { chatType: 2, peerUid: String(groupId), guildId: "" };
+    if (typeof service?.queryMsgsWithFilterEx === "function") {
+      const result = await service.queryMsgsWithFilterEx("0", "0", String(sequence), {
+        chatInfo: peer,
+        filterMsgType: [],
+        filterSendersUid: [],
+        filterMsgToTime: "0",
+        filterMsgFromTime: "0",
+        isReverseOrder: reverse,
+        isIncludeCurrent: true,
+        pageLimit: 1,
+      });
+      const message = collectionValues(result?.msgList || result)[0];
+      if (message) return message;
+    }
+    if (typeof service?.getMsgsBySeqAndCount === "function") {
+      const result = await service.getMsgsBySeqAndCount(peer, String(sequence), 1, true, true);
+      return collectionValues(result?.msgList || result)[0] || null;
+    }
+    return null;
+  }
+  async createGroupEmojiLikeNotice(groupId, like) {
+    const raw = await this.queryGroupMessageBySeq(groupId, like.messageSeq, true);
+    if (!raw) return null;
+    return {
+      post_type: "notice", notice_type: "group_msg_emoji_like",
+      group_id: Number(groupId) || groupId,
+      user_id: Number(like.senderUin) || like.senderUin || 0,
+      message_id: toOneBotMessageId(nativeMessageKey(raw), raw),
+      likes: [{ emoji_id: String(like.emojiId), count: 1 }],
+      is_add: true,
+    };
+  }
+  async createEssenceNotice(essence) {
+    const raw = await this.queryGroupMessageBySeq(essence.groupId, essence.messageSeq, false);
+    if (!raw) return null;
+    let operatorId = 0;
+    try {
+      const entries = await this.getEssenceMessages({ group_id: essence.groupId });
+      const current = entries.find((item) => String(item.msg_seq) === String(essence.messageSeq));
+      operatorId = Number(current?.operator_id || 0);
+    } catch {
+    }
+    let senderId = String(raw.senderUin || "");
+    if ((!senderId || senderId === "0") && raw.senderUid) senderId = String(await this.resolveUin(String(raw.senderUid)));
+    return {
+      post_type: "notice", notice_type: "essence", sub_type: "add",
+      group_id: Number(essence.groupId) || essence.groupId,
+      user_id: Number(senderId) || senderId || 0,
+      sender_id: Number(senderId) || senderId || 0,
+      operator_id: operatorId,
+      message_id: toOneBotMessageId(nativeMessageKey(raw), raw),
+    };
   }
   async handleMessage(msg, forceSent = false) {
     const elements = msg.elements || [];
     if (!elements.length) return;
+    await this.detectMessageGroupCard(msg);
     for (const element of elements) {
       const notice = await this.grayTipNotice(element, msg);
       if (!notice) continue;
       const noticeKey = "gray:" + nativeMessageKey(msg) + ":" + notice.notice_type + ":" + (notice.sub_type || "");
       if (this.rememberNotice(noticeKey)) this.emitOneBotEvent(notice);
-      return;
     }
     const event = await this.toOneBotEvent(msg);
     if (!event) return;
@@ -4949,7 +5105,7 @@ class QQInstance {
           post_type: "notice", notice_type: "group_upload",
           group_id: event.group_id, user_id: event.user_id,
           file: {
-            id: String(file.fileUuid || element.elementId || ""), name: String(file.fileName || ""),
+            id: String(file.fileMd5 || file.fileUuid || element.elementId || ""), name: String(file.fileName || ""),
             size: Number(file.fileSize || 0), busid: Number(file.fileBizId || 0),
           },
         });
@@ -4985,16 +5141,19 @@ class QQInstance {
       const isGroup = Number(msg.chatType) === 2;
       const target = {
         time: 0,
-        self_id: this.getSelfUin(),
+        self_id: Number(this.getSelfUin()) || this.getSelfUin(),
         post_type: "message",
         message_type: isGroup ? "group" : "private",
-        sub_type: "normal",
+        sub_type: isGroup ? "normal" : "friend",
         message_id: reference.messageId,
-        real_id: reference.sequence,
+        message_seq: reference.messageId,
+        real_id: reference.messageId,
         real_seq: reference.sequence,
         user_id: Number(reference.senderUin) || reference.senderUin || 0,
         message: [],
         raw_message: "",
+        message_format: "array",
+        font: 14,
         sender: {
           user_id: Number(reference.senderUin) || reference.senderUin || 0,
           nickname: reference.senderName,
@@ -5036,38 +5195,39 @@ class QQInstance {
     if (element?.textElement) return this.oneBotTextSegment(element.textElement);
     if (element?.picElement) {
       const pic = element.picElement;
-      const file = String(pic.sourcePath || pic.filePath || pic.fileName || pic.fileUuid || "");
+      const file = String(pic.fileName || pic.filePath || pic.sourcePath || pic.fileUuid || "");
       const data = {
+        summary: pic.summary === undefined ? undefined : String(pic.summary),
         file,
-        file_id: String(pic.fileUuid || element.elementId || file),
+        sub_type: pic.picSubType === undefined ? undefined : Number(pic.picSubType),
         url: String(pic.originImageUrl || pic.url || ""),
         file_size: String(pic.fileSize || ""),
-        summary: String(pic.summary || ""),
-        sub_type: Number(pic.picSubType || 0),
       };
-      this.rememberOneBotFile(pic, data);
+      this.rememberOneBotFile(pic, {
+        ...data,
+        file_id: String(pic.fileUuid || element.elementId || file),
+      });
       return { type: "image", data };
     }
     if (element?.fileElement) {
       const file = element.fileElement;
       const data = {
-        file: String(file.fileName || file.filePath || file.fileUuid || ""),
+        file: String(file.fileName || ""),
         file_id: String(file.fileUuid || element.elementId || file.fileName || ""),
+        file_size: String(file.fileSize || ""),
+        url: file.url ? String(file.url) : undefined,
+      };
+      this.rememberOneBotFile(file, {
+        ...data,
         name: String(file.fileName || ""),
         path: String(file.filePath || ""),
-        file_size: String(file.fileSize || ""),
         element_id: String(element.elementId || ""),
-      };
-      this.rememberOneBotFile(file, data);
+      });
       if (Number(element.elementType) === 23 || Number(element.elementType) === 30) {
         const isDir = Number(element.elementType) === 30;
         return {
           type: "onlinefile",
           data: {
-            ...data,
-            msg_id: String(msg.msgId || ""),
-            element_id: String(element.elementId || ""),
-            is_dir: isDir,
             msgId: String(msg.msgId || ""),
             elementId: String(element.elementId || ""),
             fileName: String(file.fileName || ""),
@@ -5080,28 +5240,32 @@ class QQInstance {
     }
     if (element?.pttElement) {
       const ptt = element.pttElement;
+      const fileCode = String(ptt.fileName || randomUUID().replace(/-/g, ""));
       const data = {
-        file: String(ptt.fileName || ptt.fileUuid || ptt.filePath || ""),
-        file_id: String(ptt.fileUuid || element.elementId || ptt.fileName || ""),
+        file: fileCode,
         path: String(ptt.filePath || ""),
-        url: String(ptt.url || ""),
+        url: ptt.url || ptt.filePath ? String(ptt.url || ptt.filePath) : undefined,
         file_size: String(ptt.fileSize || ""),
-        duration: Number(ptt.duration || 0),
       };
-      this.rememberOneBotFile(ptt, data);
+      this.rememberOneBotFile(ptt, {
+        ...data,
+        file_id: fileCode,
+      });
       return { type: "record", data };
     }
     if (element?.videoElement) {
       const video = element.videoElement;
+      const fileCode = String(video.fileName || randomUUID().replace(/-/g, ""));
       const data = {
-        file: String(video.fileName || video.fileUuid || video.filePath || ""),
-        file_id: String(video.fileUuid || element.elementId || video.fileName || ""),
-        path: String(video.filePath || ""),
-        url: String(video.url || ""),
+        file: fileCode,
+        url: video.url || video.filePath ? String(video.url || video.filePath) : undefined,
         file_size: String(video.fileSize || ""),
-        duration: Number(video.fileTime || 0),
       };
-      this.rememberOneBotFile(video, data);
+      this.rememberOneBotFile(video, {
+        ...data,
+        file_id: fileCode,
+        path: String(video.filePath || ""),
+      });
       return { type: "video", data };
     }
     if (element?.faceElement) {
@@ -5119,6 +5283,7 @@ class QQInstance {
         type: "face",
         data: {
           id: String(face.faceIndex || ""),
+          raw: face,
           resultId: face.resultId === undefined ? undefined : String(face.resultId),
           chainCount: face.chainCount === undefined ? undefined : Number(face.chainCount),
         },
@@ -5133,120 +5298,48 @@ class QQInstance {
         ? "https://gxh.vip.qq.com/club/item/parcel/item/" + dir + "/" + emojiId + "/raw300.gif"
         : "";
       return { type: "image", data: {
-        file, url, summary: String(face.faceName || "[商城表情]"),
+        summary: String(face.faceName || "[商城表情]"), file, url,
         key: String(face.key || ""), emoji_id: emojiId,
         emoji_package_id: Number(face.emojiPackageId || 0),
       } };
     }
     if (element?.arkElement) {
       const content = String(element.arkElement.bytesData || "");
-      const forward = this.forwardArkData(content);
-      if (forward) {
-        return {
-          type: "forward",
-          data: {
-            id: String(toOneBotMessageId(nativeMessageKey(msg))),
-            res_id: String(forward.meta.detail.resid),
-          },
-        };
-      }
       return { type: "json", data: { data: content } };
     }
     if (element?.structLongMsgElement) {
-      return {
-        type: "xml",
-        data: {
-          data: String(element.structLongMsgElement.xmlContent || ""),
-          resid: String(element.structLongMsgElement.resId || ""),
-        },
-      };
+      return null;
     }
     if (element?.markdownElement) {
       const markdown = element.markdownElement;
       const fileSetId = String(markdown?.mdExtInfo?.flashTransferInfo?.filesetId || "");
-      if (fileSetId) return { type: "flashtransfer", data: { fileset_id: fileSetId, fileSetId } };
+      if (fileSetId) return { type: "flashtransfer", data: { fileSetId } };
       return { type: "markdown", data: { content: String(markdown.content || "") } };
     }
     if (element?.multiForwardMsgElement) {
-      const forward = element.multiForwardMsgElement;
       return {
         type: "forward",
         data: {
-          id: String(toOneBotMessageId(nativeMessageKey(msg))),
-          res_id: String(forward.resId || ""),
+          id: String(msg.msgId || nativeMessageKey(msg)),
         },
       };
     }
     if (element?.shareLocationElement) {
-      const location = element.shareLocationElement;
-      let ext = {};
-      try {
-        ext = JSON.parse(String(location.ext || "{}"));
-      } catch {
-      }
-      return {
-        type: "location",
-        data: {
-          lat: Number(ext.lat || ext.latitude || 0),
-          lon: Number(ext.lon || ext.lng || ext.longitude || 0),
-          title: String(ext.title || location.text || ""),
-          content: String(ext.content || ext.address || ""),
-        },
-      };
+      return null;
     }
     if (element?.walletElement) {
-      const title = String(element.walletElement?.receiver?.title || element.walletElement?.receiver?.notice || "").trim();
-      return { type: "text", data: { text: title ? "[QQ红包] " + title : "[QQ红包]" } };
+      return null;
     }
     return null;
   }
-  encodeCq(value) {
-    return String(value ?? "").replace(/&/g, "&amp;").replace(/\[/g, "&#91;").replace(/\]/g, "&#93;").replace(/,/g, "&#44;");
-  }
   toOneBotRawMessage(message) {
-    return Array.from(message || []).map((segment) => {
-      if (segment?.type === "text") return String(segment?.data?.text || "");
-      const data = Object.entries(segment?.data || {}).filter(([, value]) => value !== undefined).map(([key, value]) => {
-        const rendered = typeof value === "object" ? JSON.stringify(value) : String(value);
-        return key + "=" + this.encodeCq(rendered);
-      });
-      return "[CQ:" + String(segment?.type || "unknown") + (data.length ? "," + data.join(",") : "") + "]";
-    }).join("");
+    return encodeOneBotCqMessage(message);
   }
   async toOneBotEvent(msg) {
     const message = [];
-    const inlineKeyboard = [];
     for (const element of msg.elements || []) {
       const segment = await this.oneBotElement(element, msg);
       if (segment) message.push(segment);
-      const keyboard = element?.inlineKeyboardElement;
-      if (keyboard) {
-        for (const row of keyboard.rows || []) {
-          for (const button of row?.buttons || []) {
-            const findCallbackData = (value) => {
-              if (!value || typeof value !== "object") return "";
-              for (const child of Object.values(value)) {
-                if (typeof child === "string" && child.startsWith("BOT1.0_")) return child;
-              }
-              for (const child of Object.values(value)) {
-                const found = findCallbackData(child);
-                if (found) return found;
-              }
-              return "";
-            };
-            const callbackData = String(
-              findCallbackData(button) || button?.callback_data ||
-              button?.action?.callback_data || button?.action?.data || button?.data || ""
-            );
-            if (!callbackData.startsWith("BOT1.0_")) continue;
-            inlineKeyboard.push({
-              bot_appid: String(keyboard.botAppid || keyboard.bot_appid || ""),
-              button_id: String(button?.id || button?.button_id || button?.action?.button_id || "1"),
-              callback_data: callbackData
-            });
-          }
-        }
-      }
     }
     const chatType = Number(msg.chatType || 0);
     if (![1, 2, 100].includes(chatType)) return null;
@@ -5268,23 +5361,22 @@ class QQInstance {
       peerUin = await this.resolveUin(String(msg.peerUid));
     }
     if (chatType !== 1 && (!peerUin || peerUin === "0")) return null;
-    const messageId = toOneBotMessageId(nativeMessageKey(msg));
-    const isGroup = chatType === 2 || chatType === 100;
+    const messageId = toOneBotMessageId(nativeMessageKey(msg), msg);
+    const isGroup = chatType === 2;
+    const isTempGroup = chatType === 100;
     const isSelf = String(senderUin) === String(this.getSelfUin());
     const rawTime = Number(msg.msgTime || 0);
-    const event = {
-      time: rawTime > 1e10 ? Math.floor(rawTime / 1e3) : rawTime || Math.floor(Date.now() / 1e3),
-      self_id: this.getSelfUin(),
-      post_type: isSelf ? "message_sent" : "message",
+    const event = createOneBotEvent(this.getSelfUin(), isSelf ? "message_sent" : "message", {
+      time: Number.parseInt(String(rawTime), 10) || Date.now(),
       message_type: isGroup ? "group" : "private",
-      sub_type: chatType === 100 ? "group" : isGroup ? "normal" : "friend",
+      sub_type: isTempGroup ? "group" : isGroup ? "normal" : "friend",
       message_id: messageId,
-      real_id: String(msg.msgSeq || ""),
+      message_seq: messageId,
+      real_id: messageId,
       real_seq: String(msg.msgSeq || ""),
-      message_seq: Number(msg.msgSeq || 0),
       user_id: Number(senderUin) || senderUin || 0,
       message,
-      raw_message: this.toOneBotRawMessage(message),
+      raw_message: this.toOneBotRawMessage(message).trim(),
       message_format: "array",
       message_sent_type: isSelf ? "self" : undefined,
       font: 14,
@@ -5292,20 +5384,20 @@ class QQInstance {
         user_id: Number(senderUin) || senderUin || 0,
         nickname: this.displayText(msg.sendNickName) || this.displayText(msg.sendMemberName),
         card: this.displayText(msg.sendMemberName),
-        sex: String(msg.sex || "unknown"),
-        age: Number(msg.age || 0),
-        role: Number(msg.roleType) === 4 ? "owner" : Number(msg.roleType) === 3 ? "admin" : "member",
-        title: String(msg.memberSpecialTitle || ""),
+        ...(isGroup ? {
+          role: Number(msg.roleType) === 4 ? "owner" : Number(msg.roleType) === 3 ? "admin" : "member",
+        } : {}),
       },
-      _peer_uid: String(msg.peerUid || ""),
-      _chat_type: chatType,
-    };
-    if (isGroup) {
+    });
+    if (isGroup || isTempGroup) {
       event.group_id = Number(peerUin) || peerUin;
-      event.group_name = this.displayText(msg.peerName) || this.displayText(msg.groupName);
-      if (chatType === 100) event.temp_source = 0;
+      if (isGroup) event.group_name = this.displayText(msg.peerName) || this.displayText(msg.groupName);
+      else event.temp_source = 0;
     }
-    if (inlineKeyboard.length) event._elaina_inline_keyboard = inlineKeyboard;
+    if (isSelf || !isGroup) {
+      const target = Number.parseInt(String(msg.peerUin || ""), 10);
+      event.target_id = Number.isFinite(target) ? target : Number(msg.peerUin) || msg.peerUin;
+    }
     return event;
   }
 }
