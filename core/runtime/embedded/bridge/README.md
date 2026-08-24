@@ -22,6 +22,7 @@
 | `elainaqq-runtime.mjs` | 运行时入口，加载 QQNT 包装器、维护账号会话并与 Python 管理器通信 |
 | `onebot_action_contract.mjs` | OneBot 动作契约与动作名称处理 |
 | `onebot_message.mjs` | 消息段转换与消息发送辅助 |
+| `inline_keyboard.mjs` | QQNT 内联键盘元素与官方机器人回调参数规范化 |
 | `onebot_data.mjs` | OneBot 数据结构转换 |
 | `onebot_packet.mjs` | 原始数据包相关处理 |
 | `packet_backend.mjs` | 原始发包后端选择与加载 |

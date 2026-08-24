@@ -500,14 +500,14 @@ class OneBotAPI:
     ) -> list[dict[str, str]]:
         """Read an official-bot keyboard from a group message via raw protobuf."""
         sequence = real_seq
+        detail = await self.call_api('get_msg', {'message_id': message_id})
+        data = detail.get('data') if isinstance(detail, dict) else None
+        if not isinstance(data, dict):
+            data = detail if isinstance(detail, dict) else {}
+        embedded = data.get('_elaina_inline_keyboard')
+        if isinstance(embedded, list) and embedded:
+            return [item for item in embedded if isinstance(item, dict)]
         if not sequence:
-            detail = await self.call_api('get_msg', {'message_id': message_id})
-            data = detail.get('data') if isinstance(detail, dict) else None
-            if not isinstance(data, dict):
-                data = detail if isinstance(detail, dict) else {}
-            embedded = data.get('_elaina_inline_keyboard')
-            if isinstance(embedded, list) and embedded:
-                return [item for item in embedded if isinstance(item, dict)]
             sequence = data.get('real_seq') or data.get('message_seq')
         if not sequence:
             return []
@@ -519,8 +519,12 @@ class OneBotAPI:
             'cmd': GROUP_MESSAGE_COMMAND,
             'data': packet,
         })
-        if not isinstance(response, dict) or response.get('status') == 'failed':
-            return []
+        if not isinstance(response, dict):
+            raise RuntimeError('send_packet 未返回 OneBot 响应')
+        if response.get('status') == 'failed':
+            raise RuntimeError(
+                str(response.get('message') or response.get('wording') or 'send_packet 读取消息 PB 失败')
+            )
         return extract_inline_keyboard_buttons(response, bot_appid=str(bot_appid or ''))
 
     async def get_login_info(self) -> dict | None:

@@ -68,12 +68,56 @@ export function normalizePacketRequest(params = {}) {
   return { cmd, data: Buffer.from(hex, "hex"), rsp: asOneBotBoolean(params.rsp, true) };
 }
 
-function responseBytes(result) {
-  if (Buffer.isBuffer(result) || result instanceof Uint8Array) return Buffer.from(result);
-  if (!result || typeof result !== "object") return null;
-  for (const value of [result.rspbuffer, result.rspBuffer, result.rsp, result.data, result.body, result.payload, result.buffer]) {
-    if (Buffer.isBuffer(value) || value instanceof Uint8Array) return Buffer.from(value);
-    if (value?.type === "Buffer" && Array.isArray(value.data)) return Buffer.from(value.data);
+function bytesLike(value) {
+  if (!value || typeof value !== "object") return null;
+  try {
+    if (Buffer.isBuffer(value)) return Buffer.from(value);
+    if (ArrayBuffer.isView(value)) {
+      return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    }
+    const objectTag = Object.prototype.toString.call(value);
+    if (objectTag === "[object ArrayBuffer]" || objectTag === "[object SharedArrayBuffer]") {
+      return Buffer.from(value);
+    }
+    if (value.type === "Buffer" && Array.isArray(value.data)) {
+      return Buffer.from(value.data);
+    }
+    if (Array.isArray(value) && value.every((item) => Number.isInteger(item) && item >= 0 && item <= 255)) {
+      return Buffer.from(value);
+    }
+    if (Number.isInteger(value.length) && value.length >= 0 && value.length <= 32 * 1024 * 1024) {
+      const data = Array.from({ length: value.length }, (_, index) => value[index]);
+      if (data.every((item) => Number.isInteger(item) && item >= 0 && item <= 255)) {
+        return Buffer.from(data);
+      }
+    }
+  } catch {
+  }
+  return null;
+}
+
+function responseBytes(result, depth = 0) {
+  const direct = bytesLike(result);
+  if (direct) return direct;
+  if (!result || typeof result !== "object" || depth >= 4) return null;
+  for (const key of ["rspbuffer", "rspBuffer", "rsp", "data", "body", "payload", "buffer", "response"]) {
+    if (!(key in result)) continue;
+    const found = responseBytes(result[key], depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+function responseHex(result, depth = 0) {
+  if (typeof result === "string") {
+    const value = result.trim().replace(/^0x/i, "");
+    return /^(?:[0-9a-fA-F]{2})+$/.test(value) ? value : null;
+  }
+  if (!result || typeof result !== "object" || depth >= 4) return null;
+  for (const key of ["rspbuffer", "rspBuffer", "rsp", "data", "body", "payload", "buffer", "response"]) {
+    if (!(key in result)) continue;
+    const found = responseHex(result[key], depth + 1);
+    if (found !== null) return found;
   }
   return null;
 }
@@ -84,11 +128,11 @@ export function normalizePacketResponse(result, waitForResponse = true) {
   if (!waitForResponse || result === undefined || result === null) return undefined;
 
   const bytes = responseBytes(result);
-  if (bytes) return bytes.toString("hex");
-  if (typeof result === "string") return result;
-  if (result && typeof result === "object") {
-    const value = [result.rsp, result.data].find((item) => typeof item === "string");
-    return value || undefined;
+  if (bytes?.length) return bytes.toString("hex");
+  const hex = responseHex(result);
+  if (hex) return hex;
+  if (bytes || hex === "") {
+    throw new OneBotActionError("原始发包响应正文为空", 1500, "send_packet");
   }
-  return undefined;
+  throw new OneBotActionError("原始发包未返回可识别的响应正文", 1500, "send_packet");
 }

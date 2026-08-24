@@ -16,6 +16,7 @@ import {
   SessionListener
 } from './session_adapters.mjs';
 import { IncomingMessageGate } from './message_gate.mjs';
+import { extractInlineKeyboardButtons } from './inline_keyboard.mjs';
 import { nativeMessageKey, resolveReplyReference, toOneBotMessageId } from './message_identity.mjs';
 import { asOneBotBoolean, encodeOneBotCqMessage, normalizeOneBotMessage, oneBotTextSegment } from './onebot_message.mjs';
 import { createHeartbeatEvent, createLifecycleEvent, createOneBotEvent } from './onebot_event.mjs';
@@ -5389,6 +5390,8 @@ class QQInstance {
         } : {}),
       },
     });
+    const inlineKeyboard = extractInlineKeyboardButtons(msg.elements);
+    if (inlineKeyboard.length) event._elaina_inline_keyboard = inlineKeyboard;
     if (isGroup || isTempGroup) {
       event.group_id = Number(peerUin) || peerUin;
       if (isGroup) event.group_name = this.displayText(msg.peerName) || this.displayText(msg.groupName);
