@@ -488,6 +488,14 @@ class EmbeddedQQManager:
             os.environ.get('ELAINAQQ_PACKET_OFFSETS_PATH')
             or cfg.get('settings', 'embedded_qq.packet_offsets_path', '')
         )
+        configured_event_native = (
+            os.environ.get('ELAINAQQ_PACKET_EVENT_NATIVE_PATH')
+            or cfg.get('settings', 'embedded_qq.packet_event_native_path', '')
+        )
+        configured_event_offsets = (
+            os.environ.get('ELAINAQQ_PACKET_EVENT_OFFSETS_PATH')
+            or cfg.get('settings', 'embedded_qq.packet_event_offsets_path', '')
+        )
         native_path = Path(str(configured_native)) if configured_native else (
             napcat_root
             / 'packages'
@@ -498,14 +506,32 @@ class EmbeddedQQManager:
         offsets_path = Path(str(configured_offsets)) if configured_offsets else (
             napcat_root / 'packages' / 'napcat-core' / 'external' / 'napi2native.json'
         )
+        event_native_path = Path(str(configured_event_native)) if configured_event_native else (
+            napcat_root
+            / 'packages'
+            / 'napcat-native'
+            / 'packet'
+            / f'MoeHoo.{platform_name}.{arch}.node'
+        )
+        event_offsets_path = Path(str(configured_event_offsets)) if configured_event_offsets else (
+            napcat_root / 'packages' / 'napcat-core' / 'external' / 'packet.json'
+        )
         if configured_native and not native_path.is_absolute():
             native_path = self._base_dir / native_path
         if configured_offsets and not offsets_path.is_absolute():
             offsets_path = self._base_dir / offsets_path
+        if configured_event_native and not event_native_path.is_absolute():
+            event_native_path = self._base_dir / event_native_path
+        if configured_event_offsets and not event_offsets_path.is_absolute():
+            event_offsets_path = self._base_dir / event_offsets_path
         if native_path.is_file():
             result['ELAINAQQ_PACKET_NATIVE_PATH'] = str(native_path.resolve())
         if offsets_path.is_file():
             result['ELAINAQQ_PACKET_OFFSETS_PATH'] = str(offsets_path.resolve())
+        if event_native_path.is_file():
+            result['ELAINAQQ_PACKET_EVENT_NATIVE_PATH'] = str(event_native_path.resolve())
+        if event_offsets_path.is_file():
+            result['ELAINAQQ_PACKET_EVENT_OFFSETS_PATH'] = str(event_offsets_path.resolve())
         return result
 
     def _env(

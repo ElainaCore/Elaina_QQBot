@@ -7,11 +7,17 @@ function withoutUndefined(value) {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined));
 }
 
+export function normalizeOneBotTimestamp(value, fallback = Math.floor(Date.now() / 1000)) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return Math.floor(Number(fallback));
+  return Math.floor(numeric > 100_000_000_000 ? numeric / 1000 : numeric);
+}
+
 /** Build the wire-level event shape used by NapCat OneBot 11. */
 export function createOneBotEvent(selfId, postType, fields = {}) {
   const { time, ...payload } = fields;
   return withoutUndefined({
-    time: time ?? Math.floor(Date.now() / 1000),
+    time: normalizeOneBotTimestamp(time),
     self_id: oneBotId(selfId),
     post_type: postType,
     ...payload,

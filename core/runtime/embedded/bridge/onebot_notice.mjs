@@ -115,6 +115,43 @@ function parseProfileLike(content) {
   };
 }
 
+const GROUP_INCREASE_NOTIFY_TYPES = new Set([4, 5, 6, 7]);
+
+/** Build a recent-member candidate from QQNT's accepted group request notice. */
+export function groupIncreaseCandidateFromNotify(notify, observedAt = Date.now()) {
+  const type = Number(notify?.type || 0);
+  const status = Number(notify?.status || 0);
+  const groupId = String(notify?.group?.groupCode || notify?.groupCode || "");
+  const memberUid = String(notify?.user1?.uid || "");
+  const operatorUid = String(notify?.actionUser?.uid || notify?.user2?.uid || "");
+  if (!GROUP_INCREASE_NOTIFY_TYPES.has(type) || status !== 2 || !groupId || !memberUid) return null;
+  return {
+    groupId,
+    memberUid,
+    operatorUid,
+    type,
+    observedAt: Number(observedAt) || Date.now(),
+    seq: String(notify?.seq || ""),
+  };
+}
+
+/** Return a candidate only when the recent notices identify one unique member. */
+export function findGroupIncreaseCandidate(candidates, groupId, operatorUid = "", now = Date.now(), maxAge = 10000) {
+  const group = String(groupId || "");
+  const operator = String(operatorUid || "");
+  const cutoff = Number(now) - Math.max(0, Number(maxAge) || 0);
+  const matches = Array.from(candidates || []).filter((candidate) => {
+    if (!candidate || String(candidate.groupId || "") !== group) return false;
+    if (operator && String(candidate.operatorUid || "") !== operator) return false;
+    return Number(candidate.observedAt || 0) >= cutoff;
+  });
+  const members = new Set(matches.map((candidate) => String(candidate.memberUid || "")).filter(Boolean));
+  if (members.size !== 1) return null;
+  return matches
+    .filter((candidate) => String(candidate.memberUid || "") === members.values().next().value)
+    .sort((left, right) => Number(right.observedAt || 0) - Number(left.observedAt || 0))[0] || null;
+}
+
 /** Decode the OneBot event-bearing branches handled by NapCat's onRecvSysMsg. */
 export function decodeNapCatSystemNotice(payload) {
   const root = decodeProtoFields(payload);
@@ -158,6 +195,13 @@ export function decodeNapCatSystemNotice(payload) {
       sub_type: enabled ? "set" : "unset",
     };
   }
+  if (type === 87 && msgContent.length) {
+    const invite = decodeProtoFields(msgContent);
+    return {
+      post_type: "request", request_type: "group", sub_type: "invite",
+      group_id: integer(invite, 1), inviter_uid: string(invite, 5),
+    };
+  }
   if (type === 528 && subType === 39 && msgContent.length) return parseProfileLike(msgContent);
   if (type === 166 && c2cCmd === 133 && msgContent.length > 17) {
     const mainCmd = msgContent[15];
@@ -187,7 +231,48 @@ export function parseEmojiLikeGrayTip(content) {
   const senderUin = xmlAttribute(content, "qq", "jp");
   const messageSeq = xmlAttribute(content, "url", "msgseq");
   const emojiId = xmlAttribute(content, "face", "id");
-  return senderUin && messageSeq && emojiId ? { senderUin, messageSeq, emojiId } : null;
+  return senderUin && messageSeq && emojiId
+    ? { senderUin, messageSeq, emojiId, count: 1, isAdd: true }
+    : null;
+}
+
+/** Decode NapCat's raw OlPush group-reaction packet without a protobuf dependency. */
+export function parseGroupReactionPacket(payload) {
+  try {
+    const packet = typeof payload === "string"
+      ? Buffer.from(payload, "hex")
+      : asBuffer(payload);
+    if (!packet.length) return null;
+
+    const push = decodeProtoFields(packet);
+    const message = nested(push, 1);
+    const contentHead = nested(message, 2);
+    if (Number(integer(contentHead, 1)) !== 732 || Number(integer(contentHead, 2)) !== 16) return null;
+
+    const msgContent = bytes(nested(message, 3), 2);
+    if (msgContent.length <= 7) return null;
+    const notify = decodeProtoFields(msgContent.subarray(7));
+    if (Number(integer(notify, 13)) !== 35) return null;
+
+    const reactionData = nested(nested(nested(notify, 44), 1), 1);
+    const target = nested(reactionData, 2);
+    const content = nested(reactionData, 3);
+    const groupId = String(integer(notify, 4, "") || "");
+    const operatorUid = string(content, 4);
+    const messageSeq = String(integer(target, 1, "") || "");
+    const emojiId = string(content, 1);
+    if (!groupId || !operatorUid || !messageSeq || !emojiId) return null;
+    return {
+      groupId,
+      operatorUid,
+      messageSeq,
+      emojiId,
+      count: content.has(3) ? Number(integer(content, 3)) : 1,
+      isAdd: Number(integer(content, 5)) === 1,
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function parseEssenceGrayTip(jsonValue) {
@@ -207,4 +292,35 @@ export function parseEssenceGrayTip(jsonValue) {
   } catch {
     return null;
   }
+}
+
+export function parseGroupInviteArk(message, selfUin = "") {
+  if (Number(message?.msgType || 0) !== 11) return null;
+  const ark = Array.from(message?.elements || []).find((element) => element?.arkElement)?.arkElement;
+  if (!ark?.bytesData) return null;
+  try {
+    const data = typeof ark.bytesData === "string" ? JSON.parse(ark.bytesData) : ark.bytesData;
+    const jump = String(data?.meta?.news?.jumpUrl || "");
+    if (!jump) return null;
+    const url = new URL(jump, "https://qun.qq.com/");
+    const groupId = url.searchParams.get("groupcode") || url.searchParams.get("groupCode") || "";
+    const receiverUin = url.searchParams.get("receiveruin") || url.searchParams.get("receiverUin") || "";
+    const flag = url.searchParams.get("msgseq") || url.searchParams.get("msgSeq") || "";
+    const inviterUid = String(message?.senderUid || "");
+    if (!groupId || !flag || !inviterUid || (selfUin && receiverUin !== String(selfUin))) return null;
+    return { groupId, inviterUid, receiverUin, flag };
+  } catch {
+    return null;
+  }
+}
+
+export function isThirdPartyGroupIncreaseGrayTip(jsonValue) {
+  let data;
+  try {
+    data = typeof jsonValue === "string" ? JSON.parse(jsonValue) : jsonValue;
+  } catch {
+    return false;
+  }
+  const items = Array.from(data?.items || []);
+  return items.length === 1 && String(items[0]?.txt || "").endsWith("加入群");
 }

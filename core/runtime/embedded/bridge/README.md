@@ -45,8 +45,19 @@
 | `ELAINAQQ_DATA_DIR` | 当前账号的独立数据目录 |
 | `ELAINAQQ_HEADLESS` | 是否使用无界面运行方式 |
 | `ELAINAQQ_ONEBOT_ACTIONS` | 框架登记的动作名称列表 |
+| `ELAINAQQ_PACKET_NATIVE_PATH` | NapCat `napi2native` 原生模块路径 |
+| `ELAINAQQ_PACKET_OFFSETS_PATH` | 与当前 QQ 构建匹配的收发包偏移表路径 |
+| `ELAINAQQ_PACKET_EVENT_NATIVE_PATH` | NapCat `MoeHoo` 原始包事件模块路径 |
+| `ELAINAQQ_PACKET_EVENT_OFFSETS_PATH` | NapCat 原始包事件偏移表 `packet.json` 路径 |
 
 Windows 下，框架还会为每个账号设置独立的 `APPDATA`、`LOCALAPPDATA` 和 `USERPROFILE`。Linux 下可能附加数据包后端和资源控制相关环境变量。
+
+原始发包后端遵循 NapCat 的两阶段初始化顺序：QQ session 创建前加载
+`napi2native` 并启用 native bypass，session 初始化完成后再安装版本对应的
+收发包 Hook。两步不能合并到 session 初始化之后，否则 QQ 原生接口会把
+protobuf Buffer 当成普通请求体解析并返回 `request body decode failed`。
+`MoeHoo` 事件观察器仅在 `packet.json` 含当前 QQ 构建的安全偏移时启用；
+缺少偏移时会自动降级，不影响登录和普通 QQNT 回调事件。
 
 ---
 

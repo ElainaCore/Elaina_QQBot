@@ -38,6 +38,38 @@ export function extractNativeMemberMap(result) {
   return undefined;
 }
 
+/** Normalize the one-object and legacy multi-argument member-list callbacks used by QQNT. */
+export function normalizeNativeMemberListCallback(args, fallbackGroupId = "") {
+  const values = Array.from(args || []);
+  const first = values[0];
+  const payload = first && typeof first === "object" && !Array.isArray(first) && !(first instanceof Map)
+    ? first
+    : null;
+  const groupId = String(
+    payload?.groupCode || payload?.groupId || payload?.sceneId ||
+    (["string", "number", "bigint"].includes(typeof first) ? first : "") || fallbackGroupId || "",
+  );
+  const infos = extractNativeMemberMap(payload) ?? values[1] ??
+    (first instanceof Map || Array.isArray(first) ? first : undefined);
+  return { groupId, infos, payload };
+}
+
+/** Return a member only when two complete snapshots contain one unambiguous addition. */
+export function findAddedGroupMember(previous, current) {
+  const oldIds = new Set();
+  for (const member of previous?.values?.() || []) {
+    if (member?.uid) oldIds.add("uid:" + String(member.uid));
+    if (member?.uin && String(member.uin) !== "0") oldIds.add("uin:" + String(member.uin));
+  }
+  const added = [];
+  for (const member of current?.values?.() || []) {
+    const known = (member?.uid && oldIds.has("uid:" + String(member.uid))) ||
+      (member?.uin && String(member.uin) !== "0" && oldIds.has("uin:" + String(member.uin)));
+    if (!known) added.push(member);
+  }
+  return added.length === 1 ? added[0] : null;
+}
+
 export function oneBotGroup(group, fallbackId = "") {
   const groupId = group?.groupCode ?? group?.group_id ?? group?.groupId ?? fallbackId;
   return {

@@ -19,10 +19,15 @@ export class NativePacketBackend {
     this.logger = logger;
     this.available = false;
     this.reason = "尚未初始化";
+    this.nativeModule = null;
+    this.offsets = null;
+    this.loaded = false;
+    this.bypassEnabled = false;
   }
 
-  init() {
-    if (["off", "false", "0", "disabled"].includes(this.mode)) {
+  load() {
+    if (this.loaded) return true;
+    if (["off", "false", "0", "disable", "disabled"].includes(this.mode)) {
       this.reason = "配置已禁用原始发包后端";
       return false;
     }
@@ -36,6 +41,37 @@ export class NativePacketBackend {
       this.reason = "未找到 napi2native 原生模块";
       return false;
     }
+
+    try {
+      this.nativeModule = { exports: {} };
+      process.dlopen(this.nativeModule, this.nativePath, constants.dlopen.RTLD_LAZY);
+      this.loaded = true;
+      const enableAllBypasses = this.nativeModule.exports?.enableAllBypasses;
+      if (typeof enableAllBypasses === "function") {
+        this.bypassEnabled = Boolean(enableAllBypasses({
+          hook: true,
+          window: true,
+          module: true,
+          process: true,
+          container: true,
+          js: true,
+        }));
+      }
+      this.reason = "原始发包 Hook 尚未安装";
+      this.logger(
+        "napi2native 已加载，native bypass " +
+        (this.bypassEnabled ? "已启用" : "未启用或当前 addon 不支持")
+      );
+      return true;
+    } catch (error) {
+      this.reason = "加载 napi2native 失败: " + (error?.message || error);
+      this.loaded = false;
+      return false;
+    }
+  }
+
+  initHook() {
+    if (!this.loaded && !this.load()) return false;
     if (!this.offsetsPath || !fs.existsSync(this.offsetsPath)) {
       this.reason = "未找到 napi2native 版本偏移表";
       return false;
@@ -56,9 +92,7 @@ export class NativePacketBackend {
     }
 
     try {
-      const nativeModule = { exports: {} };
-      process.dlopen(nativeModule, this.nativePath, constants.dlopen.RTLD_LAZY);
-      const initHook = nativeModule.exports?.initHook;
+      const initHook = this.nativeModule?.exports?.initHook;
       if (typeof initHook !== "function") {
         this.reason = "napi2native 模块缺少 initHook";
         return false;
@@ -67,23 +101,32 @@ export class NativePacketBackend {
         this.reason = "napi2native Hook 初始化失败: " + key;
         return false;
       }
+      this.offsets = { send: String(offsets.send), recv: String(offsets.recv) };
       this.available = true;
       this.reason = "";
       this.logger("原始发包 Hook 初始化成功: " + key);
       return true;
     } catch (error) {
-      this.reason = "加载 napi2native 失败: " + (error?.message || error);
+      this.reason = "初始化 napi2native Hook 失败: " + (error?.message || error);
       return false;
     }
+  }
+
+  init() {
+    return this.load() && this.initHook();
   }
 
   status() {
     return {
       enabled: this.available,
       available: this.available,
+      loaded: this.loaded,
+      bypass_enabled: this.bypassEnabled,
+      hook_initialized: this.available,
       backend: "native",
       version: this.version,
       arch: process.arch,
+      offsets: this.offsets,
       reason: this.reason,
     };
   }

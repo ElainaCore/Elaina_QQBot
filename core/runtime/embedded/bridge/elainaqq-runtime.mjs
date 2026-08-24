@@ -20,14 +20,25 @@ import { extractInlineKeyboardButtons } from './inline_keyboard.mjs';
 import { nativeMessageKey, resolveReplyReference, toOneBotMessageId } from './message_identity.mjs';
 import { asOneBotBoolean, encodeOneBotCqMessage, normalizeOneBotMessage, oneBotTextSegment } from './onebot_message.mjs';
 import { createHeartbeatEvent, createLifecycleEvent, createOneBotEvent } from './onebot_event.mjs';
-import { decodeNapCatSystemNotice, parseEmojiLikeGrayTip, parseEssenceGrayTip } from './onebot_notice.mjs';
+import {
+  decodeNapCatSystemNotice,
+  findGroupIncreaseCandidate,
+  groupIncreaseCandidateFromNotify,
+  isThirdPartyGroupIncreaseGrayTip,
+  parseEmojiLikeGrayTip,
+  parseEssenceGrayTip,
+  parseGroupReactionPacket,
+  parseGroupInviteArk,
+} from './onebot_notice.mjs';
 import { buildGroupSpecialTitlePacket, normalizePacketRequest, normalizePacketResponse } from './onebot_packet.mjs';
 import { NativePacketBackend } from './packet_backend.mjs';
+import { NativePacketEventBackend } from './packet_event_backend.mjs';
 import {
   collectionValues,
   extractNativeGroupDetail,
   extractNativeGroupList,
   extractNativeMemberMap,
+  findAddedGroupMember,
   groupAddOptionRequest,
   groupManagementRequests,
   groupRobotOptionRequest,
@@ -35,6 +46,7 @@ import {
   oneBotFriend,
   oneBotGroup,
   oneBotGroupMember,
+  normalizeNativeMemberListCallback,
 } from './onebot_data.mjs';
 import {
   ONEBOT_ACTIONS,
@@ -413,6 +425,7 @@ class QQInstance {
   incomingMessageGate = null;
   incomingMessageTail = Promise.resolve();
   packetBackend = null;
+  packetEventBackend = null;
   statusCallback = null;
   oneBotEventCallback = null;
   redPacketCallback = null;
@@ -423,6 +436,11 @@ class QQInstance {
   oneBotNoticeKeys = /* @__PURE__ */ new Map();
   oneBotGroupCards = /* @__PURE__ */ new Map();
   oneBotGroupOperators = /* @__PURE__ */ new Map();
+  oneBotGroupIncreaseCandidates = /* @__PURE__ */ new Map();
+  oneBotGroupInviteArks = /* @__PURE__ */ new Map();
+  oneBotGroupInviteRequests = /* @__PURE__ */ new Map();
+  oneBotGroupMemberSnapshots = /* @__PURE__ */ new Map();
+  oneBotUidToUin = /* @__PURE__ */ new Map();
   oneBotHeartbeatTimer = null;
   pendingSentMessages = /* @__PURE__ */ new Set();
   pendingNativeEvents = /* @__PURE__ */ new Map();
@@ -464,6 +482,29 @@ class QQInstance {
       log(id, "dataPath:", dataPath, "dataPathGlobal:", dataPathGlobal);
       const platformType = this.getPlatformType();
       log(id, "平台:", platformType, "版本:", this.qqInfo.version, "appid:", this.qqInfo.appid, "qua:", this.qqInfo.qua);
+      // 与 NapCat 一致：先加载 napi2native 并启用 bypass，再创建 QQ session。
+      // initHook 必须等 session 初始化完成后再安装。
+      this.packetBackend = new NativePacketBackend({
+        version: this.qqInfo.version,
+        nativePath: process.env["ELAINAQQ_PACKET_NATIVE_PATH"],
+        offsetsPath: process.env["ELAINAQQ_PACKET_OFFSETS_PATH"],
+        mode: process.env["ELAINAQQ_PACKET_BACKEND"],
+        logger: (message) => log(id, "[PACKET]", message),
+      });
+      if (!this.packetBackend.load()) {
+        log(id, "[PACKET]", this.packetBackend.status().reason);
+      }
+      this.packetEventBackend = new NativePacketEventBackend({
+        version: this.qqInfo.version,
+        nativePath: process.env["ELAINAQQ_PACKET_EVENT_NATIVE_PATH"],
+        offsetsPath: process.env["ELAINAQQ_PACKET_EVENT_OFFSETS_PATH"],
+        mode: process.env["ELAINAQQ_PACKET_BACKEND"],
+        logger: (message) => log(id, "[PACKET EVENT]", message),
+        onPacket: (packet) => this.handlePacketEvent(packet),
+      });
+      if (!this.packetEventBackend.init()) {
+        log(id, "[PACKET EVENT]", this.packetEventBackend.status().reason);
+      }
       log(id, "步骤1: 初始化 O3MiscService...");
       try {
         this.o3Service = this.wrapper.NodeIO3MiscService.get();
@@ -528,20 +569,15 @@ class QQInstance {
       log(id, "步骤5: 初始化 session...");
       await this.initSession(dataPath);
       log(id, "session 初始化完成");
-      this.packetBackend = new NativePacketBackend({
-        version: this.qqInfo.version,
-        nativePath: process.env["ELAINAQQ_PACKET_NATIVE_PATH"],
-        offsetsPath: process.env["ELAINAQQ_PACKET_OFFSETS_PATH"],
-        mode: process.env["ELAINAQQ_PACKET_BACKEND"],
-        logger: (message) => log(id, "[PACKET]", message),
-      });
-      this.packetBackend.init();
-      if (!this.packetBackend.available) {
+      if (!this.packetBackend.initHook()) {
         log(id, "[PACKET]", this.packetBackend.status().reason);
       }
       log(id, "步骤6: 注册消息监听...");
       this.registerMsgListener();
       this.registerEventListeners();
+      this.initializeGroupMemberSnapshots().catch((error) => {
+        logErr(id, "[EVENT] 初始化群成员快照失败:", error?.message || error);
+      });
       this.botConfig.uin = this.selfInfo.uin;
       this.botConfig.nickname = this.selfInfo.nick || this.selfInfo.uin;
       botUinMap.set(this.botConfig.id, this.selfInfo.uin);
@@ -703,7 +739,13 @@ class QQInstance {
       this.groupListenerHandle = null;
       this.incomingMessageGate = null;
       this.incomingMessageTail = Promise.resolve();
+      this.oneBotGroupIncreaseCandidates.clear();
+      this.oneBotGroupInviteArks.clear();
+      this.oneBotGroupInviteRequests.clear();
+      this.oneBotGroupMemberSnapshots.clear();
+      this.oneBotUidToUin.clear();
       this.packetBackend = null;
+      this.packetEventBackend = null;
       this.cleanOneBotStreams();
       if (this.startupSession && typeof this.startupSession.stop === "function") {
         try {
@@ -880,8 +922,9 @@ class QQInstance {
         return this.setDoubtFriendRequest(params);
       case "get_group_system_msg":
       case "get_group_ignored_notifies":
-      case "get_group_ignore_add_request":
         return this.getGroupRequests(params);
+      case "get_group_ignore_add_request":
+        return this.getIgnoredGroupAddRequests(params);
       case "set_group_add_request":
         await this.setGroupAddRequest(params);
         return null;
@@ -1517,31 +1560,45 @@ class QQInstance {
     uid = String(uid || "");
     if (!uid) return "0";
     if (/^[1-9]\d*$/.test(uid)) return uid;
+    const cached = this.oneBotUidToUin.get(uid);
+    if (cached) return cached;
     try {
       const converted = await this.session?.getUixConvertService?.().getUin([uid]);
       const uin = converted?.uinInfo?.get?.(uid);
-      if (uin && String(uin) !== "0") return String(uin);
+      if (uin && String(uin) !== "0") return this.rememberUin(uid, uin);
     } catch {
     }
     try {
       const converted = await this.session?.getProfileService?.().getUinByUid("FriendsServiceImpl", [uid]);
       const uin = converted?.get?.(uid);
-      if (uin && String(uin) !== "0") return String(uin);
+      if (uin && String(uin) !== "0") return this.rememberUin(uid, uin);
     } catch {
     }
     try {
       const converted = await this.session?.getGroupService?.().getUinByUids?.([uid]);
       const uin = converted?.uins?.get?.(uid);
-      if (uin && String(uin) !== "0") return String(uin);
+      if (uin && String(uin) !== "0") return this.rememberUin(uid, uin);
     } catch {
     }
     try {
       const detail = await this.session?.getProfileService?.().getUserDetailInfo?.(uid);
       const uin = detail?.uin || detail?.detail?.uin || detail?.data?.uin || detail?.data?.detail?.uin;
-      if (uin && String(uin) !== "0") return String(uin);
+      if (uin && String(uin) !== "0") return this.rememberUin(uid, uin);
     } catch {
     }
     return "0";
+  }
+  rememberUin(uid, uin) {
+    const normalizedUid = String(uid || "");
+    const normalizedUin = String(uin || "");
+    if (!normalizedUid || !normalizedUin || normalizedUin === "0") return "0";
+    if (!/^[1-9]\d*$/.test(normalizedUid)) {
+      this.oneBotUidToUin.set(normalizedUid, normalizedUin);
+      while (this.oneBotUidToUin.size > 20000) {
+        this.oneBotUidToUin.delete(this.oneBotUidToUin.keys().next().value);
+      }
+    }
+    return normalizedUin;
   }
   async deleteFriend(params) {
     const uid = await this.resolveUid(String(params.user_id));
@@ -1638,40 +1695,52 @@ class QQInstance {
     const notifies = waited.direct !== null ? this.groupRequestList(waited.direct) : collectionValues(waited.args[2]);
     return notifies.map((notify) => ({ ...notify, _doubt: doubt }));
   }
-  groupRequestToOneBot(notify) {
+  async groupRequestToOneBot(notify) {
     const groupId = String(notify?.group?.groupCode || notify?.groupCode || "");
+    const requestId = String(notify?.seq || notify?.flag || "");
+    const [invitorUin, actorUin] = await Promise.all([
+      this.resolveUin(String(notify?.user1?.uid || "")),
+      this.resolveUin(String(notify?.user2?.uid || notify?.actionUser?.uid || "")),
+    ]);
     return {
-      request_id: String(notify?.seq || notify?.flag || ""),
-      invitor_uin: Number(notify?.user2?.uin || 0),
-      invitor_nick: String(notify?.user2?.nickName || ""),
+      request_id: Number(requestId) || requestId,
+      invitor_uin: Number(invitorUin) || invitorUin || 0,
+      invitor_nick: String(notify?.user1?.nickName || ""),
       group_id: Number(groupId) || groupId,
       group_name: String(notify?.group?.groupName || ""),
-      checked: Number(notify?.status || 0) !== 0,
-      actor: Number(notify?.actionUser?.uin || 0),
-      requester_uid: String(notify?.user1?.uid || notify?.actionUser?.uid || notify?.userUid || ""),
+      checked: Number(notify?.status || 0) !== 1,
+      actor: Number(actorUin) || actorUin || 0,
+      requester_nick: String(notify?.user1?.nickName || ""),
       message: String(notify?.postscript || ""),
-      flag: String(notify?.seq || notify?.flag || ""),
-      sub_type: notify?.invitationExt ? "invite" : "add",
+      flag: requestId,
     };
   }
   async getGroupRequests(params = {}) {
-    const [normal, doubtful] = await Promise.all([
-      this.loadGroupRequests(false, params),
-      this.loadGroupRequests(true, params),
-    ]);
-    const requests = [...normal, ...doubtful];
+    const requests = await this.loadGroupRequests(false, params);
+    const invited = await Promise.all(requests.filter((item) => Number(item?.type || 0) === 1).map((item) => this.groupRequestToOneBot(item)));
+    const joined = await Promise.all(requests.filter((item) => Number(item?.type || 0) === 7).map((item) => this.groupRequestToOneBot(item)));
     return {
-      invited_requests: requests.filter((item) => item.invitationExt).map((item) => this.groupRequestToOneBot(item)),
-      join_requests: requests.filter((item) => !item.invitationExt).map((item) => this.groupRequestToOneBot(item)),
+      invited_requests: invited,
+      InvitedRequest: invited,
+      join_requests: joined,
     };
+  }
+  async getIgnoredGroupAddRequests(params = {}) {
+    const requests = await this.loadGroupRequests(true, { ...params, count: params.count || 10 });
+    return Promise.all(requests
+      .filter((item) => Number(item?.type || 0) === 7)
+      .map((item) => this.groupRequestToOneBot(item)));
   }
   async setGroupAddRequest(params) {
     const flag = String(params.flag || params.request_id || "");
-    const [normal, doubtful] = await Promise.all([
-      this.loadGroupRequests(false, { count: params.count }),
-      this.loadGroupRequests(true, { count: params.count }),
-    ]);
-    const notify = [...normal, ...doubtful].find((item) => String(item.seq || item.flag) === flag);
+    let notify = this.oneBotGroupInviteRequests.get(flag);
+    if (!notify) {
+      const [normal, doubtful] = await Promise.all([
+        this.loadGroupRequests(false, { count: params.count }),
+        this.loadGroupRequests(true, { count: params.count }),
+      ]);
+      notify = [...normal, ...doubtful].find((item) => String(item.seq || item.flag) === flag);
+    }
     if (!notify) throw new OneBotActionError("群请求不存在或已过期", 1404, "set_group_add_request");
     const service = this.session?.getGroupService?.();
     const method = requireNativeMethod(service, "operateSysNotify", "set_group_add_request");
@@ -1684,6 +1753,7 @@ class QQInstance {
         postscript: String(params.reason || " ") || " ",
       },
     }), "处理群请求失败");
+    this.oneBotGroupInviteRequests.delete(flag);
     return {};
   }
   async getGroupShutList(groupId) {
@@ -1946,6 +2016,18 @@ class QQInstance {
       throw new OneBotActionError("原始发包不可用: " + reason, 1405, "send_packet");
     }
     const method = requireNativeMethod(this.getMsgService(), "sendSsoCmdReqByContend", "send_packet");
+    const packetStatus = this.packetBackend.status();
+    log(
+      this.botConfig.id,
+      "[PACKET] 请求",
+      `cmd=${cmd}`,
+      `bytes=${data.length}`,
+      `buffer=${Buffer.isBuffer(data)}`,
+      `rsp=${rsp}`,
+      `loaded=${packetStatus.loaded}`,
+      `bypass=${packetStatus.bypass_enabled}`,
+      `hook=${packetStatus.hook_initialized}`
+    );
     if (!rsp) {
       Promise.resolve(method(cmd, data)).catch((error) => {
         logErr(this.botConfig.id, "[PACKET] 无响应发包失败:", error?.message || error);
@@ -1960,7 +2042,23 @@ class QQInstance {
           timer = setTimeout(() => reject(new OneBotActionError("原始发包等待响应超时", 1500, "send_packet")), 5000);
         }),
       ]);
-      return normalizePacketResponse(result, true);
+      const response = normalizePacketResponse(result, true);
+      log(
+        this.botConfig.id,
+        "[PACKET] 响应",
+        `cmd=${cmd}`,
+        `bytes=${response.length / 2}`,
+        `native=${safeJson(result, 500)}`
+      );
+      return response;
+    } catch (error) {
+      logErr(
+        this.botConfig.id,
+        "[PACKET] 失败",
+        `cmd=${cmd}`,
+        error?.message || error
+      );
+      throw error;
     } finally {
       if (timer) clearTimeout(timer);
     }
@@ -3870,15 +3968,37 @@ class QQInstance {
     const waited = await this.waitForNativeEvent(
       "member_list",
       () => service.getAllMemberList(String(groupId), forced),
-      (callbackGroup, members) => String(callbackGroup || groupId) === String(groupId) && (members instanceof Map || Array.isArray(members) || (members && typeof members === "object")),
+      (...args) => {
+        const callback = normalizeNativeMemberListCallback(args, groupId);
+        return callback.groupId === String(groupId) && extractNativeMemberMap({ infos: callback.infos }) !== undefined;
+      },
       (result) => extractNativeMemberMap(result) !== undefined,
     );
     if (waited.direct !== null) checkNativeResult(waited.direct, "获取群成员列表失败");
-    const infos = waited.direct !== null ? extractNativeMemberMap(waited.direct) : waited.args[1] || waited.args[0];
-    return collectionValues(infos)
-      .filter((member) => member && typeof member === "object")
+    const infos = waited.direct !== null
+      ? extractNativeMemberMap(waited.direct)
+      : normalizeNativeMemberListCallback(waited.args, groupId).infos;
+    const members = collectionValues(infos).filter((member) => member && typeof member === "object");
+    this.rememberGroupMemberSnapshot(groupId, members);
+    return members
       .map((member) => oneBotGroupMember(groupId, member))
       .filter((member) => member.user_id);
+  }
+  async initializeGroupMemberSnapshots() {
+    const groups = await this.queryGroupList({ no_cache: true });
+    const pending = Array.from(groups || []);
+    const workers = Array.from({ length: Math.min(4, pending.length) }, async () => {
+      while (pending.length) {
+        const group = pending.shift();
+        if (!group?.group_id) continue;
+        try {
+          await this.queryGroupMemberList(String(group.group_id), { no_cache: true });
+        } catch (error) {
+          logErr(this.botConfig.id, "[EVENT] 预热群成员快照失败: group=" + group.group_id, error?.message || error);
+        }
+      }
+    });
+    await Promise.all(workers);
   }
   async queryGroupMemberInfo(groupId, userId, params = {}) {
     const forced = this.asBoolean(params.no_cache, true);
@@ -4579,6 +4699,7 @@ class QQInstance {
       self.handleSentMessageUpdates([message]);
     };
     listenerImpl.onRecvMsg = (msgs) => {
+      for (const message of Array.from(msgs || [])) self.rememberGroupInviteArk(message);
       self.incomingMessageTail = self.incomingMessageTail
         .catch(() => {})
         .then(() => self.handleIncomingMessages(msgs));
@@ -4673,15 +4794,26 @@ class QQInstance {
       const buddy = new BuddyListener();
       buddy.onBuddyReqChange = async (payload) => {
         this.emitNativeEvent("buddy_requests", payload);
+        try {
+          await this.session?.getBuddyService?.().clearBuddyReqUnreadCnt?.();
+        } catch (error) {
+          logErr(id, "[EVENT] 清除好友请求未读数失败:", error?.message || error);
+        }
         for (const request of Array.from(payload?.buddyReqs || []).slice(0, Number(payload?.unreadNums || 0))) {
           if (request?.isInitiator || (request?.isDecide && Number(request?.reqType) !== 13) || !request?.isUnread) continue;
           const userId = await this.resolveUin(String(request.friendUid || ""));
+          if (!userId || userId === "0") {
+            logErr(id, "[EVENT] 好友请求 UID 无法转换为 QQ: " + String(request.friendUid || ""));
+            continue;
+          }
+          const flag = String(request.reqTime || request.flag || "");
+          if (!this.rememberNotice("request:friend:" + flag)) continue;
           emit({
             post_type: "request",
             request_type: "friend",
             user_id: Number(userId) || userId,
             comment: String(request.extWords || ""),
-            flag: String(request.reqTime || request.flag || ""),
+            flag,
           });
         }
       };
@@ -4703,9 +4835,14 @@ class QQInstance {
           const status = Number(notify?.status || 0);
           const notifyTime = Number(notify?.seq || 0) / 1e6;
           if (Number.isFinite(notifyTime) && notifyTime > 0 && notifyTime < Number(this.incomingMessageGate?.startedAt || 0)) continue;
+          const increaseCandidate = groupIncreaseCandidateFromNotify(notify);
+          if (increaseCandidate) this.rememberGroupIncreaseCandidate(increaseCandidate);
           const requestUid = type === 1 ? notify?.user2?.uid : notify?.user1?.uid;
           const affectedUid = String(requestUid || notify?.actionUser?.uid || "");
-          const affectedUin = affectedUid ? await this.resolveUin(affectedUid) : "";
+          const directUin = type === 1 ? notify?.user2?.uin : notify?.user1?.uin;
+          const affectedUin = String(directUin || (affectedUid
+            ? await this.resolveGroupMemberUin(groupId, affectedUid)
+            : ""));
           const operatorUid = String(notify?.actionUser?.uid || notify?.user2?.uid || "");
           if (groupId && affectedUid && operatorUid) {
             this.oneBotGroupOperators.set(groupId + ":" + affectedUid, operatorUid);
@@ -4715,6 +4852,11 @@ class QQInstance {
           }
           const flag = String(notify?.seq || notify?.flag || "");
           if (status === 1 && [1, 5, 7].includes(type)) {
+            if (!affectedUin || affectedUin === "0") {
+              logErr(id, `[EVENT] 群请求成员 UID 无法转换为 QQ: group=${groupId}, uid=${affectedUid}`);
+              continue;
+            }
+            if (!this.rememberNotice("request:group:" + flag)) continue;
             emit({
               post_type: "request",
               request_type: "group",
@@ -4730,10 +4872,16 @@ class QQInstance {
       group.onGroupListUpdate = (updateType, groups) => {
         this.emitNativeEvent("group_list", updateType, groups);
       };
-      group.onGroupNotifiesUpdated = handleGroupNotifies;
-      group.onGroupSingleScreenNotifies = async (doubt, seq, notifies) => {
-        this.emitNativeEvent("group_notifies", doubt, seq, notifies);
+      group.onGroupNotifiesUpdated = async (doubt, notifies) => {
+        try {
+          await this.session?.getGroupService?.().clearGroupNotifiesUnreadCount?.(false);
+        } catch (error) {
+          logErr(id, "[EVENT] 清除群请求未读数失败:", error?.message || error);
+        }
         await handleGroupNotifies(doubt, notifies);
+      };
+      group.onGroupSingleScreenNotifies = (doubt, seq, notifies) => {
+        this.emitNativeEvent("group_notifies", doubt, seq, notifies);
       };
       group.onGroupDetailInfoChange = (detail) => {
         this.emitNativeEvent("group_detail", detail);
@@ -4743,8 +4891,11 @@ class QQInstance {
         for (const member of collectionValues(members)) this.rememberGroupCard(groupCode, member);
       };
       group.onMemberListChange = (...args) => {
-        this.emitNativeEvent("member_list", ...args);
-        const [groupCode, members] = args;
+        const { groupId: groupCode, infos: members, payload } = normalizeNativeMemberListCallback(args);
+        this.emitNativeEvent("member_list", groupCode, members, payload);
+        if (!payload || (!payload.hasPrev && !payload.hasNext)) {
+          this.rememberGroupMemberSnapshot(groupCode, collectionValues(members));
+        }
         for (const member of collectionValues(members)) this.rememberGroupCard(groupCode, member);
       };
       group.onShutUpMemberListChanged = (groupCode, members) => {
@@ -4765,18 +4916,67 @@ class QQInstance {
     try {
       const event = decodeNapCatSystemNotice(payload);
       if (!event) return false;
-      const memberUid = String(event.member_uid || "");
+      let memberUid = String(event.member_uid || "");
       const groupId = String(event.group_id || "");
       let operatorUid = String(event.operator_uid || "");
+      if (event.post_type === "request" && event.request_type === "group" && event.sub_type === "invite") {
+        const inviterUid = String(event.inviter_uid || "");
+        const invite = await this.takeGroupInviteArk(groupId, inviterUid);
+        if (!invite) {
+          logErr(this.botConfig.id, "[EVENT] 群邀请未关联到 Ark 请求序号: group=" + groupId + ", inviter=" + inviterUid);
+          return false;
+        }
+        const inviterUin = await this.resolveUin(inviterUid);
+        if (!inviterUin || inviterUin === "0") {
+          logErr(this.botConfig.id, "[EVENT] 群邀请者 UID 无法转换为 QQ: " + inviterUid);
+          return false;
+        }
+        event.user_id = Number(inviterUin) || inviterUin || 0;
+        event.comment = "";
+        event.flag = String(invite.flag);
+        delete event.inviter_uid;
+        this.oneBotGroupInviteRequests.set(String(invite.flag), {
+          seq: String(invite.flag),
+          type: 1,
+          group: { groupCode: groupId, groupName: "" },
+          user1: { uid: inviterUid, nickName: "" },
+          user2: { uid: String(this.selfInfo?.uid || ""), nickName: "" },
+          actionUser: { uid: inviterUid, nickName: "" },
+          actionTime: String(Date.now()),
+          postscript: "",
+          repeatSeqs: [],
+          warningTips: "",
+          invitationExt: { srcType: 1, groupCode: groupId, waitStatus: 1 },
+          status: 1,
+          _doubt: false,
+        });
+        while (this.oneBotGroupInviteRequests.size > 50) {
+          this.oneBotGroupInviteRequests.delete(this.oneBotGroupInviteRequests.keys().next().value);
+        }
+      }
+      if (event.notice_type === "group_increase" && !memberUid && groupId) {
+        const candidate = await this.takeGroupIncreaseCandidate(groupId, operatorUid);
+        if (candidate) {
+          memberUid = String(candidate.memberUid || "");
+          operatorUid ||= String(candidate.operatorUid || "");
+        } else {
+          logErr(this.botConfig.id, `[EVENT] 入群通知缺少成员 UID，且未找到唯一的群通知关联: group=${groupId}`);
+          return false;
+        }
+      }
       if (!operatorUid && groupId && memberUid) {
         operatorUid = String(this.oneBotGroupOperators.get(groupId + ":" + memberUid) || "");
       }
       if (memberUid) {
-        const userId = await this.resolveUin(memberUid);
+        const userId = await this.resolveGroupMemberUin(groupId, memberUid);
+        if (event.notice_type === "group_increase" && (!userId || userId === "0")) {
+          logErr(this.botConfig.id, `[EVENT] 入群成员 UID 无法转换为 QQ: group=${groupId}, uid=${memberUid}`);
+          return false;
+        }
         event.user_id = Number(userId) || userId || 0;
       }
       if (operatorUid) {
-        const operatorId = await this.resolveUin(operatorUid);
+        const operatorId = await this.resolveGroupMemberUin(groupId, operatorUid);
         event.operator_id = Number(operatorId) || operatorId || 0;
       } else if (["group_increase", "group_decrease"].includes(event.notice_type)) {
         event.operator_id = 0;
@@ -4794,6 +4994,169 @@ class QQInstance {
       logErr(this.botConfig.id, "[EVENT] 系统消息转换失败:", error?.message || error);
       return false;
     }
+  }
+  rememberGroupInviteArk(message) {
+    const invite = parseGroupInviteArk(message, this.getSelfUin());
+    if (!invite) return false;
+    const value = { ...invite, observedAt: Date.now() };
+    const key = String(invite.groupId) + ":" + String(invite.inviterUid);
+    this.oneBotGroupInviteArks.set(key, value);
+    while (this.oneBotGroupInviteArks.size > 50) {
+      this.oneBotGroupInviteArks.delete(this.oneBotGroupInviteArks.keys().next().value);
+    }
+    this.emitNativeEvent("group_invite_ark", value);
+    return true;
+  }
+  async takeGroupInviteArk(groupId, inviterUid) {
+    const key = String(groupId) + ":" + String(inviterUid);
+    const now = Date.now();
+    for (const [cacheKey, value] of this.oneBotGroupInviteArks) {
+      if (Number(value?.observedAt || 0) < now - 10000) this.oneBotGroupInviteArks.delete(cacheKey);
+    }
+    let invite = this.oneBotGroupInviteArks.get(key) || null;
+    if (!invite) {
+      try {
+        const waited = await this.waitForNativeEvent(
+          "group_invite_ark",
+          () => undefined,
+          (value) => String(value?.groupId || "") === String(groupId)
+            && String(value?.inviterUid || "") === String(inviterUid),
+          () => false,
+          1000,
+        );
+        invite = waited.args[0] || null;
+      } catch {
+      }
+    }
+    if (invite) this.oneBotGroupInviteArks.delete(key);
+    return invite;
+  }
+  rememberGroupIncreaseCandidate(candidate) {
+    const now = Date.now();
+    for (const [key, value] of this.oneBotGroupIncreaseCandidates) {
+      if (Number(value?.observedAt || 0) < now - 10000) this.oneBotGroupIncreaseCandidates.delete(key);
+    }
+    const key = [candidate.groupId, candidate.memberUid, candidate.operatorUid, candidate.seq].join(":");
+    this.oneBotGroupIncreaseCandidates.set(key, candidate);
+    while (this.oneBotGroupIncreaseCandidates.size > 1000) {
+      this.oneBotGroupIncreaseCandidates.delete(this.oneBotGroupIncreaseCandidates.keys().next().value);
+    }
+    this.emitNativeEvent("group_increase_candidate", candidate);
+  }
+  async takeGroupIncreaseCandidate(groupId, operatorUid) {
+    let candidate = findGroupIncreaseCandidate(
+      this.oneBotGroupIncreaseCandidates.values(),
+      groupId,
+      operatorUid,
+    );
+    if (!candidate && operatorUid) {
+      candidate = findGroupIncreaseCandidate(
+        this.oneBotGroupIncreaseCandidates.values(),
+        groupId,
+      );
+    }
+    if (!candidate) {
+      try {
+        const waited = await this.waitForNativeEvent(
+          "group_increase_candidate",
+          () => undefined,
+          (value) => String(value?.groupId || "") === String(groupId)
+            && (!operatorUid || String(value?.operatorUid || "") === String(operatorUid)),
+          () => false,
+          1000,
+        );
+        candidate = waited.args[0] || null;
+      } catch {
+      }
+    }
+    if (!candidate) return null;
+    for (const [key, value] of this.oneBotGroupIncreaseCandidates) {
+      if (String(value?.groupId || "") === String(candidate.groupId)
+        && String(value?.memberUid || "") === String(candidate.memberUid)) {
+        this.oneBotGroupIncreaseCandidates.delete(key);
+      }
+    }
+    return candidate;
+  }
+  async resolveGroupMemberUin(groupId, memberUid) {
+    groupId = String(groupId || "");
+    memberUid = String(memberUid || "");
+    if (!memberUid) return "0";
+    let userId = await this.resolveUin(memberUid);
+    if (userId !== "0" || !groupId) return userId;
+    const cachedMember = Array.from(this.oneBotGroupMemberSnapshots.get(groupId)?.values?.() || [])
+      .find((member) => String(member?.uid || "") === memberUid);
+    if (cachedMember?.uin && String(cachedMember.uin) !== "0") {
+      return this.rememberUin(memberUid, cachedMember.uin);
+    }
+    const service = this.session?.getGroupService?.();
+    if (typeof service?.getMemberInfo === "function") try {
+      const hasMember = (value) => collectionValues(extractNativeMemberMap(value)).some(
+        (member) => String(member?.uid || "") === String(memberUid),
+      );
+      const waited = await this.waitForNativeEvent(
+        "member_info",
+        () => service.getMemberInfo(String(groupId), [String(memberUid)], true),
+        (callbackGroup, _source, members) => String(callbackGroup) === String(groupId)
+          && collectionValues(members).some((member) => String(member?.uid || "") === String(memberUid)),
+        hasMember,
+        1500,
+      );
+      const infos = waited.direct !== null
+        ? extractNativeMemberMap(waited.direct)
+        : waited.args[2] || waited.args[1];
+      const member = collectionValues(infos).find(
+        (value) => String(value?.uid || "") === String(memberUid),
+      );
+      if (member?.uin && String(member.uin) !== "0") return this.rememberUin(memberUid, member.uin);
+      userId = await this.resolveUin(memberUid);
+    } catch {
+    }
+    if (userId === "0" && typeof service?.getAllMemberList === "function") {
+      try {
+        await this.queryGroupMemberList(groupId, { no_cache: true });
+        userId = this.oneBotUidToUin.get(memberUid) || "0";
+      } catch {
+      }
+    }
+    return userId;
+  }
+  rememberGroupMemberSnapshot(groupCode, members) {
+    const groupId = String(groupCode || "");
+    if (!groupId) return false;
+    const snapshot = new Map();
+    for (const member of Array.from(members || [])) {
+      const uid = String(member?.uid || "");
+      const uin = String(member?.uin || member?.user_id || "");
+      const key = uid || uin;
+      if (key) snapshot.set(key, { uid, uin });
+      if (uid && uin && uin !== "0") this.rememberUin(uid, uin);
+    }
+    if (!snapshot.size) return false;
+    this.oneBotGroupMemberSnapshots.set(groupId, snapshot);
+    while (this.oneBotGroupMemberSnapshots.size > 500) {
+      this.oneBotGroupMemberSnapshots.delete(this.oneBotGroupMemberSnapshots.keys().next().value);
+    }
+    return true;
+  }
+  async createThirdPartyGroupIncreaseNotice(groupId) {
+    const oldMembers = this.oneBotGroupMemberSnapshots.get(String(groupId));
+    if (!oldMembers) return null;
+    await this.queryGroupMemberList(String(groupId), { no_cache: true });
+    const newMembers = this.oneBotGroupMemberSnapshots.get(String(groupId));
+    if (!newMembers) return null;
+    const member = findAddedGroupMember(oldMembers, newMembers);
+    if (!member) return null;
+    const userId = member.uin && member.uin !== "0"
+      ? member.uin
+      : await this.resolveGroupMemberUin(String(groupId), member.uid);
+    if (!userId || userId === "0") return null;
+    return {
+      post_type: "notice", notice_type: "group_increase", sub_type: "invite",
+      group_id: Number(groupId) || groupId,
+      user_id: Number(userId) || userId,
+      operator_id: 0,
+    };
   }
   async rememberGroupCard(groupCode, member, emitChange = true) {
     const groupId = String(groupCode || member?.groupCode || "");
@@ -4906,15 +5269,22 @@ class QQInstance {
     if (![1, 2].includes(chatType)) return false;
     const key = "recall:" + chatType + ":" + String(message?.peerUid || message?.peerUin || "") + ":" + nativeMessageKey(message);
     if (!this.rememberNotice(key)) return true;
+    const groupId = chatType === 2 ? String(message?.peerUin || message?.peerUid || "") : "";
+    let senderId = String(message?.senderUin || "");
+    if ((!senderId || senderId === "0") && message?.senderUid) {
+      senderId = chatType === 2
+        ? await this.resolveGroupMemberUin(groupId, String(message.senderUid))
+        : await this.resolveUin(String(message.senderUid));
+    }
     const event = {
       post_type: "notice",
       notice_type: chatType === 2 ? "group_recall" : "friend_recall",
-      user_id: Number(message?.senderUin || 0) || 0,
+      user_id: Number(senderId) || senderId || 0,
       message_id: toOneBotMessageId(nativeMessageKey(message), message),
     };
     if (chatType === 2) {
-      const operatorId = await this.resolveUin(String(revoke.operatorUid));
-      event.group_id = Number(message?.peerUin || message?.peerUid || 0) || 0;
+      const operatorId = await this.resolveGroupMemberUin(groupId, String(revoke.operatorUid));
+      event.group_id = Number(groupId) || groupId || 0;
       event.operator_id = Number(operatorId) || operatorId || 0;
     }
     this.emitOneBotEvent(event);
@@ -4926,7 +5296,7 @@ class QQInstance {
     const groupId = String(msg?.peerUin || msg?.peerUid || "");
     const group = gray.groupElement;
     if (group && Number(group.type || 0) === 5) {
-      const userId = await this.resolveUin(String(group.memberUid || msg?.senderUid || ""));
+      const userId = await this.resolveGroupMemberUin(groupId, String(group.memberUid || msg?.senderUid || ""));
       return {
         post_type: "notice", notice_type: "notify", sub_type: "group_name",
         group_id: Number(groupId) || groupId, user_id: Number(userId) || userId || 0,
@@ -4935,8 +5305,8 @@ class QQInstance {
     }
     if (group && Number(group.type || 0) === 8 && group.shutUp) {
       const memberUid = String(group.shutUp?.member?.uid || group.memberUid || "");
-      const userId = memberUid ? await this.resolveUin(memberUid) : "0";
-      const operatorId = await this.resolveUin(String(group.shutUp?.admin?.uid || group.adminUid || ""));
+      const userId = memberUid ? await this.resolveGroupMemberUin(groupId, memberUid) : "0";
+      const operatorId = await this.resolveGroupMemberUin(groupId, String(group.shutUp?.admin?.uid || group.adminUid || ""));
       let duration = Math.max(0, Number(group.shutUp?.duration || 0));
       if (!memberUid && duration > 0) duration = -1;
       return {
@@ -4946,8 +5316,8 @@ class QQInstance {
       };
     }
     if (group && Number(group.type || 0) === 1 && String(group.memberUid || "") === String(this.selfInfo?.uid || "")) {
-      const userId = await this.resolveUin(String(group.memberUid || group.memberAdd?.otherAdd?.uid || ""));
-      const operatorId = await this.resolveUin(String(group.adminUid || ""));
+      const userId = this.getSelfUin();
+      const operatorId = await this.resolveGroupMemberUin(groupId, String(group.adminUid || ""));
       return {
         post_type: "notice", notice_type: "group_increase", sub_type: "approve",
         group_id: Number(groupId) || groupId, user_id: Number(userId) || userId || 0,
@@ -4962,8 +5332,10 @@ class QQInstance {
       if (businessId === "1061") {
         const uids = Array.from(rawInfo?.items || []).map((item) => String(item?.uid || "")).filter(Boolean);
         if (uids.length >= 2) {
-          const identities = await Promise.all([this.resolveUin(uids[0]), this.resolveUin(uids[1])]);
           const isGroup = Number(msg?.chatType) === 2;
+          const identities = await Promise.all(uids.slice(0, 2).map((uid) =>
+            isGroup ? this.resolveGroupMemberUin(groupId, uid) : this.resolveUin(uid)
+          ));
           const peerId = isGroup ? "" : await this.resolveUin(String(msg?.peerUid || ""));
           return {
             post_type: "notice", notice_type: "notify", sub_type: "poke",
@@ -4983,6 +5355,9 @@ class QQInstance {
       if (businessId === "2401") {
         const essence = parseEssenceGrayTip(rawInfo);
         return essence ? await this.createEssenceNotice(essence) : null;
+      }
+      if (businessId === "51" && isThirdPartyGroupIncreaseGrayTip(rawInfo)) {
+        return this.createThirdPartyGroupIncreaseNotice(groupId);
       }
       const grayItems = Array.from(rawInfo?.items || []);
       const grayType = String(grayItems.at(-1)?.txt || "");
@@ -5009,6 +5384,7 @@ class QQInstance {
       };
     }
     if (Number(msg?.chatType) === 2 && String(gray.xmlElement?.templId || "") === "10382") {
+      if (this.packetEventBackend?.available) return null;
       const like = parseEmojiLikeGrayTip(gray.xmlElement?.content);
       return like ? await this.createGroupEmojiLikeNotice(groupId, like) : null;
     }
@@ -5045,9 +5421,25 @@ class QQInstance {
       group_id: Number(groupId) || groupId,
       user_id: Number(like.senderUin) || like.senderUin || 0,
       message_id: toOneBotMessageId(nativeMessageKey(raw), raw),
-      likes: [{ emoji_id: String(like.emojiId), count: 1 }],
-      is_add: true,
+      likes: [{ emoji_id: String(like.emojiId), count: Math.max(0, Number(like.count ?? 1)) }],
+      is_add: Boolean(like.isAdd ?? true),
     };
+  }
+  async handlePacketEvent(packet) {
+    if (Number(packet?.type) !== 1 || packet?.cmd !== "trpc.msg.olpush.OlPushService.MsgPush") return false;
+    const reaction = parseGroupReactionPacket(packet?.hex_data);
+    if (!reaction) return false;
+    const senderUin = await this.resolveGroupMemberUin(reaction.groupId, reaction.operatorUid);
+    if (!senderUin || senderUin === "0") return false;
+    const notice = await this.createGroupEmojiLikeNotice(reaction.groupId, { ...reaction, senderUin });
+    if (!notice) return false;
+    const noticeKey = [
+      "packet-reaction", String(packet?.seq || ""), reaction.groupId,
+      reaction.messageSeq, senderUin, reaction.emojiId, reaction.isAdd ? "add" : "remove",
+    ].join(":");
+    if (!this.rememberNotice(noticeKey)) return true;
+    this.emitOneBotEvent(notice);
+    return true;
   }
   async createEssenceNotice(essence) {
     const raw = await this.queryGroupMessageBySeq(essence.groupId, essence.messageSeq, false);
@@ -5344,11 +5736,6 @@ class QQInstance {
     }
     const chatType = Number(msg.chatType || 0);
     if (![1, 2, 100].includes(chatType)) return null;
-    let senderUin = String(msg.senderUin || "");
-    if ((!senderUin || senderUin === "0") && msg.senderUid) {
-      senderUin = await this.resolveUin(String(msg.senderUid));
-    }
-    if (!senderUin || senderUin === "0") return null;
     let peerUin = String(msg.peerUin || "");
     if (chatType === 100) {
       try {
@@ -5362,6 +5749,13 @@ class QQInstance {
       peerUin = await this.resolveUin(String(msg.peerUid));
     }
     if (chatType !== 1 && (!peerUin || peerUin === "0")) return null;
+    let senderUin = String(msg.senderUin || "");
+    if ((!senderUin || senderUin === "0") && msg.senderUid) {
+      senderUin = chatType === 2
+        ? await this.resolveGroupMemberUin(peerUin, String(msg.senderUid))
+        : await this.resolveUin(String(msg.senderUid));
+    }
+    if (!senderUin || senderUin === "0") return null;
     const messageId = toOneBotMessageId(nativeMessageKey(msg), msg);
     const isGroup = chatType === 2;
     const isTempGroup = chatType === 100;
