@@ -2854,6 +2854,32 @@ class QQInstance {
     }
     return String(billNo || "");
   }
+  redPacketExclusiveIdentity(wallet) {
+    const redBag = wallet?.redBag || {};
+    const receiver = wallet?.receiver || {};
+    const uinValue = redBag.receiveUin ?? redBag.receiverUin ?? receiver.uin ?? wallet?.exclusiveUin ?? "";
+    const uidValue = redBag.receiveUid ?? redBag.receiverUid ?? receiver.uid ?? wallet?.exclusiveUid ?? "";
+    const uinText = String(uinValue || "").trim();
+    return {
+      uin: /^\d+$/.test(uinText) && uinText !== "0" ? uinText : "",
+      uid: String(uidValue || (!/^\d+$/.test(uinText) ? uinText : "") || "").trim()
+    };
+  }
+  redPacketChannel(wallet) {
+    const value = wallet?.redChannel ?? wallet?.redBag?.redChannel ?? wallet?.grabedMsg?.redChannel ?? wallet?.receiver?.redChannel ?? 0;
+    const channel = Number(value);
+    return Number.isFinite(channel) ? channel : 0;
+  }
+  redPacketPassword(wallet) {
+    return String(
+      wallet?.receiver?.title
+      || wallet?.receiver?.notice
+      || wallet?.redBag?.wording
+      || wallet?.redBag?.authKey
+      || wallet?.grabedMsg?.wording
+      || ""
+    ).trim();
+  }
   rememberRedPacket(msg, wallet) {
     const billNo = this.redPacketBillNo(wallet);
     if (!billNo) return null;
@@ -2861,6 +2887,7 @@ class QQInstance {
     if (existing) return null;
     const chatType = Number(msg?.chatType ?? 2);
     const peerUin = String(msg?.peerUin || "");
+    const exclusive = this.redPacketExclusiveIdentity(wallet);
     const packet = {
       createdAt: Date.now(),
       billNo,
@@ -2876,9 +2903,10 @@ class QQInstance {
       redBagType: Number(wallet?.redBag?.redBagType ?? wallet?.redBagType ?? wallet?.grabedMsg?.redBagType ?? -1),
       senderRole: Number(msg?.roleType ?? 4),
       wishing: String(wallet?.receiver?.title || wallet?.receiver?.notice || ""),
-      password: String(wallet?.redBag?.authKey || wallet?.receiver?.title || ""),
-      redChannel: Number(wallet?.redChannel ?? 0),
-      exclusiveUin: String(wallet?.redBag?.receiveUin || wallet?.redBag?.receiverUin || wallet?.receiver?.uin || wallet?.exclusiveUin || "")
+      password: this.redPacketPassword(wallet),
+      redChannel: this.redPacketChannel(wallet),
+      exclusiveUin: exclusive.uin,
+      exclusiveUid: exclusive.uid
     };
     this.redPackets.set(billNo, packet);
     const cutoff = Date.now() - 10 * 60 * 1e3;
@@ -2909,6 +2937,32 @@ class QQInstance {
       exclusive_uin: packet.exclusiveUin
     };
   }
+  async getRedPacketDetails(params = {}) {
+    const billNo = String(params.bill_no || params.billNo || "");
+    const packet = this.redPackets.get(billNo);
+    if (!packet) {
+      return { ok: false, err_code: -2, err_msg: "红包上下文不存在或已过期" };
+    }
+    const exclusive = this.redPacketExclusiveIdentity(packet.wallet);
+    let exclusiveUin = exclusive.uin || String(packet.exclusiveUin || "");
+    const exclusiveUid = exclusive.uid || String(packet.exclusiveUid || "");
+    if (!exclusiveUin && exclusiveUid) {
+      const resolved = String(await this.resolveUin(exclusiveUid) || "");
+      if (/^\d+$/.test(resolved) && resolved !== "0") exclusiveUin = resolved;
+    }
+    packet.exclusiveUin = exclusiveUin;
+    packet.exclusiveUid = exclusiveUid;
+    return {
+      ok: true,
+      bill_no: packet.billNo,
+      red_packet_type: packet.redBagType,
+      red_channel: packet.redChannel,
+      password_required: packet.redChannel === 32,
+      password: packet.password,
+      exclusive_uin: exclusiveUin,
+      exclusive_uid: exclusiveUid
+    };
+  }
   async grabRedPacket(params = {}) {
     const billNo = String(params.bill_no || params.billNo || "");
     const packet = this.redPackets.get(billNo);
@@ -2933,8 +2987,16 @@ class QQInstance {
     let timer;
     try {
       const timeout = Symbol("red-packet-timeout");
+      const grabPromise = Promise.resolve(service.grabRedBag(request));
+      if (params.send_password_after === true && packet.redChannel === 32
+        && packet.groupId && packet.password) {
+        // Native grab is invoked first. Password delivery is best-effort and never blocks it.
+        void Promise.resolve()
+          .then(() => this.sendGroupMsg(packet.groupId, packet.password))
+          .catch(() => {});
+      }
       const nativeResult = await Promise.race([
-        Promise.resolve(service.grabRedBag(request)),
+        grabPromise,
         new Promise((resolve) => {
           timer = setTimeout(() => resolve(timeout), 1800);
         })

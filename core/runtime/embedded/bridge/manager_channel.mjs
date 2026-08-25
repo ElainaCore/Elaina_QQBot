@@ -188,8 +188,14 @@ export class EmbeddedManagerChannel {
       } else if (command.type === "resolve_uid") {
         const data = await this.instance.resolveUid(String(command.user_id || ""));
         result = { status: "ok", retcode: 0, data, message: "", wording: "" };
+      } else if (command.type === "query_red_packet") {
+        const data = await this.instance.getRedPacketDetails({ bill_no: command.bill_no });
+        result = { status: "ok", retcode: 0, data, message: "", wording: "" };
       } else if (command.type === "grab_red_packet") {
-        const data = await this.instance.grabRedPacket({ bill_no: command.bill_no });
+        const data = await this.instance.grabRedPacket({
+          bill_no: command.bill_no,
+          send_password_after: command.send_password_after === true,
+        });
         result = { status: "ok", retcode: 0, data, message: "", wording: "" };
       } else if (command.type === "refresh_qr") {
         result = { success: true, data: this.instance.refreshQrCode() };

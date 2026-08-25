@@ -1049,7 +1049,9 @@ class EmbeddedQQManager:
                 return bot_id
         return ''
 
-    async def grab_red_packet(self, self_id: str, bill_no: str) -> dict[str, Any]:
+    async def grab_red_packet(
+        self, self_id: str, bill_no: str, *, send_password_after: bool = False,
+    ) -> dict[str, Any]:
         """通过指定内置 QQ 账号直接调用原生 grabRedBag。"""
         bot_id = self._red_packet_bot_id(self_id)
         bill_no = str(bill_no or '').strip()
@@ -1065,7 +1067,11 @@ class EmbeddedQQManager:
             }
         response = await self._control_call(
             bot_id,
-            {'type': 'grab_red_packet', 'bill_no': bill_no},
+            {
+                'type': 'grab_red_packet',
+                'bill_no': bill_no,
+                'send_password_after': bool(send_password_after),
+            },
             timeout=5,
         )
         if response.get('status') == 'failed':
@@ -1082,6 +1088,30 @@ class EmbeddedQQManager:
             'ok': False, 'amount': 0, 'err_code': -8,
             'err_msg': '红包领取接口返回格式错误',
         }
+
+    async def query_red_packet(self, self_id: str, bill_no: str) -> dict[str, Any]:
+        """查询指定内置 QQ 缓存的红包详情，不执行领取。"""
+        bot_id = self._red_packet_bot_id(self_id)
+        bill_no = str(bill_no or '').strip()
+        if not bot_id:
+            return {'ok': False, 'err_code': -5, 'err_msg': '内置 QQ 账号不存在'}
+        if not bill_no:
+            return {'ok': False, 'err_code': -6, 'err_msg': '缺少红包 bill_no'}
+        response = await self._control_call(
+            bot_id,
+            {'type': 'query_red_packet', 'bill_no': bill_no},
+            timeout=5,
+        )
+        if response.get('status') == 'failed':
+            return {
+                'ok': False,
+                'err_code': int(response.get('retcode') or -7),
+                'err_msg': str(response.get('message') or '红包详情查询失败'),
+            }
+        result = response.get('data')
+        if isinstance(result, dict):
+            return result
+        return {'ok': False, 'err_code': -8, 'err_msg': '红包详情返回格式错误'}
 
     async def refresh_qr(self, bot_id: str) -> dict:
         bot = self.bots.get(bot_id)
