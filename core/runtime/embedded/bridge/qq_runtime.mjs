@@ -3019,6 +3019,11 @@ class QQInstance {
       index: packet.wallet?.stringIndex
     };
     let timer;
+    const nativeCallAtMs = Date.now();
+    const timing = () => ({
+      dispatch_delay_ms: Math.max(0, nativeCallAtMs - Number(packet.eventReceivedAtMs || nativeCallAtMs)),
+      native_elapsed_ms: Math.max(0, Date.now() - nativeCallAtMs),
+    });
     try {
       const timeout = Symbol("red-packet-timeout");
       const grabPromise = Promise.resolve(service.grabRedBag(request));
@@ -3036,15 +3041,21 @@ class QQInstance {
         })
       ]);
       if (nativeResult === timeout) {
-        return { ok: false, amount: 0, err_code: -1, err_msg: "领取超时" };
+        return { ok: false, amount: 0, err_code: -1, err_msg: "领取超时", ...timing() };
       }
       const response = nativeResult?.grabRedBagRsp || nativeResult || {};
       const amountFen = Number.parseInt(String(response?.recvdOrder?.amount || 0), 10) || 0;
       const errCode = Number(response?.retCode ?? response?.result ?? nativeResult?.result ?? 0);
       const errMsg = String(response?.retMsg || response?.errMsg || nativeResult?.errMsg || (errCode ? `错误码${errCode}` : ""));
-      return { ok: errCode === 0, amount: amountFen / 100, err_code: errCode, err_msg: errMsg };
+      return {
+        ok: errCode === 0, amount: amountFen / 100, err_code: errCode, err_msg: errMsg,
+        ...timing(),
+      };
     } catch (error) {
-      return { ok: false, amount: 0, err_code: -4, err_msg: String(error?.message || error) };
+      return {
+        ok: false, amount: 0, err_code: -4, err_msg: String(error?.message || error),
+        ...timing(),
+      };
     } finally {
       clearTimeout(timer);
     }
@@ -4497,8 +4508,7 @@ class QQInstance {
       self.handleSentMessageUpdates([message]);
     };
     listenerImpl.onRecvMsg = (msgs) => {
-      for (const message of Array.from(msgs || [])) self.rememberGroupInviteArk(message);
-      void self.handleIncomingMessages(msgs);
+      void self.handleIncomingMessages(msgs, true);
     };
     listenerImpl.onRecvOnlineFileMsg = (msgs) => {
       void self.handleIncomingMessages(msgs);
@@ -4554,17 +4564,23 @@ class QQInstance {
       logErr(id, "[消息] 注册消息监听失败:", e.message);
     }
   }
-  async handleIncomingMessages(msgs) {
+  async handleIncomingMessages(msgs, rememberInvites = false) {
     const id = this.botConfig.id;
     const gate = this.incomingMessageGate;
     if (!gate) return;
     const ignored = { history: 0, invalid_time: 0, duplicate: 0 };
     const jobs = [];
     for (const msg of Array.from(msgs || [])) {
+      if (rememberInvites) this.rememberGroupInviteArk(msg);
       const decision = gate.inspect(msg);
       if (!decision.accept) {
         ignored[decision.reason] += 1;
         continue;
+      }
+      const elements = msg.elements || [];
+      if (Number(msg?.msgType || 0) !== 1 && elements.length) {
+        // 红包绕过同会话消息转换队列，避免被图片、回复等慢消息阻塞。
+        this.emitRedPackets(msg, elements);
       }
       jobs.push(this.enqueueMessageWork(msg, () => this.handleMessage(msg), "[消息] 消息转换失败:"));
     }
@@ -5288,7 +5304,6 @@ class QQInstance {
   async handleMessage(msg, forceSent = false) {
     const elements = msg.elements || [];
     if (Number(msg?.msgType || 0) === 1 || !elements.length) return;
-    this.emitRedPackets(msg, elements);
     const sideEvents = this.handleMessageSideEvents(msg);
     const event = await this.toOneBotEvent(msg);
     if (!event) {

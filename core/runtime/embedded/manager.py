@@ -1115,9 +1115,6 @@ class EmbeddedQQManager:
             tasks = self._red_packet_tasks.setdefault(owner, set())
             tasks.add(task)
             task.add_done_callback(tasks.discard)
-        if self._red_packet_listeners:
-            # 先让监听器完成同步策略判断并把抢包命令放入优先队列。
-            await asyncio.sleep(0)
         return True
 
     def _red_packet_bot_id(self, self_id: str) -> str:
