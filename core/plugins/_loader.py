@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import os
 import sys
@@ -28,11 +29,16 @@ async def _run_hooks(
     *,
     phase: str,
     continue_on_error: bool = False,
+    timeout: float = 30,
 ) -> None:
     for func in funcs:
         try:
             with plugin_scope(context), api_call_source(plugin_name):
-                await func()
+                if timeout <= 0:
+                    await func()
+                else:
+                    async with asyncio.timeout(timeout):
+                        await func()
         except Exception as error:
             if continue_on_error:
                 report_error(
@@ -118,16 +124,28 @@ class _LoaderMixin:
             raise FileNotFoundError(f'插件入口不存在: {entry_path}')
 
         async with self._lock:
-            if name in self._plugins:
-                await self._unload_plugin(name)
+            old_plugin = self._plugins.get(name)
+            from core.plugins.web_pages import (
+                has_resources_by_owner,
+                resource_registration_scope,
+                restore_resources_by_owner,
+                snapshot_resources_by_owner,
+            )
+
+            old_resources = snapshot_resources_by_owner(name)
             plugin_context = PluginContext(name, plugin_dir)
             await plugin_context.prepare()
+            if old_plugin is not None:
+                await asyncio.to_thread(self._clear_bytecode_cache, plugin_dir)
+            old_modules = self._pop_modules(name)
             started = time.perf_counter()
             registrations = PluginRegistrations()
+            plugin = None
             try:
                 with (
                     plugin_scope(plugin_context),
                     registration_scope(registrations),
+                    resource_registration_scope() as new_resources,
                     api_call_source(name),
                 ):
                     module = await asyncio.to_thread(
@@ -136,8 +154,6 @@ class _LoaderMixin:
                         plugin_dir,
                         entry_path,
                     )
-                    from core.plugins.web_pages import has_resources_by_owner
-
                     if registrations.count == 0 and not has_resources_by_owner(name):
                         raise RuntimeError(
                             f'插件 [{name}] 没有注册任何能力；'
@@ -170,6 +186,25 @@ class _LoaderMixin:
                     api_interceptors,
                     started,
                 )
+                if old_plugin is not None:
+                    plugin.enabled = old_plugin.enabled
+
+                # 新版本加载成功后才卸载旧版本。切换期间保存两代模块和
+                # Web 注册项，确保任何一步失败都能恢复原有可用版本。
+                new_modules = self._pop_modules(name)
+                if old_plugin is not None:
+                    self._restore_modules(name, old_modules)
+                    with resource_registration_scope():
+                        await _run_hooks(
+                            old_plugin.on_unload_funcs,
+                            name,
+                            old_plugin.ctx,
+                            phase='on_unload',
+                            continue_on_error=True,
+                        )
+                    self._drop_modules(name)
+                self._restore_modules(name, new_modules)
+                restore_resources_by_owner(name, new_resources)
                 self._plugins[name] = plugin
                 self._discovered_plugins.add(name)
                 self._rebuild_handler_list()
@@ -181,17 +216,23 @@ class _LoaderMixin:
                     plugin.load_time,
                 )
             except Exception as error:
-                from core.plugins.web_pages import clear_resources_by_owner
-
-                await _run_hooks(
-                    list(registrations.on_unload),
-                    name,
-                    plugin_context,
-                    phase='rollback',
-                    continue_on_error=True,
-                )
-                clear_resources_by_owner(name)
+                with resource_registration_scope():
+                    await _run_hooks(
+                        list(registrations.on_unload),
+                        name,
+                        plugin_context,
+                        phase='rollback',
+                        continue_on_error=True,
+                    )
                 self._drop_modules(name)
+                self._restore_modules(name, old_modules)
+                restore_resources_by_owner(name, old_resources)
+                if plugin is not None and self._plugins.get(name) is plugin:
+                    if old_plugin is None:
+                        self._plugins.pop(name, None)
+                    else:
+                        self._plugins[name] = old_plugin
+                    self._rebuild_handler_list()
                 if isinstance(error, RuntimeError) and str(error).startswith(f'插件 [{name}]'):
                     raise
                 raise RuntimeError(f'插件 [{name}] 加载失败: {error}') from error
@@ -235,10 +276,39 @@ class _LoaderMixin:
 
     @staticmethod
     def _drop_modules(name: str) -> None:
+        _LoaderMixin._pop_modules(name)
+
+    @staticmethod
+    def _pop_modules(name: str) -> dict[str, types.ModuleType]:
         prefix = f'plugins.{name}'
+        removed = {}
         for module_name in tuple(sys.modules):
             if module_name == prefix or module_name.startswith(f'{prefix}.'):
-                sys.modules.pop(module_name, None)
+                removed[module_name] = sys.modules.pop(module_name)
+        package = sys.modules.get('plugins')
+        if package is not None:
+            package.__dict__.pop(name, None)
+        return removed
+
+    @staticmethod
+    def _restore_modules(name: str, modules: dict[str, types.ModuleType]) -> None:
+        if not modules:
+            return
+        sys.modules.update(modules)
+        package = sys.modules.get('plugins')
+        root = modules.get(f'plugins.{name}')
+        if package is not None and root is not None:
+            setattr(package, name, root)
+
+    @staticmethod
+    def _clear_bytecode_cache(plugin_dir: str) -> None:
+        for root, dirs, files in os.walk(plugin_dir):
+            dirs[:] = [item for item in dirs if item != '__pycache__' and not item.startswith('.')]
+            for filename in files:
+                if not filename.endswith('.py'):
+                    continue
+                with contextlib.suppress(OSError):
+                    os.remove(importlib.util.cache_from_source(os.path.join(root, filename)))
 
     @staticmethod
     def _import_plugin(name: str, plugin_dir: str, entry_path: str):

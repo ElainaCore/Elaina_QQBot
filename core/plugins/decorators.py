@@ -84,6 +84,7 @@ def handler(
     cooldown=0,
     block=False,
     fallback=False,
+    timeout=30,
 ):
     """注册异步事件处理器。"""
 
@@ -104,6 +105,7 @@ def handler(
                 'cooldown': cooldown,
                 'block': block,
                 'fallback': fallback,
+                'timeout': timeout,
             }
         )
         return func
@@ -121,25 +123,31 @@ def on_unload(func):
     return func
 
 
-def interceptor(priority=100):
+def interceptor(priority=100, *, timeout=30):
     def decorator(func):
-        _current_registrations().interceptors.append({'func': _async_only(func, 'interceptor'), 'priority': priority})
+        _current_registrations().interceptors.append(
+            {'func': _async_only(func, 'interceptor'), 'priority': priority, 'timeout': timeout}
+        )
         return func
 
     return decorator
 
 
-def handler_filter(priority=100):
+def handler_filter(priority=100, *, timeout=30):
     def decorator(func):
-        _current_registrations().handler_filters.append({'func': _async_only(func, 'handler_filter'), 'priority': priority})
+        _current_registrations().handler_filters.append(
+            {'func': _async_only(func, 'handler_filter'), 'priority': priority, 'timeout': timeout}
+        )
         return func
 
     return decorator
 
 
-def api_interceptor(priority=100):
+def api_interceptor(priority=100, *, timeout=30):
     def decorator(func):
-        _current_registrations().api_interceptors.append({'func': _async_only(func, 'api_interceptor'), 'priority': priority})
+        _current_registrations().api_interceptors.append(
+            {'func': _async_only(func, 'api_interceptor'), 'priority': priority, 'timeout': timeout}
+        )
         return func
 
     return decorator

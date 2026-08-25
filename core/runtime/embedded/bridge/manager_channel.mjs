@@ -35,6 +35,10 @@ export class EmbeddedManagerChannel {
     this.instance = null;
     this.running = false;
     this.loopPromise = null;
+    this.priorityLoopPromise = null;
+    this.statusReady = Promise.resolve();
+    this.onlineReported = false;
+    this.priorityCommands = new Set();
     this.reportTails = new Map();
     this.statusTail = Promise.resolve();
     this.agent = new http.Agent({
@@ -55,7 +59,12 @@ export class EmbeddedManagerChannel {
   start() {
     if (this.loopPromise) return this.loopPromise;
     this.running = true;
-    this.loopPromise = this.controlLoop().finally(() => {
+    this.priorityLoopPromise = this.controlLoop(
+      "/api/embedded/control/priority-poll", true,
+    ).finally(() => {
+      this.priorityLoopPromise = null;
+    });
+    this.loopPromise = this.controlLoop("/api/embedded/control/poll").finally(() => {
       this.loopPromise = null;
     });
     return this.loopPromise;
@@ -149,6 +158,10 @@ export class EmbeddedManagerChannel {
       "[桥接] 状态上报失败:",
       "status",
     );
+    if (runtime?.status === "online" && !this.onlineReported) {
+      this.onlineReported = true;
+      this.statusReady = this.statusTail;
+    }
     return this.statusTail;
   }
 
@@ -158,19 +171,20 @@ export class EmbeddedManagerChannel {
       { bot_id: this.botId, self_id: event.self_id || this.botId, event },
       "[桥接] 事件上报失败:",
       this.eventReportKey(event),
-      this.statusTail,
+      this.statusReady,
     );
   }
 
   reportRedPacket(packet) {
     const selfId = this.instance?.getSelfUin() || this.botId;
-    return this.queueReport(
+    return this.request(
+      "POST",
       "/api/embedded/red-packets",
       { bot_id: this.botId, self_id: selfId, red_packet: packet },
-      "[桥接] 红包上报失败:",
-      `${selfId}:${packet?.group_id || packet?.user_id || "全局"}`,
-      this.statusTail,
-    );
+      5_000,
+    ).catch((error) => {
+      this.logger("[桥接] 红包上报失败:", error?.message || error);
+    });
   }
 
   async executeControlCommand(command) {
@@ -212,16 +226,27 @@ export class EmbeddedManagerChannel {
     }, 5_000);
   }
 
-  async controlLoop() {
+  async controlLoop(apiPath, concurrent = false) {
     while (this.running) {
       try {
         const command = await this.request(
           "GET",
-          `/api/embedded/control/poll?bot_id=${encodeURIComponent(this.botId)}`,
+          `${apiPath}?bot_id=${encodeURIComponent(this.botId)}`,
           null,
           30_000,
         );
-        if (command) await this.executeControlCommand(command);
+        if (!command) continue;
+        if (!concurrent) {
+          await this.executeControlCommand(command);
+          continue;
+        }
+        while (this.priorityCommands.size >= 8) {
+          await Promise.race(this.priorityCommands);
+        }
+        const task = this.executeControlCommand(command)
+          .catch((error) => this.logger("[桥接] 红包优先命令失败:", error?.message || error));
+        this.priorityCommands.add(task);
+        task.finally(() => this.priorityCommands.delete(task));
       } catch {
         if (this.running) await new Promise((resolve) => setTimeout(resolve, 1_000));
       }

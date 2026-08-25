@@ -389,7 +389,21 @@ class OneBotAPI:
             from core.plugins.context import plugin_scope
 
             with plugin_scope(interceptor['_context']):
-                return await interceptor['func'](request, call_next)
+                configured_timeout = interceptor.get('timeout')
+                timeout = 30.0 if configured_timeout is None else float(configured_timeout)
+                if timeout <= 0:
+                    return await interceptor['func'](request, call_next)
+                async with asyncio.timeout(timeout):
+                    return await interceptor['func'](request, call_next)
+        except TimeoutError:
+            logger.error(
+                '插件出站 API 中间件超时: %s (%s)',
+                interceptor.get('_plugin', '?'),
+                request.action,
+            )
+            if advanced:
+                return None
+            return await call_next()
         except Exception:
             logger.exception(
                 '插件出站 API 中间件异常: %s (%s)',

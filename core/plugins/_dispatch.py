@@ -10,6 +10,16 @@ from core.protocols.onebot.api import api_call_source
 
 log = get_logger(PLUGIN, '管理器')
 _MAX_COOLDOWN_ENTRIES = 8192
+_DEFAULT_HANDLER_TIMEOUT = 30.0
+_SLOW_HANDLER_SECONDS = 1.0
+
+
+async def _await_with_budget(awaitable, timeout) -> Any:
+    seconds = _DEFAULT_HANDLER_TIMEOUT if timeout is None else float(timeout)
+    if seconds <= 0:
+        return await awaitable
+    async with asyncio.timeout(seconds):
+        return await awaitable
 
 
 class _DispatchMixin:
@@ -19,6 +29,7 @@ class _DispatchMixin:
     _all_interceptors: list[dict[str, Any]]
     _all_handler_filters: list[dict[str, Any]]
     _msg_handlers: list[dict[str, Any]]
+    _msg_handler_stages: dict[tuple[str, bool], tuple[dict[str, Any], ...]]
     _generic_handlers: list[dict[str, Any]]
     _typed_handlers: dict[str, list[dict[str, Any]]]
     _event_handlers: dict[str, list[dict[str, Any]]]
@@ -52,6 +63,28 @@ class _DispatchMixin:
                 if et not in {'message', 'message_sent'}:
                     typed.setdefault(et, []).append(h)
         self._msg_handlers = msg
+        stages: dict[tuple[str, bool], list[dict[str, Any]]] = {
+            ('message', False): [],
+            ('message', True): [],
+            ('message_sent', False): [],
+            ('message_sent', True): [],
+        }
+        for handler in msg:
+            event_types = handler.get('event_types')
+            post_types = []
+            if not event_types or 'message' in event_types:
+                post_types.append('message')
+            if event_types and 'message_sent' in event_types:
+                post_types.append('message_sent')
+            fallback = handler.get('fallback', False)
+            fallback_stages = (False, True) if callable(fallback) else (bool(fallback),)
+            for post_type in post_types:
+                for fallback_stage in fallback_stages:
+                    stages[(post_type, fallback_stage)].append(handler)
+        self._msg_handler_stages = {
+            key: tuple(handlers)
+            for key, handlers in stages.items()
+        }
         self._generic_handlers = generic
         self._typed_handlers = typed
         self._event_handlers = {event_type: sorted((*generic, *handlers), key=lambda item: -item['priority']) for event_type, handlers in typed.items()}
@@ -93,10 +126,15 @@ class _DispatchMixin:
                 continue
             try:
                 with plugin_scope(item['_context']):
-                    result = await item['func'](event, target_plugin)
+                    result = await _await_with_budget(
+                        item['func'](event, target_plugin),
+                        item.get('timeout'),
+                    )
                 if result is True:
                     blocked = True
                     break
+            except TimeoutError:
+                report_error(PLUGIN, item.get('_plugin', '?'), '处理器过滤器超时')
             except Exception as exc:
                 report_error(PLUGIN, item.get('_plugin', '?'), exc)
         cache[target_plugin] = blocked
@@ -114,9 +152,11 @@ class _DispatchMixin:
                 continue
             try:
                 with plugin_scope(ic['_context']):
-                    r = await ic['func'](event)
+                    r = await _await_with_budget(ic['func'](event), ic.get('timeout'))
                 if r is True:
                     return True
+            except TimeoutError:
+                report_error(PLUGIN, ic.get('_plugin', '?'), '事件拦截器超时')
             except Exception as e:
                 report_error(PLUGIN, ic.get('_plugin', '?'), e)
 
@@ -152,11 +192,11 @@ class _DispatchMixin:
                 allowed = h.get('_allowed_bots')
                 if not self._allows_bot(allowed, str(getattr(event, 'self_id', '') or '')):
                     continue
-                if await self._is_handler_filtered(h, event, filter_cache):
-                    continue
                 # 非消息事件同样允许通过正则模式筛选。
                 m = h['compiled'].search(content or event_type)
                 if not m:
+                    continue
+                if await self._is_handler_filtered(h, event, filter_cache):
                     continue
                 matched.append((h, m))
                 if h.get('block', False):  # 仅显式启用拦截时终止后续匹配。
@@ -170,28 +210,28 @@ class _DispatchMixin:
         """匹配一个消息阶段；宽泛兜底不会阻止后续斜杠兼容指令。"""
         matched = []
         self_id = str(getattr(event, 'self_id', '') or '')
-        for h in self._msg_handlers:
-            event_types = h.get('event_types')
-            post_type = str(getattr(event, 'post_type', '') or '')
-            if post_type == 'message_sent' and (not event_types or 'message_sent' not in event_types):
-                continue
-            if post_type == 'message' and event_types and 'message' not in event_types:
-                continue
-            if _fallback_enabled(h, event) != fallback_stage:
+        post_type = str(getattr(event, 'post_type', '') or '')
+        is_group = event.is_group
+        is_private = event.is_private
+        candidates = self._msg_handler_stages.get((post_type, fallback_stage), ())
+        for h in candidates:
+            if callable(h.get('fallback')) and _fallback_enabled(h, event) != fallback_stage:
                 continue
             allowed = h.get('_allowed_bots')
             if not self._allows_bot(allowed, self_id):
                 continue
-            if await self._is_handler_filtered(h, event, filter_cache):
+            if h['group_only'] and not is_group:
                 continue
-            if h['group_only'] and not event.is_group:
-                continue
-            if h['private_only'] and not event.is_private:
+            if h['private_only'] and not is_private:
                 continue
             if h['owner_only'] and not self._is_owner(event):
                 continue
             match = h['compiled'].search(content)
-            if not match or self._is_cooling_down(h, event):
+            if not match:
+                continue
+            if await self._is_handler_filtered(h, event, filter_cache):
+                continue
+            if self._is_cooling_down(h, event):
                 continue
             matched.append((h, match))
             if h.get('block', False):
@@ -209,13 +249,14 @@ class _DispatchMixin:
     async def _run_handler(self, h, event, match):
         """执行单个处理器 (带超时和异常捕获)"""
         plugin_name = h['name'] or h.get('_plugin', '')
+        started = time.monotonic()
+        timeout = _DEFAULT_HANDLER_TIMEOUT if h.get('timeout') is None else float(h['timeout'])
         try:
             fn = h['func']
             with plugin_scope(h['_context']), api_call_source(h.get('_plugin', ''), event):
-                async with asyncio.timeout(300):
-                    await fn(event, match)
+                await _await_with_budget(fn(event, match), timeout)
         except TimeoutError:
-            report_error(PLUGIN, plugin_name, f'处理器 [{h["name"]}] 超时(300s)')
+            report_error(PLUGIN, plugin_name, f'处理器 [{h["name"]}] 超时({timeout:g}s)')
         except Exception as e:
             report_error(
                 PLUGIN,
@@ -228,6 +269,10 @@ class _DispatchMixin:
                     'content': (event.content if hasattr(event, 'content') else '')[:200],
                 },
             )
+        finally:
+            elapsed = time.monotonic() - started
+            if elapsed >= _SLOW_HANDLER_SECONDS:
+                log.warning('插件处理器 [%s/%s] 执行 %.3f 秒', h.get('_plugin', '?'), h['name'], elapsed)
 
 
 def _fallback_enabled(handler, event) -> bool:

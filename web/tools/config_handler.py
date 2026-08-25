@@ -8,11 +8,13 @@ from core.services.files import read_text, run_sync, write_text
 from web.protocol import error, json_body, ok
 
 _base_dir = ''
+_app = None
 _ALLOWED = ('settings',)
 
 
-def set_context(base_dir: str):
-    global _base_dir
+def set_context(app_instance, base_dir: str):
+    global _app, _base_dir
+    _app = app_instance
     _base_dir = base_dir
 
 
@@ -44,9 +46,11 @@ async def handle_save_config(request: web.Request):
         import yaml
 
         try:
-            await run_sync(yaml.safe_load, content)
+            parsed = await run_sync(yaml.safe_load, content)
         except yaml.YAMLError as e:
             return error(f'YAML 格式错误: {e}')
+        if not isinstance(parsed, dict):
+            return error('YAML 根节点必须是对象')
 
         cdir = _config_dir()
         path = os.path.join(cdir, f'{file_name}.yaml')
@@ -60,8 +64,12 @@ async def handle_save_config(request: web.Request):
         # 触发热重载
         from core.foundation.config import cfg
 
-        await run_sync(cfg.reload, file_name)
+        if not await run_sync(cfg.reload, file_name):
+            return error('配置已保存，但重新读取失败；框架继续使用旧配置', status=500)
+        result = await _app.apply_config(file_name) if _app else {'restart_required': []}
 
-        return ok(message='配置已保存')
+        restart_required = result.get('restart_required', [])
+        message = '配置已保存；部分字段需重启生效' if restart_required else '配置已保存并应用'
+        return ok(message=message, restart_required=restart_required)
     except Exception as e:
         return error(str(e), status=500)

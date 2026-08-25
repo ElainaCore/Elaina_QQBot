@@ -32,6 +32,7 @@ class PluginManager(_LoaderMixin, _WatcherMixin, _DispatchMixin, _PluginBotsMixi
         self._all_api_interceptors: list[dict[str, Any]] = []
         # 分发索引桶 (按事件类型预分组, 避免每条事件遍历全部处理器)
         self._msg_handlers: list[dict[str, Any]] = []
+        self._msg_handler_stages: dict[tuple[str, bool], tuple[dict[str, Any], ...]] = {}
         self._generic_handlers: list[dict[str, Any]] = []
         self._typed_handlers: dict[str, list[dict[str, Any]]] = {}
         self._event_handlers: dict[str, list[dict[str, Any]]] = {}
@@ -39,7 +40,7 @@ class PluginManager(_LoaderMixin, _WatcherMixin, _DispatchMixin, _PluginBotsMixi
         self._cooldowns: dict[tuple[str, ...], tuple[float, float]] = {}  # 处理器与会话标识映射到最近触发时间和冷却秒数
         self._last_cooldown_cleanup = 0.0
         self._lock = asyncio.Lock()
-        self._file_mtimes: dict[str, float] = {}
+        self._file_mtimes: dict[str, tuple[int, int]] = {}
         self._watcher_task = None
         self._watcher_running = False
         self._owner_ids: list[str] = []

@@ -29,6 +29,14 @@ _DEFAULT_MANIFEST = {
     'version': '1.0.0',
     'author': '',
 }
+_LIFECYCLE_TIMEOUT = 30.0
+
+
+async def _run_lifecycle(callback, *args):
+    if callback is None:
+        return None
+    async with asyncio.timeout(_LIFECYCLE_TIMEOUT):
+        return await callback(*args)
 
 
 class ModuleContext(BaseContext):
@@ -44,15 +52,15 @@ class ModuleContext(BaseContext):
     def module_dir(self):
         return self._root_dir
 
-    def hook(self, hook_name, *, priority=100):
+    def hook(self, hook_name, *, priority=100, timeout=None):
         def decorator(func):
-            self._hooks.register(hook_name, func, owner=self.name, priority=priority)
+            self._hooks.register(hook_name, func, owner=self.name, priority=priority, timeout=timeout)
             return func
 
         return decorator
 
-    def register_hook(self, hook_name, callback, *, priority=100):
-        self._hooks.register(hook_name, callback, owner=self.name, priority=priority)
+    def register_hook(self, hook_name, callback, *, priority=100, timeout=None):
+        self._hooks.register(hook_name, callback, owner=self.name, priority=priority, timeout=timeout)
 
     async def emit(self, hook_name, *args, **kwargs):
         await self._hooks.emit(hook_name, *args, **kwargs)
@@ -178,7 +186,7 @@ class ModuleManager:
                 module = await asyncio.to_thread(self._import_module, name, info.module_dir)
                 info.module = module
                 setup_fn = _async_lifecycle(module, 'setup')
-                result = await setup_fn(ctx) if setup_fn else None
+                result = await _run_lifecycle(setup_fn, ctx)
                 info.instance = result if result is not None else True
                 info.error = None
                 if _persist:
@@ -186,6 +194,9 @@ class ModuleManager:
                 log.info(f'模块已启用: {info.display_name}@{info.version}')
                 return True
             except Exception as e:
+                self._hook_manager.unregister_owner(info.display_name or name)
+                info.instance = info.ctx = info.module = None
+                sys.modules.pop(f'modules.{name}', None)
                 info.error = str(e)
                 report_error(EXTENSION, name, e)
                 return False
@@ -201,7 +212,7 @@ class ModuleManager:
             try:
                 teardown_fn = _async_lifecycle(info.module, 'teardown')
                 if teardown_fn:
-                    await teardown_fn()
+                    await _run_lifecycle(teardown_fn)
             except Exception as e:
                 report_error(EXTENSION, name, e)
             self._hook_manager.unregister_owner(info.display_name or name)

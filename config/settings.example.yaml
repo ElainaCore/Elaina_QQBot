@@ -48,6 +48,8 @@ embedded_qq:
 logging:
   dir: "log"                               # 日志根目录
   insert_interval: 2                       # 批量写入间隔(秒)
+  max_batch_size: 500                      # 单次事务最多写入条数
+  max_queue_entries: 100000                # 内存待写队列总上限
   retention_days: 30                       # 日志保留天数
   wal_mode: true                           # SQLite WAL模式
 

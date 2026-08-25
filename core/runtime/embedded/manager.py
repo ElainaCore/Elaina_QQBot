@@ -102,7 +102,10 @@ class EmbeddedQQManager:
         self._stopping: set[str] = set()
         self._memory_monitor = ProcessMemoryMonitor()
         self._control_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
+        self._priority_control_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
+        self._priority_control_pollers: set[str] = set()
         self._control_futures: dict[str, tuple[str, asyncio.Future[dict[str, Any]]]] = {}
+        self._red_packet_bot_aliases: dict[str, str] = {}
         self._red_packet_listeners: dict[str, Any] = {}
         self._red_packet_tasks: dict[str, set[asyncio.Task]] = {}
         self._bridge_runners: dict[str, web.AppRunner] = {}
@@ -609,6 +612,15 @@ class EmbeddedQQManager:
                 return web.Response(status=204)
             return web.json_response(command)
 
+        async def poll_priority_control(request: web.Request) -> web.Response:
+            requested = str(request.query.get('bot_id') or '')
+            if requested and requested != bot.bot_id:
+                raise web.HTTPForbidden(text='账号与桥接端口不匹配')
+            command = await self.next_control_command(bot.bot_id, priority=True)
+            if command is None:
+                return web.Response(status=204)
+            return web.json_response(command)
+
         async def resolve_control(request: web.Request) -> web.Response:
             payload = await read_payload(request)
             if not self.resolve_control_command(bot.bot_id, payload):
@@ -621,6 +633,7 @@ class EmbeddedQQManager:
                 web.post('/api/embedded/events', handle_event),
                 web.post('/api/embedded/red-packets', handle_red_packet),
                 web.get('/api/embedded/control/poll', poll_control),
+                web.get('/api/embedded/control/priority-poll', poll_priority_control),
                 web.post('/api/embedded/control/result', resolve_control),
             ]
         )
@@ -866,25 +879,73 @@ class EmbeddedQQManager:
         targets = [bot.bot_id for bot in self.bots.values() if bot.qq_version_key == version_key]
         await asyncio.gather(*(self.stop(bot_id, disable=False) for bot_id in targets), return_exceptions=True)
 
-    def _control_queue(self, bot_id: str) -> asyncio.Queue[dict[str, Any]]:
-        queue = self._control_queues.get(bot_id)
+    def _control_queue(
+        self,
+        bot_id: str,
+        *,
+        priority: bool = False,
+    ) -> asyncio.Queue[dict[str, Any]]:
+        queues = self._priority_control_queues if priority else self._control_queues
+        queue = queues.get(bot_id)
         if queue is None:
-            queue = asyncio.Queue(maxsize=32)
-            self._control_queues[bot_id] = queue
+            queue = asyncio.Queue(maxsize=64 if priority else 32)
+            queues[bot_id] = queue
         return queue
 
     async def next_control_command(
         self,
         bot_id: str,
         timeout: float = 25.0,
+        *,
+        priority: bool = False,
     ) -> dict[str, Any] | None:
         bot = self.bots.get(bot_id)
         if not bot or not bot.process or bot.process.returncode is not None:
             return None
+        if priority:
+            self._priority_control_pollers.add(bot_id)
+            try:
+                return await asyncio.wait_for(
+                    self._control_queue(bot_id, priority=True).get(),
+                    timeout,
+                )
+            except TimeoutError:
+                return None
+
+        regular_queue = self._control_queue(bot_id)
+        priority_queue = self._control_queue(bot_id, priority=True)
+        regular_get = asyncio.create_task(regular_queue.get())
+        priority_get = (
+            asyncio.create_task(priority_queue.get())
+            if bot_id not in self._priority_control_pollers
+            else None
+        )
         try:
-            return await asyncio.wait_for(self._control_queue(bot_id).get(), timeout)
-        except TimeoutError:
-            return None
+            waiters = (regular_get,) if priority_get is None else (priority_get, regular_get)
+            done, _pending = await asyncio.wait(
+                waiters,
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                return None
+            if priority_get is not None and priority_get in done:
+                command = priority_get.result()
+                if regular_get in done:
+                    with contextlib.suppress(asyncio.QueueFull):
+                        regular_queue.put_nowait(regular_get.result())
+                return command
+            return regular_get.result()
+        finally:
+            for task in (regular_get, priority_get):
+                if task is None:
+                    continue
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (regular_get, priority_get) if task is not None),
+                return_exceptions=True,
+            )
 
     def resolve_control_command(self, bot_id: str, payload: dict[str, Any]) -> bool:
         request_id = str(payload.get('request_id') or '')
@@ -904,11 +965,18 @@ class EmbeddedQQManager:
                 future.set_result(
                     action_failed(message, 1500)
                 )
-        queue = self._control_queues.pop(bot_id, None)
-        if queue:
-            while not queue.empty():
-                with contextlib.suppress(asyncio.QueueEmpty):
-                    queue.get_nowait()
+        for queues in (self._control_queues, self._priority_control_queues):
+            queue = queues.pop(bot_id, None)
+            if queue:
+                while not queue.empty():
+                    with contextlib.suppress(asyncio.QueueEmpty):
+                        queue.get_nowait()
+        self._priority_control_pollers.discard(bot_id)
+        self._red_packet_bot_aliases = {
+            self_id: target
+            for self_id, target in self._red_packet_bot_aliases.items()
+            if target != bot_id
+        }
 
     async def _control_call(
         self,
@@ -922,11 +990,18 @@ class EmbeddedQQManager:
         request_id = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
         self._control_futures[request_id] = (bot_id, future)
+        # 红包查询/领取始终走独立队列；普通轮询本身兼容兜底消费，避免启动竞态。
+        priority = command.get('type') in {'query_red_packet', 'grab_red_packet'}
+        queue = self._control_queue(bot_id, priority=priority)
         try:
-            await asyncio.wait_for(
-                self._control_queue(bot_id).put({'request_id': request_id, **command}),
-                timeout=2,
-            )
+            item = {'request_id': request_id, **command}
+            if priority:
+                try:
+                    queue.put_nowait(item)
+                except asyncio.QueueFull:
+                    return action_failed('红包优先控制队列已满', 1500)
+            else:
+                await asyncio.wait_for(queue.put(item), timeout=2)
             return await asyncio.wait_for(future, timeout)
         except TimeoutError:
             return action_failed('ElainaQQ QQ 运行时响应超时', 1500)
@@ -1028,24 +1103,33 @@ class EmbeddedQQManager:
             return False
         bot.last_seen = time.time()
         self_id = str(payload.get('self_id') or bot.uin or bot_id)
-        for owner, callback in tuple(self._red_packet_listeners.items()):
+        self._red_packet_bot_aliases[self_id] = bot_id
+        listeners = tuple(self._red_packet_listeners.items())
+        for index, (owner, callback) in enumerate(listeners):
             task = asyncio.create_task(
                 self._run_red_packet_listener(
-                    owner, callback, self_id, dict(packet),
+                    owner, callback, self_id, packet if index == 0 else dict(packet),
                 ),
                 name=f'red-packet-{owner}-{self_id}',
             )
             tasks = self._red_packet_tasks.setdefault(owner, set())
             tasks.add(task)
             task.add_done_callback(tasks.discard)
+        if self._red_packet_listeners:
+            # 先让监听器完成同步策略判断并把抢包命令放入优先队列。
+            await asyncio.sleep(0)
         return True
 
     def _red_packet_bot_id(self, self_id: str) -> str:
         self_id = str(self_id or '').strip()
         if self_id in self.bots:
             return self_id
+        cached = self._red_packet_bot_aliases.get(self_id)
+        if cached in self.bots:
+            return cached
         for bot_id, bot in self.bots.items():
             if str(bot.uin or '') == self_id:
+                self._red_packet_bot_aliases[self_id] = bot_id
                 return bot_id
         return ''
 

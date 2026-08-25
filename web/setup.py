@@ -1,5 +1,7 @@
 """Web 面板集成入口"""
 
+import asyncio
+import contextlib
 import gzip
 import logging
 import os
@@ -188,43 +190,58 @@ def _gzipped(file_path: str) -> bytes:
     return data
 
 
-def _cache_headers(path: str) -> dict:
-    """稳定文件名配合修改时间参数，禁止浏览器混用不同构建。"""
-    return {'Cache-Control': 'no-store, no-cache, must-revalidate'}
+def _cache_headers(path: str, request: web.Request) -> dict:
+    """入口文件总是校验，带构建版本的资源允许长期缓存。"""
+    if path != 'index.html' and request.query.get('v'):
+        return {'Cache-Control': 'public, max-age=31536000, immutable'}
+    return {'Cache-Control': 'no-cache, must-revalidate'}
 
 
 def _make_spa_handler(dist_dir: str):
     dist_root = os.path.realpath(dist_dir)
+    transformed_cache: dict[str, tuple[int, tuple[tuple[str, int], ...], bytes, bytes]] = {}
+    transformed_locks: dict[str, asyncio.Lock] = {}
 
-    def _versioned_index(file_path: str) -> bytes:
+    def _versioned_index(file_path: str) -> tuple[bytes, tuple[tuple[str, int], ...]]:
         """为固定资源名追加文件修改时间，避免浏览器使用旧构建。"""
         with open(file_path, encoding='utf-8') as file:
             text = file.read()
         asset_pattern = re.compile(r'((?:/web/)?assets/[^"\'\s?]+)')
+        dependencies: list[tuple[str, int]] = []
+        assets_root = os.path.join(dist_root, 'assets')
+        for root, _, files in os.walk(assets_root):
+            for filename in files:
+                asset_path = os.path.realpath(os.path.join(root, filename))
+                with contextlib.suppress(OSError):
+                    dependencies.append((asset_path, os.stat(asset_path).st_mtime_ns))
+        build_version = max((mtime_ns for _, mtime_ns in dependencies), default=os.stat(file_path).st_mtime_ns)
 
         def replace(match):
             url = match.group(1)
-            relative = url.split('/assets/', 1)[-1]
+            relative = url.split('/assets/', 1)[-1] if '/assets/' in url else url.removeprefix('assets/')
             asset_path = os.path.realpath(os.path.join(dist_root, 'assets', relative))
             if not (asset_path == dist_root or asset_path.startswith(dist_root + os.sep)) or not os.path.isfile(asset_path):
                 return url
-            return f'{url}?v={os.stat(asset_path).st_mtime_ns}'
+            return f'{url}?v={build_version}'
 
-        return asset_pattern.sub(replace, text).encode('utf-8')
+        return asset_pattern.sub(replace, text).encode('utf-8'), tuple(dependencies)
 
-    def _versioned_script(file_path: str) -> bytes:
+    def _versioned_script(file_path: str) -> tuple[bytes, tuple[tuple[str, int], ...]]:
         """给懒加载脚本的相对 import 也追加对应文件的修改时间。"""
         with open(file_path, encoding='utf-8') as file:
             text = file.read()
         base_dir = os.path.dirname(file_path)
         pattern = re.compile(r'(["\'\x60])((?:\./|assets/)[^"\'\x60?]+?\.(?:js|css))(?:\?[^"\'\x60]*)?\1')
+        dependencies: list[tuple[str, int]] = []
 
         def replace(match):
             quote, relative = match.groups()
             target = os.path.realpath(os.path.join(dist_root, relative) if relative.startswith('assets/') else os.path.join(base_dir, relative[2:]))
             if not os.path.isfile(target) or not target.startswith(dist_root + os.sep):
                 return match.group(0)
-            return f'{quote}{relative}?v={os.stat(target).st_mtime_ns}{quote}'
+            mtime_ns = os.stat(target).st_mtime_ns
+            dependencies.append((target, mtime_ns))
+            return f'{quote}{relative}?v={mtime_ns}{quote}'
 
         text = pattern.sub(replace, text)
         # 前端构建代码在创建样式链接前会检查 URL 后缀，因此先剥离查询参数。
@@ -232,20 +249,48 @@ def _make_spa_handler(dist_dir: str):
             old = f'.endsWith({quote}.css{quote})'
             new = f'.split({quote}?{quote})[0].endsWith({quote}.css{quote})'
             text = text.replace(old, new)
-        return text.encode('utf-8')
+        return text.encode('utf-8'), tuple(dependencies)
 
-    def _serve(file_path: str, path: str, request: web.Request):
+    def _dependencies_current(dependencies: tuple[tuple[str, int], ...]) -> bool:
+        try:
+            return all(os.stat(path).st_mtime_ns == mtime_ns for path, mtime_ns in dependencies)
+        except OSError:
+            return False
+
+    async def _serve(file_path: str, path: str, request: web.Request):
         ext = os.path.splitext(file_path)[1].lower()
-        headers = _cache_headers(path)
+        headers = _cache_headers(path, request)
         ct = _MIME.get(ext)
         if ct:
             headers['Content-Type'] = ct
 
         accepts_gzip = 'gzip' in request.headers.get('Accept-Encoding', '')
-        body_override = _versioned_index(file_path) if path == 'index.html' else (_versioned_script(file_path) if ext == '.js' else None)
+        body_override = None
+        compressed_override = None
+        if path == 'index.html' or ext == '.js':
+            async with transformed_locks.setdefault(file_path, asyncio.Lock()):
+                mtime_ns = (await asyncio.to_thread(os.stat, file_path)).st_mtime_ns
+                cached = transformed_cache.get(file_path)
+                cache_valid = bool(
+                    cached
+                    and cached[0] == mtime_ns
+                    and await asyncio.to_thread(_dependencies_current, cached[1])
+                )
+                if cache_valid:
+                    body_override, compressed_override = cached[2], cached[3]
+                else:
+                    transform = _versioned_index if path == 'index.html' else _versioned_script
+                    body_override, dependencies = await asyncio.to_thread(transform, file_path)
+                    compressed_override = await asyncio.to_thread(gzip.compress, body_override, 6)
+                    transformed_cache[file_path] = (
+                        mtime_ns,
+                        dependencies,
+                        body_override,
+                        compressed_override,
+                    )
         if ext in _COMPRESSIBLE and accepts_gzip:
             try:
-                body = gzip.compress(body_override, 6) if body_override is not None else _gzipped(file_path)
+                body = compressed_override if compressed_override is not None else await asyncio.to_thread(_gzipped, file_path)
                 headers['Content-Encoding'] = 'gzip'
                 headers['Vary'] = 'Accept-Encoding'
                 return web.Response(body=body, headers=headers)
@@ -262,11 +307,11 @@ def _make_spa_handler(dist_dir: str):
 
         file_path = os.path.realpath(os.path.join(dist_root, path.replace('/', os.sep)))
         if (file_path == dist_root or file_path.startswith(dist_root + os.sep)) and os.path.isfile(file_path):
-            return _serve(file_path, path, request)
+            return await _serve(file_path, path, request)
 
         index = os.path.join(dist_root, 'index.html')
         if os.path.isfile(index):
-            return _serve(index, 'index.html', request)
+            return await _serve(index, 'index.html', request)
 
         return web.Response(text='Not Found', status=404)
 

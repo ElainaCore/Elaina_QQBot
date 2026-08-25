@@ -10,7 +10,7 @@ from typing import Any
 
 log = logging.getLogger('ElainaQQ.event_dispatcher')
 
-EventProcessor = Callable[[Any, asyncio.Future[bool]], Awaitable[None]]
+EventProcessor = Callable[[Any], Awaitable[None]]
 
 
 class EventDispatcher:
@@ -26,7 +26,7 @@ class EventDispatcher:
         self._processor = processor
         self._concurrency = asyncio.Semaphore(max(1, max_concurrency))
         self._max_pending = max(1, max_pending)
-        self._queues: dict[str, deque[tuple[Any, asyncio.Future[bool]]]] = {}
+        self._queues: dict[str, deque[Any]] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._pending = 0
         self._accepting = True
@@ -36,13 +36,12 @@ class EventDispatcher:
         return self._pending
 
     async def submit(self, ordering_key: str, event: Any) -> bool:
-        """提交事件，并在事件完成持久化后返回。"""
+        """提交事件；成功进入有界队列后立即返回。"""
         if not self._accepting or self._pending >= self._max_pending:
             return False
 
-        persisted = asyncio.get_running_loop().create_future()
         queue = self._queues.setdefault(ordering_key, deque())
-        queue.append((event, persisted))
+        queue.append(event)
         self._pending += 1
         if ordering_key not in self._workers:
             self._workers[ordering_key] = asyncio.create_task(
@@ -50,30 +49,19 @@ class EventDispatcher:
                 name=f'事件分发:{ordering_key[-48:]}',
             )
 
-        try:
-            return bool(await asyncio.shield(persisted))
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return False
+        return True
 
     async def _drain(self, ordering_key: str) -> None:
         queue = self._queues[ordering_key]
         try:
             while queue:
-                event, persisted = queue[0]
+                event = queue[0]
                 try:
                     async with self._concurrency:
-                        await self._processor(event, persisted)
-                    if not persisted.done():
-                        persisted.set_result(True)
+                        await self._processor(event)
                 except asyncio.CancelledError:
-                    if not persisted.done():
-                        persisted.set_result(False)
                     raise
                 except Exception as error:
-                    if not persisted.done():
-                        persisted.set_result(False)
                     log.error('事件处理失败: %s', error, exc_info=error)
                 finally:
                     queue.popleft()
@@ -100,10 +88,6 @@ class EventDispatcher:
 
     def _reject_pending(self) -> None:
         """拒绝强制关闭时尚未处理的事件，并释放全部队列引用。"""
-        for queue in self._queues.values():
-            for _event, persisted in queue:
-                if not persisted.done():
-                    persisted.set_result(False)
         self._queues.clear()
         self._workers.clear()
         self._pending = 0

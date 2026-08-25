@@ -159,7 +159,7 @@ def set_context(app_instance, base_dir: str):
     bots.set_context(app_instance)
     logs.set_context(app_instance)
     plugin_mgr.set_context(app_instance, base_dir)
-    config_handler.set_context(base_dir)
+    config_handler.set_context(app_instance, base_dir)
     database.set_context(app_instance, base_dir)
     messages.set_context(app_instance, base_dir)
     onebot_conn.set_context(app_instance)
@@ -326,4 +326,13 @@ async def handle_ext_route(request: web.Request):
     from core.protocols.onebot.api import api_call_source
 
     with plugin_scope(entry['context']), api_call_source(entry.get('owner', '')):
-        return await entry['handler'](request)
+        configured_timeout = entry.get('timeout')
+        timeout = 30.0 if configured_timeout is None else float(configured_timeout)
+        if timeout <= 0:
+            return await entry['handler'](request)
+        try:
+            async with asyncio.timeout(timeout):
+                return await entry['handler'](request)
+        except TimeoutError:
+            log.warning('插件路由超时: %s %s', request.method, request.path)
+            return error('插件路由执行超时', status=504)

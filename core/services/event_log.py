@@ -178,7 +178,7 @@ class EventLogRecorder:
                 'extra': 'send',
             },
             bot_qq=bot_qq,
-            durable=True,
+            durable=False,
         )
         return True
 
@@ -246,7 +246,7 @@ class EventLogRecorder:
                 'extra': json.dumps({'nickname': nickname, 'direction': direction}, ensure_ascii=False),
             },
             bot_qq=bot_qq,
-            durable=True,
+            durable=False,
         )
 
     async def _log_lifecycle_event(self, event: NoticeEvent | RequestEvent | MetaEvent) -> None:
@@ -292,7 +292,7 @@ class EventLogRecorder:
                 'raw_data': raw_json,
             },
             bot_qq=bot_qq,
-            durable=True,
+            durable=False,
         )
         if isinstance(event, NoticeEvent) and event.notice_type in ('group_recall', 'friend_recall'):
             recalled_mid = str(event.raw_data.get('message_id', '') or '')
@@ -303,4 +303,3 @@ class EventLogRecorder:
                     (recalled_mid,),
                     bot_qq=bot_qq,
                 )
-

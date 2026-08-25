@@ -98,7 +98,7 @@ async def handle_save_connections(request: web.Request):
 
     if _app:
         try:
-            await _app.reload_connections()
+            await _app.apply_config('connections')
         except Exception as e:
             log.warning(f'重载连接失败: {e}')
             return error(f'已保存但重载失败: {e}', status=500)

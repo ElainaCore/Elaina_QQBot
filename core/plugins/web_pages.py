@@ -2,11 +2,28 @@
 
 from __future__ import annotations
 
+import contextvars
 import inspect
+from contextlib import contextmanager
 
 from core.services.files import read_text
 
 _registry: dict = {}  # 页面标识映射到页面信息
+_resource_stage: contextvars.ContextVar[dict[str, dict] | None] = contextvars.ContextVar(
+    'plugin_web_resource_stage',
+    default=None,
+)
+
+
+@contextmanager
+def resource_registration_scope():
+    """把加载期 Web 注册写入独立快照，提交前不影响在线路由。"""
+    stage = {'pages': {}, 'routes': {}}
+    token = _resource_stage.set(stage)
+    try:
+        yield stage
+    finally:
+        _resource_stage.reset(token)
 
 
 def register_page(
@@ -23,7 +40,9 @@ def register_page(
     from core.plugins.context import current_plugin
 
     context = current_plugin()
-    _registry[key] = {
+    stage = _resource_stage.get()
+    target = stage['pages'] if stage is not None else _registry
+    target[key] = {
         'key': key,
         'label': label,
         'source': source,
@@ -37,7 +56,9 @@ def register_page(
 
 def unregister_page(key: str):
     """注销页面"""
-    _registry.pop(key, None)
+    stage = _resource_stage.get()
+    target = stage['pages'] if stage is not None else _registry
+    target.pop(key, None)
 
 
 def get_pages() -> list:
@@ -67,7 +88,7 @@ _routes: dict = {}  # 请求方法和路径映射到路由信息
 _ROUTE_PREFIX = '/api/ext/'
 
 
-def register_route(method: str, path: str, handler=None, *, auth: bool = True):
+def register_route(method: str, path: str, handler=None, *, auth: bool = True, timeout: float = 30):
     """注册插件 HTTP 路由 (路径需以 /api/ext/ 开头; 可作装饰器或直接传 handler)"""
     from core.plugins.context import current_plugin
 
@@ -80,13 +101,16 @@ def register_route(method: str, path: str, handler=None, *, auth: bool = True):
     def _add(fn):
         if not inspect.iscoroutinefunction(fn):
             raise TypeError(f'插件 HTTP 路由必须使用 async def 定义: {fn.__module__}.{fn.__qualname__}')
-        _routes[(method, path)] = {
+        stage = _resource_stage.get()
+        target = stage['routes'] if stage is not None else _routes
+        target[(method, path)] = {
             'method': method,
             'path': path,
             'handler': fn,
             'auth': bool(auth),
             'owner': owner,
             'context': context,
+            'timeout': float(timeout),
         }
         return fn
 
@@ -95,7 +119,9 @@ def register_route(method: str, path: str, handler=None, *, auth: bool = True):
 
 def unregister_route(method: str, path: str):
     """注销路由"""
-    _routes.pop((str(method).upper(), path), None)
+    stage = _resource_stage.get()
+    target = stage['routes'] if stage is not None else _routes
+    target.pop((str(method).upper(), path), None)
 
 
 def match_route(method: str, path: str):
@@ -129,8 +155,26 @@ def clear_resources_by_owner(owner: str) -> int:
     return len(page_keys) + clear_routes_by_owner(owner)
 
 
+def snapshot_resources_by_owner(owner: str) -> dict[str, dict]:
+    """复制一个插件的 Web 注册项，供热重载提交或回滚。"""
+    return {
+        'pages': {key: dict(value) for key, value in _registry.items() if value.get('owner') == owner},
+        'routes': {key: dict(value) for key, value in _routes.items() if value.get('owner') == owner},
+    }
+
+
+def restore_resources_by_owner(owner: str, snapshot: dict[str, dict]) -> None:
+    """用快照替换一个插件当前的 Web 注册项。"""
+    clear_resources_by_owner(owner)
+    _registry.update(snapshot.get('pages', {}))
+    _routes.update(snapshot.get('routes', {}))
+
+
 def has_resources_by_owner(owner: str) -> bool:
     """判断指定插件是否注册过页面或 HTTP 路由。"""
-    return any(value.get('owner') == owner for value in _registry.values()) or any(
-        value.get('owner') == owner for value in _routes.values()
+    stage = _resource_stage.get()
+    pages = stage['pages'] if stage is not None else _registry
+    routes = stage['routes'] if stage is not None else _routes
+    return any(value.get('owner') == owner for value in pages.values()) or any(
+        value.get('owner') == owner for value in routes.values()
     )

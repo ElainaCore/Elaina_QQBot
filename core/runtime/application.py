@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import copy
 import gc
 import os
 import signal
@@ -35,11 +36,11 @@ def get_app():
 
 
 def _tune_gc() -> None:
-    """冻结启动期稳定对象并降低全量回收频率。"""
+    """为长期运行且支持热重载的进程设置保守 GC 参数。"""
     gc.collect()
     with contextlib.suppress(AttributeError):
-        gc.freeze()
-    gc.set_threshold(50_000, 25, 25)
+        gc.unfreeze()
+    gc.set_threshold(700, 10, 10)
 
 
 class Application:
@@ -65,6 +66,7 @@ class Application:
         self._event_dispatcher = None
         self._event_log_recorder = None
         self._last_queue_warning = 0.0
+        self._static_settings = {}
 
     @property
     def adapter(self):
@@ -113,6 +115,7 @@ class Application:
 
         # 1) 配置
         cfg.init(self._path('config'))
+        self._static_settings = self._static_setting_values()
         fw_name = cfg.get('settings', 'web.framework_name', PRODUCT_NAME)
         setup_logger(framework_name=fw_name)
         log.info(f'{"=" * 5} {fw_name} 启动中 {"=" * 5}')
@@ -151,6 +154,8 @@ class Application:
             wal_mode=log_cfg.get('wal_mode', True) if isinstance(log_cfg, dict) else True,
             insert_interval=log_cfg.get('insert_interval', 2) if isinstance(log_cfg, dict) else 2,
             retention_days=log_cfg.get('retention_days', 30) if isinstance(log_cfg, dict) else 30,
+            max_queue_entries=log_cfg.get('max_queue_entries', 100_000) if isinstance(log_cfg, dict) else 100_000,
+            max_batch_size=log_cfg.get('max_batch_size', 500) if isinstance(log_cfg, dict) else 500,
         )
         await self._log_service.start()
         self._event_log_recorder = EventLogRecorder(
@@ -176,7 +181,7 @@ class Application:
             self._embedded_qq_start_task.add_done_callback(self._report_embedded_start_failure)
 
         # 9) 配置监视
-        self._config_watcher = ConfigWatcherService(interval=5.0)
+        self._config_watcher = ConfigWatcherService(interval=5.0, on_reload=self.apply_config)
         self._config_watcher.start()
 
         _tune_gc()
@@ -254,6 +259,8 @@ class Application:
             await self._shutdown_step('内置 QQ 进程', self._embedded_qq.stop_all(), timeout=20)
         if self._event_dispatcher:
             await self._shutdown_step('事件调度器', self._event_dispatcher.shutdown(), timeout=15)
+        if self._config_watcher:
+            await self._shutdown_step('配置监视', self._config_watcher.shutdown(), timeout=3)
         if self._plugin_manager:
             await self._shutdown_step('插件管理器', self._plugin_manager.shutdown(), timeout=10)
         if self._module_manager:
@@ -286,8 +293,8 @@ class Application:
         if error:
             log.error('内置 QQ 自动启动任务失败: %s', error, exc_info=error)
 
-    async def _process_event(self, event, persisted):
-        """持久化并分发已经完成规范化的 OneBot 事件。"""
+    async def _process_event(self, event):
+        """记录并分发已经完成规范化的 OneBot 事件。"""
         # 注入 API 引用, 使插件可通过 event.reply() 调用
         from core.protocols.onebot.api import get_api, routed_self_id
 
@@ -295,14 +302,22 @@ class Application:
 
         # 同一事件链中的 API 调用始终回到产生事件的 QQ，避免多账号串号。
         with routed_self_id(str(event.self_id or '')):
-            # 日志属于事件接入的基础链路，必须先于可扩展钩子持久化。
-            # 这样模块或插件异常不会导致内置 QQ / OneBot 的日志一起丢失。
+            # 日志转换与插件分发并行启动；SQLite 仍由后台批量写入。
+            log_task = None
             if self._event_log_recorder:
-                await self._event_log_recorder.log_event(event)
-            if persisted is not None and not persisted.done():
-                persisted.set_result(True)
-            await self._hook_manager.emit('on_raw_event', event)
-            await self._plugin_manager.dispatch(event)
+                log_task = asyncio.create_task(
+                    self._event_log_recorder.log_event(event),
+                    name='记录 OneBot 事件',
+                )
+            try:
+                if self._hook_manager.has('on_raw_event'):
+                    await self._hook_manager.emit('on_raw_event', event)
+                await self._plugin_manager.dispatch(event)
+            finally:
+                if log_task is not None:
+                    result = await asyncio.gather(log_task, return_exceptions=True)
+                    if isinstance(result[0], Exception):
+                        log.warning('事件日志记录失败: %s', result[0])
 
     async def ingest_event(self, payload: dict, default_self_id: str = '') -> bool:
         """所有内置及网络来源共用的唯一 OneBot 事件入口。"""
@@ -345,3 +360,57 @@ class Application:
     def push_web_log(self, log_type: str, entry: dict):
         if self._web_log_cb:
             self._web_log_cb(log_type, entry)
+
+    @staticmethod
+    def _static_setting_values() -> dict[str, object]:
+        def snapshot(key: str, default):
+            return copy.deepcopy(cfg.get('settings', key, default))
+
+        return {
+            'server.host': snapshot('server.host', '0.0.0.0'),
+            'server.port': snapshot('server.port', 5201),
+            'web.framework_name': snapshot('web.framework_name', PRODUCT_NAME),
+            'web.favicon_url': snapshot('web.favicon_url', ''),
+            'logging.dir': snapshot('logging.dir', 'log'),
+            'logging.wal_mode': snapshot('logging.wal_mode', True),
+            'embedded_qq.enabled': snapshot('embedded_qq.enabled', True),
+            'embedded_qq.bridge_port_start': snapshot('embedded_qq.bridge_port_start', 30010),
+            'embedded_qq.command': snapshot('embedded_qq.command', ''),
+            'embedded_qq.qq_path': snapshot('embedded_qq.qq_path', ''),
+            'embedded_qq.packet_backend': snapshot('embedded_qq.packet_backend', 'auto'),
+            'embedded_qq.packet_verbose': snapshot('embedded_qq.packet_verbose', False),
+            'embedded_qq.packet_o3_hook': snapshot('embedded_qq.packet_o3_hook', False),
+            'embedded_qq.packet_bypass': snapshot('embedded_qq.packet_bypass', {}),
+            'embedded_qq.data_dir': snapshot('embedded_qq.data_dir', 'data/qq'),
+            'embedded_qq.headless': snapshot('embedded_qq.headless', True),
+            'embedded_qq.single_process': snapshot('embedded_qq.single_process', False),
+            'embedded_qq.accounts': tuple(snapshot('embedded_qq.accounts', []) or ()),
+        }
+
+    async def apply_config(self, name: str) -> dict[str, list[str]]:
+        """把已重新读取的配置应用到可热更新组件。"""
+        if name == 'connections':
+            await self.reload_connections()
+            if self._config_watcher:
+                self._config_watcher.mark_current(name)
+            return {'restart_required': []}
+        if name != 'settings':
+            return {'restart_required': []}
+
+        if self._plugin_manager:
+            owner_ids = cfg.get('settings', 'owner.ids', []) or []
+            self._plugin_manager.set_owner_ids([str(uid).strip() for uid in owner_ids if str(uid).strip()])
+        if self._log_service:
+            log_cfg = cfg.get('settings', 'logging') or {}
+            if isinstance(log_cfg, dict):
+                self._log_service.update_config(
+                    insert_interval=log_cfg.get('insert_interval', 2),
+                    retention_days=log_cfg.get('retention_days', 30),
+                    max_queue_entries=log_cfg.get('max_queue_entries', 100_000),
+                    max_batch_size=log_cfg.get('max_batch_size', 500),
+                )
+        current = self._static_setting_values()
+        restart_required = [key for key, initial in self._static_settings.items() if current.get(key) != initial]
+        if self._config_watcher:
+            self._config_watcher.mark_current(name)
+        return {'restart_required': restart_required}

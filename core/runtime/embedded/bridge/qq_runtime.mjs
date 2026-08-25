@@ -169,6 +169,7 @@ class QQInstance {
   oneBotStreamFiles = /* @__PURE__ */ new Set();
   oneBotOnlineClients = [];
   redPackets = /* @__PURE__ */ new Map();
+  redPacketCleanupAt = 0;
   runtime;
   constructor(botConfig, qqInfo, wrapper, _baseDataDir) {
     this.botConfig = botConfig;
@@ -2870,6 +2871,22 @@ class QQInstance {
     const channel = Number(value);
     return Number.isFinite(channel) ? channel : 0;
   }
+  redPacketType(wallet) {
+    const candidates = [
+      wallet?.redBag?.redBagType,
+      wallet?.redBagType,
+      wallet?.grabedMsg?.redBagType,
+      wallet?.receiver?.redBagType,
+      wallet?.redBag?.redType,
+      wallet?.grabedMsg?.redType,
+    ];
+    for (const value of candidates) {
+      const type = Number(value);
+      if (Number.isFinite(type) && type >= 0) return Math.trunc(type);
+    }
+    const exclusive = this.redPacketExclusiveIdentity(wallet);
+    return exclusive.uin || exclusive.uid ? 3 : 0;
+  }
   redPacketPassword(wallet) {
     return String(
       wallet?.receiver?.title
@@ -2880,7 +2897,7 @@ class QQInstance {
       || ""
     ).trim();
   }
-  rememberRedPacket(msg, wallet) {
+  rememberRedPacket(msg, wallet, event = null) {
     const billNo = this.redPacketBillNo(wallet);
     if (!billNo) return null;
     const existing = this.redPackets.get(billNo);
@@ -2888,19 +2905,24 @@ class QQInstance {
     const chatType = Number(msg?.chatType ?? 2);
     const peerUin = String(msg?.peerUin || "");
     const exclusive = this.redPacketExclusiveIdentity(wallet);
+    const eventReceivedAtMs = Date.now();
+    const rawSenderId = String(msg?.senderUin || "").trim();
+    const eventSenderId = String(event?.user_id || "").trim();
+    const senderId = rawSenderId && rawSenderId !== "0" ? rawSenderId : eventSenderId;
     const packet = {
-      createdAt: Date.now(),
+      createdAt: eventReceivedAtMs,
+      eventReceivedAtMs,
       billNo,
       wallet,
       peerUid: String(msg?.peerUid || ""),
       peerUin,
       groupId: chatType === 2 ? peerUin : "",
       groupName: String(msg?.peerName || ""),
-      senderId: String(msg?.senderUin || ""),
+      senderId,
       senderName: String(msg?.sendMemberName || msg?.sendNickName || ""),
       chatType,
       msgSeq: String(msg?.msgSeq || ""),
-      redBagType: Number(wallet?.redBag?.redBagType ?? wallet?.redBagType ?? wallet?.grabedMsg?.redBagType ?? -1),
+      redBagType: this.redPacketType(wallet),
       senderRole: Number(msg?.roleType ?? 4),
       wishing: String(wallet?.receiver?.title || wallet?.receiver?.notice || ""),
       password: this.redPacketPassword(wallet),
@@ -2909,18 +2931,30 @@ class QQInstance {
       exclusiveUid: exclusive.uid
     };
     this.redPackets.set(billNo, packet);
-    const cutoff = Date.now() - 10 * 60 * 1e3;
-    for (const [key, value] of this.redPackets) {
-      if (value.createdAt < cutoff) this.redPackets.delete(key);
+    if (eventReceivedAtMs >= this.redPacketCleanupAt) {
+      const cutoff = eventReceivedAtMs - 10 * 60 * 1e3;
+      for (const [key, value] of this.redPackets) {
+        if (value.createdAt < cutoff) this.redPackets.delete(key);
+      }
+      this.redPacketCleanupAt = eventReceivedAtMs + 60_000;
     }
     while (this.redPackets.size > 5e3) {
       this.redPackets.delete(this.redPackets.keys().next().value);
     }
     return packet;
   }
+  emitRedPackets(msg, elements) {
+    for (const element of elements) {
+      if (!element?.walletElement) continue;
+      const packet = this.rememberRedPacket(msg, element.walletElement);
+      if (!packet) continue;
+      this.redPacketCallback?.(this.redPacketPayload(packet));
+    }
+  }
   redPacketPayload(packet) {
     return {
       bill_no: packet.billNo,
+      event_received_at_ms: packet.eventReceivedAtMs,
       peer_uid: packet.peerUid,
       peer_uin: packet.peerUin,
       group_id: packet.groupId,
@@ -5254,10 +5288,11 @@ class QQInstance {
   async handleMessage(msg, forceSent = false) {
     const elements = msg.elements || [];
     if (Number(msg?.msgType || 0) === 1 || !elements.length) return;
+    this.emitRedPackets(msg, elements);
     const sideEvents = this.handleMessageSideEvents(msg);
     const event = await this.toOneBotEvent(msg);
     if (!event) {
-      await sideEvents;
+      await Promise.allSettled([sideEvents]);
       return;
     }
     if (forceSent) {
@@ -5296,12 +5331,7 @@ class QQInstance {
         });
       }
     }
-    for (const element of elements) {
-      if (!element?.walletElement) continue;
-      const packet = this.rememberRedPacket(msg, element.walletElement);
-      if (packet) this.redPacketCallback?.(this.redPacketPayload(packet));
-    }
-    await sideEvents;
+    await Promise.allSettled([sideEvents]);
   }
   rememberOneBotMessage(event, nativeId = "", rawMessage = null) {
     const messageId = String(event.message_id);

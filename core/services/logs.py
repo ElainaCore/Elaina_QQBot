@@ -6,6 +6,7 @@ import datetime
 import os
 import sqlite3
 import threading
+import time
 from collections import deque
 
 from core.foundation.logging import SYSTEM, get_logger
@@ -18,11 +19,24 @@ class LogService:
 
     _instance = None
 
-    def __init__(self, base_dir: str, wal_mode: bool = True, insert_interval: float = 2.0, retention_days: int = 30):
+    def __init__(
+        self,
+        base_dir: str,
+        wal_mode: bool = True,
+        insert_interval: float = 2.0,
+        retention_days: int = 30,
+        max_queue_entries: int = 100_000,
+        max_batch_size: int = 500,
+    ):
         self._base_dir = base_dir
         self._wal_mode = wal_mode
         self._insert_interval = insert_interval
         self._retention_days = retention_days
+        self._max_queue_entries = max(1, int(max_queue_entries))
+        self._max_batch_size = max(1, int(max_batch_size))
+        self._queued_entries = 0
+        self._dropped_entries = 0
+        self._last_drop_warning = 0.0
         self._queues: dict[tuple[str, str], deque] = {}  # 日志类型和账号映射到待写队列
         self._connections: dict[tuple[str, str], sqlite3.Connection] = {}  # 日志类型和账号映射到数据库连接
         self._queue_lock = threading.Lock()
@@ -31,12 +45,14 @@ class LogService:
         self._flush_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._running = False
         self._flush_task = None
+        self._cleanup_task = None
         LogService._instance = self
 
     async def start(self):
         await asyncio.to_thread(os.makedirs, self._base_dir, exist_ok=True)
         self._running = True
         self._flush_task = asyncio.create_task(self._flush_loop())
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop(), name='log-retention-cleanup')
         log.info(f'日志服务启动: {self._base_dir}')
 
     async def shutdown(self):
@@ -45,6 +61,10 @@ class LogService:
             self._flush_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._flush_task
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._cleanup_task
         try:
             await self._flush_all()
         finally:
@@ -62,17 +82,41 @@ class LogService:
     def _flush_lock(self, key: tuple[str, str]) -> asyncio.Lock:
         return self._flush_locks.setdefault(key, asyncio.Lock())
 
+    @property
+    def stats(self) -> dict[str, int]:
+        """返回无需磁盘访问的队列状态快照。"""
+        with self._queue_lock:
+            return {
+                'queued': self._queued_entries,
+                'dropped': self._dropped_entries,
+                'limit': self._max_queue_entries,
+            }
+
+    def update_config(
+        self,
+        *,
+        insert_interval: float | None = None,
+        retention_days: int | None = None,
+        max_queue_entries: int | None = None,
+        max_batch_size: int | None = None,
+    ) -> None:
+        """热更新不需要重建 SQLite 连接的日志参数。"""
+        if insert_interval is not None:
+            self._insert_interval = max(0.05, float(insert_interval))
+        if retention_days is not None:
+            self._retention_days = int(retention_days)
+        if max_queue_entries is not None:
+            self._max_queue_entries = max(1, int(max_queue_entries))
+        if max_batch_size is not None:
+            self._max_batch_size = max(1, int(max_batch_size))
+
     def _get_conn(self, log_type: str, bot_qq: str = '') -> sqlite3.Connection:
         key = (log_type, bot_qq or '')
         with self._connection_lock:
             if key in self._connections:
                 return self._connections[key]
-            if bot_qq:
-                db_dir = os.path.join(self._base_dir, str(bot_qq))
-                os.makedirs(db_dir, exist_ok=True)
-                db_path = os.path.join(db_dir, f'{log_type}.db')
-            else:
-                db_path = os.path.join(self._base_dir, f'{log_type}.db')
+            db_path = self._database_path(key)
+            os.makedirs(os.path.dirname(db_path), exist_ok=True)
             conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
             conn.row_factory = sqlite3.Row
             if self._wal_mode:
@@ -125,31 +169,82 @@ class LogService:
             self._connections[key] = conn
             return conn
 
-    def add_nowait(self, log_type: str, entry: dict, bot_qq: str = ''):
-        """同步入队，仅追加到内存队列，不执行磁盘读写。"""
+    def _database_path(self, key: tuple[str, str]) -> str:
+        log_type, bot_qq = key
+        if bot_qq:
+            return os.path.join(self._base_dir, bot_qq, f'{log_type}.db')
+        return os.path.join(self._base_dir, f'{log_type}.db')
+
+    def _warn_queue_drop(self, log_type: str) -> None:
+        now = time.monotonic()
+        if now - self._last_drop_warning < 30:
+            return
+        self._last_drop_warning = now
+        log.warning(
+            '日志队列已满，开始丢弃新日志 [%s]（queued=%d, dropped=%d）',
+            log_type,
+            self._queued_entries,
+            self._dropped_entries,
+        )
+
+    def add_nowait(self, log_type: str, entry: dict, bot_qq: str = '') -> bool:
+        """同步入队，仅追加到内存队列，不执行磁盘读写。
+
+        队列有界，避免数据库异常或磁盘拥塞时无限占用内存。
+        """
         key = (log_type, bot_qq or '')
         with self._queue_lock:
-            if key not in self._queues:
-                self._queues[key] = deque()
-            self._queues[key].append(entry)
+            if self._queued_entries >= self._max_queue_entries:
+                self._dropped_entries += 1
+                accepted = False
+            else:
+                queue = self._queues.setdefault(key, deque())
+                queue.append(entry)
+                self._queued_entries += 1
+                accepted = True
+        if not accepted:
+            self._warn_queue_drop(log_type)
+        return accepted
 
     async def add(self, log_type: str, entry: dict, bot_qq: str = '', durable: bool = False):
         """添加日志条目；关键事件可要求在返回前确认 SQLite 已提交。"""
-        self.add_nowait(log_type, entry, bot_qq)
+        accepted = self.add_nowait(log_type, entry, bot_qq)
+        if not accepted:
+            return False
         if durable:
             await self.flush(log_type, bot_qq)
+        return True
 
     async def add_many(self, log_type: str, entries: list[dict], bot_qq: str = '', durable: bool = False):
         """批量添加日志，供 QQ 原生历史同步使用。"""
+        if durable and entries:
+            await self.flush(log_type, bot_qq)
+            for offset in range(0, len(entries), self._max_batch_size):
+                await asyncio.to_thread(
+                    self._write_entries,
+                    log_type,
+                    str(bot_qq or ''),
+                    entries[offset : offset + self._max_batch_size],
+                )
+            return True
         if entries:
             key = (log_type, bot_qq or '')
             with self._queue_lock:
-                self._queues.setdefault(key, deque()).extend(entries)
-        if durable and entries:
-            await self.flush(log_type, bot_qq)
+                available = self._max_queue_entries - self._queued_entries
+                accepted = max(0, min(len(entries), available))
+                if accepted:
+                    self._queues.setdefault(key, deque()).extend(entries[:accepted])
+                    self._queued_entries += accepted
+                if accepted < len(entries):
+                    self._dropped_entries += len(entries) - accepted
+            if accepted < len(entries):
+                self._warn_queue_drop(log_type)
+            return accepted == len(entries)
+        return True
 
     async def execute(self, log_type: str, sql: str, params=None, bot_qq: str = '') -> int:
         """异步执行更新或删除操作。"""
+        await self.flush(log_type, bot_qq)
         return await asyncio.to_thread(self._execute_sync, log_type, sql, params, bot_qq)
 
     def _execute_sync(self, log_type: str, sql: str, params=None, bot_qq: str = '') -> int:
@@ -178,22 +273,36 @@ class LogService:
             await asyncio.gather(*(self._flush_key(key) for key in keys))
 
     async def _flush_key(self, key: tuple[str, str]) -> None:
-        """合并并写出单个分库的待处理日志。"""
+        """分批写出开始刷新时已有的日志，不长期占用该分库的刷新锁。"""
         async with self._flush_lock(key):
             with self._queue_lock:
                 queue = self._queues.get(key)
-                entries = list(queue) if queue else []
-                if queue:
-                    queue.clear()
-            if not entries:
-                return
-            try:
-                await asyncio.to_thread(self._write_entries, key[0], key[1], entries)
-            except Exception:
-                # 写入失败时把整批放回队首，保证消息和事件不会静默丢失。
+                remaining = len(queue) if queue else 0
+            while remaining > 0:
                 with self._queue_lock:
-                    self._queues.setdefault(key, deque()).extendleft(reversed(entries))
-                raise
+                    queue = self._queues.get(key)
+                    if not queue:
+                        return
+                    batch_size = min(len(queue), remaining, self._max_batch_size)
+                    entries = [queue.popleft() for _ in range(batch_size)]
+                    self._queued_entries -= len(entries)
+                    remaining -= len(entries)
+                if not entries:
+                    return
+                try:
+                    await asyncio.to_thread(self._write_entries, key[0], key[1], entries)
+                except Exception:
+                    # 失败批次完整放回。短暂超过软上限时，新日志会被拒绝，
+                    # 但已经接收的日志不会因为并发入队而丢失。
+                    with self._queue_lock:
+                        queue = self._queues.setdefault(key, deque())
+                        queue.extendleft(reversed(entries))
+                        self._queued_entries += len(entries)
+                    raise
+            with self._queue_lock:
+                queue = self._queues.get(key)
+                if queue is not None and not queue:
+                    self._queues.pop(key, None)
 
     def _query_sync(self, log_type: str, sql: str, params=None, bot_qq: str = '') -> list:
         try:
@@ -214,6 +323,17 @@ class LogService:
                 await self._flush_all()
             except Exception as error:
                 log.warning(f'定时写入日志失败，将在下次重试: {error}')
+
+    async def _cleanup_loop(self):
+        """定期执行日志保留清理，并回收 WAL 文件。"""
+        while self._running:
+            try:
+                await self.cleanup()
+                await asyncio.sleep(86_400)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                log.warning('日志清理失败: %s', error)
 
     async def _flush_all(self):
         await self.flush()
@@ -256,16 +376,53 @@ class LogService:
         """异步清理过期日志。"""
         if self._retention_days <= 0:
             return
+        await self.flush()
         await asyncio.to_thread(self._cleanup_sync)
 
     def _cleanup_sync(self):
         cutoff = (datetime.datetime.now() - datetime.timedelta(days=self._retention_days)).strftime('%Y-%m-%d %H:%M:%S')
         with self._connection_lock:
             connections = tuple(self._connections.items())
+        active_paths = {os.path.realpath(self._database_path(key)) for key, _ in connections}
         for key, conn in connections:
             with self._database_lock(key):
+                self._cleanup_connection(conn, cutoff, self._database_path(key))
+
+        # 未在本次进程中打开的历史账号分库也必须遵守保留期限。
+        for root, dirs, files in os.walk(self._base_dir):
+            dirs[:] = [name for name in dirs if name != '__pycache__']
+            for filename in files:
+                if not filename.endswith('.db'):
+                    continue
+                path = os.path.realpath(os.path.join(root, filename))
+                if path in active_paths:
+                    continue
                 try:
-                    conn.execute('DELETE FROM log WHERE timestamp < ?', (cutoff,))
-                    conn.commit()
-                except Exception:
-                    pass
+                    conn = sqlite3.connect(path, timeout=30)
+                    try:
+                        self._cleanup_connection(conn, cutoff, path)
+                    finally:
+                        conn.close()
+                except Exception as error:
+                    log.warning('清理历史日志失败 [%s]: %s', path, error)
+
+    def _cleanup_connection(self, conn: sqlite3.Connection, cutoff: str, path: str) -> None:
+        try:
+            table = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='log'").fetchone()
+            if table is None:
+                return
+            while True:
+                cursor = conn.execute(
+                    'DELETE FROM log WHERE id IN '
+                    '(SELECT id FROM log WHERE timestamp < ? LIMIT 5000)',
+                    (cutoff,),
+                )
+                conn.commit()
+                if cursor.rowcount < 5000:
+                    break
+            if self._wal_mode:
+                conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        except Exception as error:
+            with contextlib.suppress(Exception):
+                conn.rollback()
+            log.warning('清理历史日志失败 [%s]: %s', path, error)

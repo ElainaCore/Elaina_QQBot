@@ -47,34 +47,45 @@ class Config:
     def _load_all(self):
         """加载配置目录下所有 yaml 文件"""
         if not os.path.isdir(self._config_dir):
-            return
+            return []
+        loaded = []
         for fname in os.listdir(self._config_dir):
             if fname.endswith('.yaml') and not fname.endswith('.example.yaml'):
                 name = fname[:-5]
-                self._load_file(name)
+                if self._load_file(name):
+                    loaded.append(name)
+        return loaded
 
     def _load_file(self, name: str):
         """加载单个配置文件"""
         path = os.path.join(self._config_dir, f'{name}.yaml')
         if not os.path.isfile(path):
-            return
+            return False
         try:
             with open(path, encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
+                data = yaml.safe_load(f)
+            if data is None:
+                data = {}
+            if not isinstance(data, dict):
+                raise TypeError('YAML 根节点必须是对象')
             with self._lock:
                 self._data[name] = data
+            return True
         except Exception as e:
             log.error(f'加载配置失败 [{name}]: {e}')
+            return False
 
     def reload(self, name: str | None = None):
         """重新加载配置"""
         if name:
-            self._load_file(name)
-            self._fire_callbacks(name)
-        else:
-            self._load_all()
-            for n in self._data:
-                self._fire_callbacks(n)
+            loaded = self._load_file(name)
+            if loaded:
+                self._fire_callbacks(name)
+            return loaded
+        loaded_names = self._load_all()
+        for loaded_name in loaded_names:
+            self._fire_callbacks(loaded_name)
+        return bool(loaded_names)
 
     def get(self, file: str, key: str, default: Any = None) -> Any:
         """获取配置值，支持点号路径 (如 'server.port')"""
