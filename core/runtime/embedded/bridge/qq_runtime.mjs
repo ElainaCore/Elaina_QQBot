@@ -5366,7 +5366,17 @@ class QQInstance {
       if (!reference) continue;
       if (reference.record) {
         const event = await this.toOneBotEvent(reference.record);
-        if (event) this.rememberOneBotMessage(event, reference.nativeId || nativeMessageKey(reference.record), reference.record);
+        if (event) {
+          const nativeId = reference.nativeId || nativeMessageKey(reference.record);
+          this.rememberOneBotMessage(event, nativeId, reference.record);
+          if (String(event.message_id) !== String(reference.messageId)) {
+            this.rememberOneBotMessage(
+              { ...event, message_id: reference.messageId },
+              nativeId,
+              reference.record,
+            );
+          }
+        }
         continue;
       }
       const isGroup = Number(msg.chatType) === 2;
