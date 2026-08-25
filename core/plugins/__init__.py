@@ -1,7 +1,8 @@
-"""Public API for asynchronous plugins."""
+"""异步插件公开接口。"""
 
 from core.foundation.config import cfg as config
 from core.foundation.logging import PLUGIN, get_logger, report_error
+from core.plugins._runtime import get_application as get_app
 from core.plugins.context import PluginContext, current_plugin
 from core.plugins.decorators import (
     api_interceptor,
@@ -31,13 +32,6 @@ from core.services.files import (
     write_json,
     write_text,
 )
-
-
-def get_app():
-    from core.runtime.application import get_app as resolve_application
-
-    return resolve_application()
-
 
 __all__ = [
     'ApiCallRequest',

@@ -66,6 +66,7 @@ ElainaQQ/
 ## 🔌 开发与扩展
 
 - **开发文档** — [文档目录](docs/README.md)汇总插件开发、事件模型、消息发送和 OneBot API。
+- **架构规范** — [架构文档](docs/ARCHITECTURE.md)定义内部模块职责、依赖方向、资源布局和性能约束。
 - **插件开发** — [插件开发文档](docs/PLUGIN_DEVELOPMENT.md)包含插件结构、上下文、处理器、生命周期、中间件、多账号和 Web 扩展。
 - **OneBot API** — [API 参考文档](docs/ONEBOT_API.md)包含账号路由、消息段、常用动作、响应结构与错误处理。
 - **Web 前端** — 前端源码位于 [Elaina_QQBot_web](https://github.com/ElainaCore/Elaina_QQBot_web)，本仓库保留可直接运行的 `web/dist` 构建产物。

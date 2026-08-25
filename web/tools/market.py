@@ -6,6 +6,9 @@ from web.tools._market.install import (
     handle_market_preview,
     handle_market_uninstall,
 )
+from web.tools._market.install import (
+    set_context as set_install_context,
+)
 from web.tools._market.local import (
     handle_local_plugin_read,
     handle_local_plugin_save,
@@ -39,5 +42,6 @@ __all__ = [
 ]
 
 
-def set_context(base_dir: str):
+def set_context(app_instance, base_dir: str):
     _shared.set_context(base_dir)
+    set_install_context(app_instance)

@@ -21,7 +21,6 @@ QQ_VERSIONS: dict[str, dict[str, Any]] = {
         'url': 'https://github.com/Rodert/qq-versions/releases/download/qq-windows-x64-9.9.30-20260429/QQ_9.9.30_260429_x64_01.exe',
         'filename': 'QQ_9.9.30_260429_x64_01.exe',
         'size': 291623088,
-        'sha256': '3d991ee6cc920a73272a72d6be934144f045852b86cc557ad45341f321565859',
         'platform': 'windows',
         'arch': 'x64',
         'package': 'exe',

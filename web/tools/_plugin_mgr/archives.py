@@ -15,16 +15,10 @@ from aiohttp import BodyPartReader, web
 
 from core.foundation.archives import is_within, safe_extractall, validate_archive
 from core.services.files import replace_directory
+from web.tools._plugin_mgr import context
 
 MAX_SOURCE_UPLOAD = 2 * 1024 * 1024
 MAX_ARCHIVE_UPLOAD = 128 * 1024 * 1024
-
-
-def _manager():
-    from web.tools import plugin_mgr
-
-    return plugin_mgr
-
 
 def _temporary_path(suffix: str) -> str:
     descriptor, path = tempfile.mkstemp(prefix='elaina-upload-', suffix=suffix)
@@ -135,7 +129,6 @@ def _install_module_archive(upload_path: str, modules_root: str, module_name: st
 
 
 async def handle_upload_plugin(request: web.Request):
-    manager = _manager()
     reader = await request.multipart()
     upload_path = filename = None
     directory = 'alone'
@@ -155,7 +148,7 @@ async def handle_upload_plugin(request: web.Request):
         if not upload_path or not filename:
             return web.json_response({'success': False, 'message': '没有文件'}, status=400)
 
-        plugins_root = os.path.realpath(manager.plugins_dir())
+        plugins_root = os.path.realpath(context.plugins_dir())
         if filename.lower().endswith('.py'):
             try:
                 destination = await asyncio.to_thread(_install_source, upload_path, plugins_root, directory, filename)
@@ -188,7 +181,6 @@ async def handle_upload_plugin(request: web.Request):
 
 
 async def handle_module_upload(request: web.Request):
-    manager = _manager()
     reader = await request.multipart()
     field = cast(BodyPartReader, await reader.next())
     if not field or field.name != 'file':
@@ -203,7 +195,7 @@ async def handle_module_upload(request: web.Request):
         module_name = os.path.splitext(filename)[0].strip()
         if not re.fullmatch(r'[A-Za-z0-9_.-]+', module_name):
             return web.json_response({'success': False, 'message': '无效模块名'}, status=400)
-        modules_root = os.path.realpath(manager.modules_dir())
+        modules_root = os.path.realpath(context.modules_dir())
         await asyncio.to_thread(_install_module_archive, upload_path, modules_root, module_name)
         return web.json_response(
             {

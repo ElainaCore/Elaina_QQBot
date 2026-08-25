@@ -116,7 +116,7 @@ class WSBroadcast:
         """
         for ws in list(self._clients):
             with contextlib.suppress(Exception, RuntimeError):
-                asyncio.get_running_loop().create_task(ws.close(code=1001, message=b'Server shutdown'))
+                asyncio.get_running_loop().create_task(ws.close(code=1001, message='服务关闭'.encode()))
         self._clients.clear()
         self._sse_queues.clear()
         self._pending.clear()

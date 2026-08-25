@@ -25,7 +25,8 @@ _MAX_SESSIONS = 10
 _MAX_FAIL_COUNT = 5
 _SESSION_DAYS = 7
 _MAX_IP_RECORDS = 10000
-SESSION_COOKIE = 'elaina_session'
+_SESSION_COOKIE_PREFIX = 'elaina_session'
+SESSION_COOKIE = _SESSION_COOKIE_PREFIX
 
 valid_sessions: dict = {}
 ip_access_data: dict = {}
@@ -35,18 +36,21 @@ _data_dir = ''
 _ip_file = ''
 _session_file = ''
 _secret_file = ''
+_instance_file = ''
 _io_lock = threading.Lock()  # 串行化文件写入, 避免内容交错损坏
 _write_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix='web-auth-io')
 
 
 def init(base_dir: str):
-    global _data_dir, _ip_file, _session_file, _secret_file, _COOKIE_SECRET
+    global _data_dir, _ip_file, _session_file, _secret_file, _instance_file, _COOKIE_SECRET, SESSION_COOKIE
     _data_dir = os.path.join(base_dir, 'data', 'web')
     os.makedirs(_data_dir, exist_ok=True)
     _ip_file = os.path.join(_data_dir, 'ip.json')
     _session_file = os.path.join(_data_dir, 'sessions.json')
     _secret_file = os.path.join(_data_dir, '.cookie_secret')
+    _instance_file = os.path.join(_data_dir, 'instance_id')
     _COOKIE_SECRET = _load_or_create_secret()
+    SESSION_COOKIE = f'{_SESSION_COOKIE_PREFIX}_{_load_or_create_instance_id()}'
     _load_ip_data()
     _load_session_data()
 
@@ -72,6 +76,20 @@ def _load_or_create_secret() -> str:
     except Exception:
         pass
     return secret
+
+
+def _load_or_create_instance_id() -> str:
+    """读取或创建稳定的框架实例标识，用于隔离同域名下的多个面板。"""
+    try:
+        with open(_instance_file, encoding='utf-8') as file:
+            instance_id = file.read().strip()
+        if instance_id.isascii() and instance_id.isalnum():
+            return instance_id
+    except OSError:
+        pass
+    instance_id = uuid.uuid4().hex
+    _write_text_sync(_instance_file, instance_id)
+    return instance_id
 
 
 # ==================== 密码摘要 ====================
@@ -380,11 +398,7 @@ def create_session(request: web.Request) -> str:
 
 
 def get_request_token(request: web.Request) -> str:
-    """从请求头或安全 Cookie 获取会话令牌。"""
-    auth_header = request.headers.get('Authorization', '')
-    scheme, _, value = auth_header.partition(' ')
-    if scheme.lower() == 'bearer':
-        return value.strip()
+    """仅从 HttpOnly Cookie 读取面板会话凭据。"""
     return request.cookies.get(SESSION_COOKIE, '')
 
 
@@ -401,8 +415,13 @@ def set_session_cookie(response: web.StreamResponse, request: web.Request, token
     )
 
 
+def delete_session_cookie(response: web.StreamResponse) -> None:
+    """清除当前框架实例的面板会话 Cookie。"""
+    response.del_cookie(SESSION_COOKIE, path='/')
+
+
 def validate_token(request: web.Request) -> bool:
-    """验证 Bearer 或 HttpOnly Cookie 中的会话令牌。"""
+    """验证 HttpOnly Cookie 中的面板会话令牌。"""
     _cleanup_sessions()
     token = get_request_token(request)
     if not token or token not in valid_sessions:
@@ -451,13 +470,12 @@ def require_auth(handler):
 
 
 def authorize_request(request: web.Request) -> web.Response | None:
-    """复用面板会话与 Cookie 写请求来源校验。"""
+    """复用面板会话与写请求来源校验。"""
     from web.protocol import error
 
     if not validate_token(request):
         return error('未登录或会话已过期', status=401)
-    uses_cookie = not request.headers.get('Authorization', '').lower().startswith('bearer ')
-    if uses_cookie and request.method not in ('GET', 'HEAD', 'OPTIONS') and not is_same_origin(request):
+    if request.method not in ('GET', 'HEAD', 'OPTIONS') and not is_same_origin(request):
         return error('跨站请求已拒绝', status=403)
     return None
 

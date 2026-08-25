@@ -1,1 +1,1 @@
-"""Embedded QQ runtime."""
+"""内置 QQ 运行时。"""

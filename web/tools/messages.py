@@ -420,7 +420,7 @@ async def handle_get_chats(request: web.Request):
 
 
 def _event_cursor(event: dict) -> str:
-    # NapCat 的 message_seq 是 OneBot 消息 ID；历史分页必须使用 QQ 原生 real_seq。
+    # Elaina 的 message_seq 是 OneBot 消息 ID；历史分页必须使用 QQ 原生 real_seq。
     return str(event.get('real_seq') or event.get('message_seq') or event.get('real_id') or '')
 
 

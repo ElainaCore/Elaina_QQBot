@@ -164,8 +164,8 @@ def set_context(app_instance, base_dir: str):
     messages.set_context(app_instance, base_dir)
     onebot_conn.set_context(app_instance)
     qq_versions.set_context(app_instance)
-    market.set_context(base_dir)
-    update.set_context(base_dir)
+    market.set_context(app_instance, base_dir)
+    update.set_context(app_instance, base_dir)
 
 
 # ======================== 内联路由处理 ========================
@@ -254,7 +254,7 @@ async def handle_login(request: web.Request):
 async def handle_auth_logout(request: web.Request):
     auth.revoke_session(request)
     response = ok()
-    response.del_cookie(auth.SESSION_COOKIE, path='/')
+    auth.delete_session_cookie(response)
     return response
 
 

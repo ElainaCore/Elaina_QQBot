@@ -1,4 +1,4 @@
-"""Single-entry asynchronous plugin discovery and loading."""
+"""以单一入口异步发现和加载插件。"""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from core.plugins.decorators import (
 )
 from core.protocols.onebot.api import api_call_source
 
-log = get_logger(PLUGIN, 'manager')
+log = get_logger(PLUGIN, '管理器')
 _ENTRY_FILE = 'main.py'
 
 
@@ -43,7 +43,7 @@ async def _run_hooks(
                 )
                 continue
             raise RuntimeError(
-                f'plugin [{plugin_name}] {phase} hook [{func.__qualname__}] failed: {error}'
+                f'插件 [{plugin_name}] 的 {phase} 钩子 [{func.__qualname__}] 执行失败: {error}'
             ) from error
 
 
@@ -77,7 +77,7 @@ def _discover_plugins(plugins_dir: str) -> list[str]:
 
 
 class _LoaderMixin:
-    """Load every plugin as one package rooted at main.py."""
+    """将每个插件作为以 main.py 为入口的独立包加载。"""
 
     async def load_all(self) -> None:
         if not self._configuration_loaded:
@@ -92,18 +92,18 @@ class _LoaderMixin:
         for name in names:
             if name in self._disabled_plugins:
                 skipped += 1
-                log.info('plugin [%s] is disabled', name)
+                log.info('插件 [%s] 已禁用', name)
                 continue
             try:
                 await self.load(name)
                 loaded += 1
             except Exception as error:
                 failed += 1
-                report_error(PLUGIN, name, error, context={'phase': 'load'})
+                report_error(PLUGIN, name, error, context={'阶段': '加载'})
         self._rebuild_handler_list()
         await asyncio.to_thread(self._snapshot_all_mtimes)
         log.info(
-            'plugins loaded: %d/%d (failed %d, disabled %d), %d handlers',
+            '插件加载完成: %d/%d（失败 %d，禁用 %d），共 %d 个处理器',
             loaded,
             len(names),
             failed,
@@ -115,7 +115,7 @@ class _LoaderMixin:
         plugin_dir = os.path.join(self._dir, name)
         entry_path = os.path.join(plugin_dir, _ENTRY_FILE)
         if not os.path.isfile(entry_path):
-            raise FileNotFoundError(f'plugin entry does not exist: {entry_path}')
+            raise FileNotFoundError(f'插件入口不存在: {entry_path}')
 
         async with self._lock:
             if name in self._plugins:
@@ -140,8 +140,8 @@ class _LoaderMixin:
 
                     if registrations.count == 0 and not has_resources_by_owner(name):
                         raise RuntimeError(
-                            f'plugin [{name}] registered no capabilities; '
-                            'import decorators from the public core.plugins API'
+                            f'插件 [{name}] 没有注册任何能力；'
+                            '请从公开的 core.plugins API 导入装饰器'
                         )
                     await _run_hooks(
                         list(registrations.on_load),
@@ -174,7 +174,7 @@ class _LoaderMixin:
                 self._discovered_plugins.add(name)
                 self._rebuild_handler_list()
                 log.info(
-                    'plugin [%s] loaded (%d handlers, %d interceptors, %.2fs)',
+                    '插件 [%s] 已加载（%d 个处理器，%d 个拦截器，%.2f 秒）',
                     name,
                     len(plugin.handlers),
                     len(plugin.interceptors),
@@ -192,9 +192,9 @@ class _LoaderMixin:
                 )
                 clear_resources_by_owner(name)
                 self._drop_modules(name)
-                if isinstance(error, RuntimeError) and str(error).startswith(f'plugin [{name}]'):
+                if isinstance(error, RuntimeError) and str(error).startswith(f'插件 [{name}]'):
                     raise
-                raise RuntimeError(f'plugin [{name}] load failed: {error}') from error
+                raise RuntimeError(f'插件 [{name}] 加载失败: {error}') from error
 
     def _filter_disabled(self, plugin_name: str, items: list[dict]) -> list[dict]:
         return [
@@ -256,7 +256,7 @@ class _LoaderMixin:
             submodule_search_locations=[plugin_dir],
         )
         if spec is None or spec.loader is None:
-            raise ImportError(f'cannot create plugin module: {module_name}')
+            raise ImportError(f'无法创建插件模块: {module_name}')
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
         spec.loader.exec_module(module)

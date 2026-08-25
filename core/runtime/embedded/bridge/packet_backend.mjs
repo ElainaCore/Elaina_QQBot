@@ -1,22 +1,26 @@
 import fs from "node:fs";
 import { constants } from "node:os";
 
-const SUPPORTED_PLATFORMS = new Set([
-  "win32.x64",
-  "linux.x64",
-  "linux.arm64",
-  "darwin.x64",
-  "darwin.arm64",
-]);
+import { normalizePacketBypass, packetBoolean } from "./packet_config.mjs";
+import { packetResource, readPacketOffsets } from "./packet_resources.mjs";
 
-/** Install the same version-specific napi2native hook that NapCat uses for raw packets. */
+/** 加载框架内置的对应版本原始发包钩子。 */
 export class NativePacketBackend {
-  constructor({ version, nativePath = "", offsetsPath = "", mode = "auto", logger = () => {} } = {}) {
+  constructor({
+    version,
+    mode = "auto",
+    logger = () => {},
+    bypassOptions = {},
+    verbose = false,
+  } = {}) {
     this.version = String(version || "");
-    this.nativePath = String(nativePath || "");
-    this.offsetsPath = String(offsetsPath || "");
+    this.resource = packetResource("sender");
+    this.nativePath = this.resource.nativePath;
+    this.offsetsPath = this.resource.offsetsPath;
     this.mode = String(mode || "auto").toLowerCase();
     this.logger = logger;
+    this.bypassOptions = normalizePacketBypass(bypassOptions);
+    this.verbose = packetBoolean(verbose, false);
     this.available = false;
     this.reason = "尚未初始化";
     this.nativeModule = null;
@@ -32,13 +36,12 @@ export class NativePacketBackend {
       return false;
     }
 
-    const platform = process.platform + "." + process.arch;
-    if (!SUPPORTED_PLATFORMS.has(platform)) {
-      this.reason = "napi2native 不支持当前平台: " + platform;
+    if (!this.resource.supported) {
+      this.reason = "原始发包模块不支持当前平台: " + this.resource.platform;
       return false;
     }
     if (!this.nativePath || !fs.existsSync(this.nativePath)) {
-      this.reason = "未找到 napi2native 原生模块";
+      this.reason = "未找到原始发包模块: " + this.nativePath;
       return false;
     }
 
@@ -46,25 +49,20 @@ export class NativePacketBackend {
       this.nativeModule = { exports: {} };
       process.dlopen(this.nativeModule, this.nativePath, constants.dlopen.RTLD_LAZY);
       this.loaded = true;
+      const setVerbose = this.nativeModule.exports?.setVerbose;
+      if (typeof setVerbose === "function") setVerbose(this.verbose);
       const enableAllBypasses = this.nativeModule.exports?.enableAllBypasses;
       if (typeof enableAllBypasses === "function") {
-        this.bypassEnabled = Boolean(enableAllBypasses({
-          hook: true,
-          window: true,
-          module: true,
-          process: true,
-          container: true,
-          js: true,
-        }));
+        this.bypassEnabled = Boolean(enableAllBypasses(this.bypassOptions));
       }
       this.reason = "原始发包 Hook 尚未安装";
       this.logger(
-        "napi2native 已加载，native bypass " +
+        "原始发包模块已加载，native bypass " +
         (this.bypassEnabled ? "已启用" : "未启用或当前 addon 不支持")
       );
       return true;
     } catch (error) {
-      this.reason = "加载 napi2native 失败: " + (error?.message || error);
+      this.reason = "加载原始发包模块失败: " + (error?.message || error);
       this.loaded = false;
       return false;
     }
@@ -73,17 +71,16 @@ export class NativePacketBackend {
   initHook() {
     if (!this.loaded && !this.load()) return false;
     if (!this.offsetsPath || !fs.existsSync(this.offsetsPath)) {
-      this.reason = "未找到 napi2native 版本偏移表";
+      this.reason = "未找到原始发包版本偏移表: " + this.offsetsPath;
       return false;
     }
 
-    const key = this.version + "-" + process.arch;
+    let key;
     let offsets;
     try {
-      const table = JSON.parse(fs.readFileSync(this.offsetsPath, "utf8"));
-      offsets = table?.[key];
+      ({ key, offsets } = readPacketOffsets(this.resource, this.version));
     } catch (error) {
-      this.reason = "读取 napi2native 偏移表失败: " + (error?.message || error);
+      this.reason = "读取原始发包偏移表失败: " + (error?.message || error);
       return false;
     }
     if (!offsets?.send || !offsets?.recv) {
@@ -94,11 +91,11 @@ export class NativePacketBackend {
     try {
       const initHook = this.nativeModule?.exports?.initHook;
       if (typeof initHook !== "function") {
-        this.reason = "napi2native 模块缺少 initHook";
+        this.reason = "原始发包模块缺少 initHook";
         return false;
       }
       if (!initHook(String(offsets.send), String(offsets.recv))) {
-        this.reason = "napi2native Hook 初始化失败: " + key;
+        this.reason = "原始发包 Hook 初始化失败: " + key;
         return false;
       }
       this.offsets = { send: String(offsets.send), recv: String(offsets.recv) };
@@ -107,7 +104,7 @@ export class NativePacketBackend {
       this.logger("原始发包 Hook 初始化成功: " + key);
       return true;
     } catch (error) {
-      this.reason = "初始化 napi2native Hook 失败: " + (error?.message || error);
+      this.reason = "初始化原始发包 Hook 失败: " + (error?.message || error);
       return false;
     }
   }
@@ -122,8 +119,10 @@ export class NativePacketBackend {
       available: this.available,
       loaded: this.loaded,
       bypass_enabled: this.bypassEnabled,
+      bypass_options: { ...this.bypassOptions },
+      verbose: this.verbose,
       hook_initialized: this.available,
-      backend: "native",
+      backend: "native_packet",
       version: this.version,
       arch: process.arch,
       offsets: this.offsets,

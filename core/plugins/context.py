@@ -1,4 +1,4 @@
-"""Plugin runtime context and loaded plugin metadata."""
+"""插件运行上下文和已加载插件元数据。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from core.foundation.logging import PLUGIN, get_logger
 
 
 class PluginContext:
-    """Paths and services owned by one plugin."""
+    """单个插件拥有的路径和服务。"""
 
     __slots__ = ('name', 'plugin_dir', 'data_dir', 'log')
 
@@ -50,7 +50,7 @@ _current_plugin: contextvars.ContextVar[PluginContext | None] = contextvars.Cont
 def current_plugin() -> PluginContext:
     context = _current_plugin.get()
     if context is None:
-        raise RuntimeError('plugin context is unavailable outside plugin execution')
+        raise RuntimeError('只能在插件执行期间访问插件上下文')
     return context
 
 
@@ -64,7 +64,7 @@ def plugin_scope(context: PluginContext):
 
 
 class PluginInfo:
-    """Runtime state for a loaded plugin."""
+    """已加载插件的运行状态。"""
 
     __slots__ = (
         'name',

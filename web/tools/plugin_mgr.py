@@ -16,17 +16,25 @@ from core.foundation.archives import is_within
 from core.services.files import ensure_dir, read_text, run_sync, write_text
 from web.protocol import json_body
 from web.tools import _common
+from web.tools._plugin_mgr import context as _context
 from web.tools._plugin_mgr.archives import handle_module_upload as handle_module_upload
 from web.tools._plugin_mgr.archives import handle_upload_plugin as handle_upload_plugin
 from web.tools._plugin_mgr.config_files import handle_read_config as handle_read_config
 from web.tools._plugin_mgr.config_files import handle_save_config as handle_save_config
+from web.tools._plugin_mgr.context import (
+    detect_config_format,
+    get_mm,
+    get_pm,
+    modules_dir,
+    plugins_dir,
+    validate_path,
+)
 
 log = logging.getLogger('ElainaQQ.web.plugin_mgr')
 
-_app = None
-_base_dir = ''
 ENTRY_CANDIDATES = ('main.py',)
 _CONFIG_EXTS = ('.yaml', '.yml', '.json')
+validate_config_path = _context.validate_config_path
 
 _PLUGIN_TEMPLATE = '''"""新插件"""
 
@@ -40,25 +48,7 @@ async def handle_command(event, match):
 
 
 def set_context(app_instance, base_dir: str):
-    global _app, _base_dir
-    _app = app_instance
-    _base_dir = base_dir
-
-
-def get_pm():
-    return getattr(_app, 'plugin_manager', None) if _app else None
-
-
-def get_mm():
-    return getattr(_app, 'module_manager', None) if _app else None
-
-
-def plugins_dir():
-    return os.path.join(_base_dir, 'plugins')
-
-
-def modules_dir():
-    return os.path.join(_base_dir, 'modules')
+    _context.set_context(app_instance, base_dir)
 
 
 def find_entry(plugin_dir):
@@ -69,25 +59,6 @@ def find_entry(plugin_dir):
     base = os.path.basename(plugin_dir)
     p = os.path.join(plugin_dir, f'{base}.py')
     return p if os.path.isfile(p) else None
-
-
-def validate_path(rel_or_abs, root):
-    root_abs = os.path.abspath(root)
-    cand = rel_or_abs
-    if not os.path.isabs(cand):
-        cand = os.path.join(root, cand) if not cand.startswith(os.path.basename(root)) else os.path.join(_base_dir, cand)
-    abs_path = os.path.abspath(cand)
-    if not is_within(root_abs, abs_path):
-        return False, ''
-    return True, abs_path
-
-
-def validate_config_path(rel_or_abs):
-    for root in (plugins_dir(), modules_dir()):
-        ok, abs_path = validate_path(rel_or_abs, root)
-        if ok:
-            return abs_path, None
-    return '', web.json_response({'success': False, 'message': '无效路径'}, status=403)
 
 
 def list_config_files(data_dir):
@@ -106,14 +77,6 @@ def list_config_files(data_dir):
                 }
             )
     return files
-
-
-def detect_config_format(ext):
-    if ext in ('.yaml', '.yml'):
-        return 'yaml'
-    if ext == '.json':
-        return 'json'
-    return 'raw'
 
 
 def _save_source(path: str, content: str) -> None:

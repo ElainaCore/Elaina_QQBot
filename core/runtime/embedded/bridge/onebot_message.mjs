@@ -28,7 +28,7 @@ function normalizeSegment(segment) {
   return { type, data };
 }
 
-/** Canonical OneBot array message shared by every embedded send action. */
+/** 所有内置发送动作共用的标准 OneBot 数组消息。 */
 export function normalizeOneBotMessage(message, autoEscape = false) {
   if (Array.isArray(message)) return message.map(normalizeSegment).filter(Boolean);
   if (message && typeof message === "object") {
@@ -70,7 +70,7 @@ function uint32Uin(value) {
   return String(numeric >>> 0);
 }
 
-/** Convert a QQNT text element to the same OneBot segment shape used by NapCat. */
+/** 将 QQNT 文本元素转换为 OneBot 消息段结构。 */
 export async function oneBotTextSegment(textElement, resolveUin) {
   let content = String(textElement?.content || "");
   if (!content.includes("\n") && !content.includes("\r\n")) {
@@ -106,7 +106,7 @@ function escapeCqAttribute(value) {
   return escapeCqText(value).replace(/,/g, "&#44;");
 }
 
-/** Encode an array message exactly like NapCat's encodeCQCode helper. */
+/** 按 CQ 码规则编码数组消息。 */
 export function encodeOneBotCqMessage(message) {
   return Array.from(message || []).map((segment) => {
     if (segment?.type === "text") return escapeCqText(segment?.data?.text);

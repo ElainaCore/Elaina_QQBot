@@ -19,16 +19,25 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `elainaqq-runtime.mjs` | 运行时入口，加载 QQNT 包装器、维护账号会话并与 Python 管理器通信 |
+| `qq_runtime.mjs` | 运行时入口，加载 QQNT 包装器、维护账号会话并与 Python 管理器通信 |
 | `onebot_action_contract.mjs` | OneBot 动作契约与动作名称处理 |
 | `onebot_message.mjs` | 消息段转换与消息发送辅助 |
 | `inline_keyboard.mjs` | QQNT 内联键盘元素与官方机器人回调参数规范化 |
 | `onebot_data.mjs` | OneBot 数据结构转换 |
-| `onebot_packet.mjs` | 原始数据包相关处理 |
+| `../packet.py` | OneBot 原始包参数、PB 构造与响应规范化 |
+| `packet_config.mjs` | 原始包 Hook 配置解析与默认值 |
+| `packet_resources.mjs` | 内置原生资源注册、平台匹配与偏移表缓存 |
+| `packet_runtime.mjs` | 发包与收包 Hook 的统一生命周期 |
 | `packet_backend.mjs` | 原始发包后端选择与加载 |
+| `packet_event_backend.mjs` | 原始包收发事件 Hook 与监听器管理 |
+| `qq_platform.mjs` | QQ 路径、版本、加载器与数据目录适配 |
 | `message_gate.mjs` | 实时消息准入与重复消息过滤 |
 | `message_identity.mjs` | 消息身份与序列标识处理 |
 | `session_adapters.mjs` | QQ 会话接口的版本兼容适配 |
+| `../native/packet/packet_sender.*.node` | 各平台原始发包模块 |
+| `../native/events/packet_events.*.node` | 各平台原始包事件模块 |
+| `../native/packet/packet_offsets.json` | 原始发包版本偏移表 |
+| `../native/events/event_offsets.json` | 原始包事件版本偏移表 |
 
 ---
 
@@ -45,19 +54,26 @@
 | `ELAINAQQ_DATA_DIR` | 当前账号的独立数据目录 |
 | `ELAINAQQ_HEADLESS` | 是否使用无界面运行方式 |
 | `ELAINAQQ_ONEBOT_ACTIONS` | 框架登记的动作名称列表 |
-| `ELAINAQQ_PACKET_NATIVE_PATH` | NapCat `napi2native` 原生模块路径 |
-| `ELAINAQQ_PACKET_OFFSETS_PATH` | 与当前 QQ 构建匹配的收发包偏移表路径 |
-| `ELAINAQQ_PACKET_EVENT_NATIVE_PATH` | NapCat `MoeHoo` 原始包事件模块路径 |
-| `ELAINAQQ_PACKET_EVENT_OFFSETS_PATH` | NapCat 原始包事件偏移表 `packet.json` 路径 |
+| `ELAINAQQ_PACKET_BACKEND` | 原始包 Hook 模式，设置为 `off` 可禁用 |
+| `ELAINAQQ_PACKET_VERBOSE` | 是否输出原生 Hook 详细日志 |
+| `ELAINAQQ_PACKET_O3_HOOK` | 是否启用 O3 原始包事件 Hook |
+| `ELAINAQQ_PACKET_BYPASS` | 六类原生检测兼容选项的 JSON 对象 |
 
 Windows 下，框架还会为每个账号设置独立的 `APPDATA`、`LOCALAPPDATA` 和 `USERPROFILE`。Linux 下可能附加数据包后端和资源控制相关环境变量。
 
-原始发包后端遵循 NapCat 的两阶段初始化顺序：QQ session 创建前加载
-`napi2native` 并启用 native bypass，session 初始化完成后再安装版本对应的
+原始发包后端采用两阶段初始化顺序：QQ session 创建前加载
+原始发包模块并启用 native bypass，session 初始化完成后再安装版本对应的
 收发包 Hook。两步不能合并到 session 初始化之后，否则 QQ 原生接口会把
 protobuf Buffer 当成普通请求体解析并返回 `request body decode failed`。
-`MoeHoo` 事件观察器仅在 `packet.json` 含当前 QQ 构建的安全偏移时启用；
+原始包事件观察器仅在内置偏移表含当前 QQ 构建的安全偏移时启用；
 缺少偏移时会自动降级，不影响登录和普通 QQNT 回调事件。
+原生模块与版本偏移表随 ElainaQQ 一同发布，并且只从框架内部目录加载。
+原始包参数校验、PB 构造、动作编排和响应解析位于 Python 的
+`core/runtime/embedded/packet.py`；JavaScript 只调用已经登录的 QQNT
+会话。QQNT 会话与登录密钥位于 Electron 进程内，因此最后的进程内
+Hook 不能由进程外 Python 代码直接替代。
+事件后端支持按收发方向、命令字或两者组合注册监听器，也支持一次性监听；
+运行时只订阅自身需要处理的命令，停止账号时会统一清理监听器。
 
 ---
 

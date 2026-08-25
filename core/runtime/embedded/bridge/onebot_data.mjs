@@ -38,7 +38,7 @@ export function extractNativeMemberMap(result) {
   return undefined;
 }
 
-/** Normalize the one-object and legacy multi-argument member-list callbacks used by QQNT. */
+/** 规范化 QQNT 的单对象与旧版多参数群成员列表回调。 */
 export function normalizeNativeMemberListCallback(args, fallbackGroupId = "") {
   const values = Array.from(args || []);
   const first = values[0];
@@ -54,7 +54,7 @@ export function normalizeNativeMemberListCallback(args, fallbackGroupId = "") {
   return { groupId, infos, payload };
 }
 
-/** Return a member only when two complete snapshots contain one unambiguous addition. */
+/** 仅在两次完整快照中存在唯一新增成员时返回该成员。 */
 export function findAddedGroupMember(previous, current) {
   const oldIds = new Set();
   for (const member of previous?.values?.() || []) {

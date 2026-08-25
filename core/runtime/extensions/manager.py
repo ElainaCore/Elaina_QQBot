@@ -19,7 +19,7 @@ log = get_logger(EXTENSION, '管理器')
 def _async_lifecycle(module, name):
     callback = getattr(module, name, None)
     if callback is not None and not inspect.iscoroutinefunction(callback):
-        raise TypeError(f'module {name} must use async def: {module.__name__}')
+        raise TypeError(f'模块生命周期函数 {name} 必须使用 async def 定义: {module.__name__}')
     return callback
 
 

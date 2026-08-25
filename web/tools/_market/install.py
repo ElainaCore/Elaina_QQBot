@@ -29,6 +29,18 @@ from web.tools._market.shared import (
 
 # 共享单文件插件目录 (位于 plugins/ 下), 仅当 single 插件显式声明 alone=True 时使用
 _ALONE_DIR = 'alone'
+_PERSISTENT_DIRS = frozenset({'config', 'data'})
+_app = None
+
+
+def set_context(app_instance) -> None:
+    global _app
+    _app = app_instance
+
+
+def _is_persistent_path(relative_path: str) -> bool:
+    normalized = str(relative_path or '').replace('\\', '/').strip('/')
+    return bool(normalized and normalized.split('/', 1)[0] in _PERSISTENT_DIRS)
 
 # 插件类型 (来源于市场清单的 type 字段, 不再依据是否有 path 推断)
 TYPE_COMPLETE = 'complete'  # 完整插件: 整仓库 / 仓库内某子目录, 装到 plugins/<name>/
@@ -300,13 +312,13 @@ def _extract_zip_subset(content, plugin_name, subdir_path=''):
 
 
 def _clean_module_dir(dest_dir):
-    """清理模块目录 (保留 data/ 用户配置)"""
+    """清理模块目录，保留 config/ 与 data/ 用户配置。"""
     if not os.path.isdir(dest_dir):
         return
     import shutil
 
     for item in os.listdir(dest_dir):
-        if item == 'data':
+        if item in _PERSISTENT_DIRS:
             continue
         p = os.path.join(dest_dir, item)
         if os.path.isdir(p):
@@ -374,8 +386,8 @@ def _install_module_archive(content: bytes, github_url: str, safe: str) -> dict:
                 rel = fp[len(mod_prefix) :]
                 if not rel:
                     continue
-                # 保留用户已有的 data/ 配置
-                if rel.startswith('data/'):
+                # 更新时保留用户已有的 config/ 与 data/ 内容。
+                if _is_persistent_path(rel):
                     dest = os.path.join(dest_dir, rel)
                     if os.path.exists(dest):
                         continue
@@ -404,12 +416,9 @@ async def _auto_enable_plugin(reload_name):
     if not reload_name:
         return
     try:
-        from core.runtime.application import get_app
-
-        app = get_app()
-        if not app or not app.plugin_manager:
+        if not _app or not _app.plugin_manager:
             return
-        await app.plugin_manager.reload(reload_name)
+        await _app.plugin_manager.reload(reload_name)
         log.info(f'插件 {reload_name} 已自动启用')
     except Exception as e:
         log.warning(f'插件自动启用失败 [{reload_name}]: {e}')
@@ -507,11 +516,11 @@ async def handle_market_install(request: web.Request):
 
 
 def _remove_dir_keep_data(dest_dir):
-    """删除目录中除 data/ 外的全部文件和子目录"""
+    """删除目录中除 config/ 与 data/ 外的全部文件和子目录。"""
     import shutil
 
     for item in os.listdir(dest_dir):
-        if item == 'data':
+        if item in _PERSISTENT_DIRS:
             continue
         p = os.path.join(dest_dir, item)
         if os.path.isdir(p):
@@ -523,11 +532,8 @@ def _remove_dir_keep_data(dest_dir):
 async def _unload_plugin_runtime(plugin_name):
     """从运行时卸载插件"""
     try:
-        from core.runtime.application import get_app
-
-        app = get_app()
-        if app and app.plugin_manager:
-            await app.plugin_manager.unload(plugin_name)
+        if _app and _app.plugin_manager:
+            await _app.plugin_manager.unload(plugin_name)
     except Exception:
         pass
 
@@ -572,10 +578,10 @@ async def handle_market_uninstall(request: web.Request):
 
     try:
         await _unload_plugin_runtime(safe)
-        if keep_data and os.path.isdir(os.path.join(dest_dir, 'data')):
+        if keep_data and any(os.path.isdir(os.path.join(dest_dir, name)) for name in _PERSISTENT_DIRS):
             await asyncio.to_thread(_remove_dir_keep_data, dest_dir)
-            log.info(f'{label} 已卸载 (保留 data/)')
-            return web.json_response({'success': True, 'message': f'已卸载 {label} (保留数据)'})
+            log.info(f'{label} 已卸载 (保留 config/ 与 data/)')
+            return web.json_response({'success': True, 'message': f'已卸载 {label} (保留配置与数据)'})
         else:
             await asyncio.to_thread(shutil.rmtree, dest_dir)
             log.info(f'{label} 已卸载')

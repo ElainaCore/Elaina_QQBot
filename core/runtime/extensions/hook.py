@@ -20,7 +20,7 @@ class HookManager:
     def register(self, hook_name, callback, *, owner='unknown', priority=100):
         """注册 hook 回调"""
         if not inspect.iscoroutinefunction(callback):
-            raise TypeError(f'hook must use async def: {callback.__module__}.{callback.__qualname__}')
+            raise TypeError(f'钩子必须使用 async def 定义: {callback.__module__}.{callback.__qualname__}')
         self._hooks[hook_name].append((priority, owner, callback))
         self._sorted.pop(hook_name, None)
 
@@ -59,7 +59,7 @@ class HookManager:
             try:
                 await callback(*args, **kwargs)
             except Exception as e:
-                log.warning(f"[{owner}] hook '{hook_name}': {e}")
+                log.warning(f"[{owner}] 钩子 '{hook_name}' 执行失败: {e}")
 
     async def pipeline(self, hook_name, data):
         """管道执行"""
@@ -71,7 +71,7 @@ class HookManager:
                 if data is None:
                     return None
             except Exception as e:
-                log.warning(f"[{owner}] hook '{hook_name}': {e}")
+                log.warning(f"[{owner}] 钩子 '{hook_name}' 执行失败: {e}")
         return data
 
     def has(self, hook_name):
@@ -88,16 +88,14 @@ class HookManager:
 _instance = None
 
 
+def bind_hook_manager(manager):
+    """由应用装配层绑定共享的 Hook 管理器。"""
+    global _instance
+    _instance = manager
+
+
 def get_hook_manager():
     global _instance
-    try:
-        from core.runtime.application import get_app
-
-        app = get_app()
-        if app is not None:
-            return app.hook_manager
-    except Exception:
-        pass
     if _instance is None:
         _instance = HookManager()
     return _instance

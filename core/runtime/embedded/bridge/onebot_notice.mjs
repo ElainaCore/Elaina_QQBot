@@ -18,7 +18,7 @@ function readVarint(buffer, start) {
   throw new Error("无效的 protobuf varint");
 }
 
-/** Minimal protobuf reader for the QQNT system-push messages used by NapCat. */
+/** 用于读取 QQNT 系统推送消息的精简 protobuf 解析器。 */
 export function decodeProtoFields(value) {
   const buffer = asBuffer(value);
   const fields = new Map();
@@ -117,7 +117,7 @@ function parseProfileLike(content) {
 
 const GROUP_INCREASE_NOTIFY_TYPES = new Set([4, 5, 6, 7]);
 
-/** Build a recent-member candidate from QQNT's accepted group request notice. */
+/** 从 QQNT 已同意的入群申请通知中构建近期成员候选项。 */
 export function groupIncreaseCandidateFromNotify(notify, observedAt = Date.now()) {
   const type = Number(notify?.type || 0);
   const status = Number(notify?.status || 0);
@@ -135,7 +135,7 @@ export function groupIncreaseCandidateFromNotify(notify, observedAt = Date.now()
   };
 }
 
-/** Return a candidate only when the recent notices identify one unique member. */
+/** 仅在近期通知能确定唯一成员时返回候选项。 */
 export function findGroupIncreaseCandidate(candidates, groupId, operatorUid = "", now = Date.now(), maxAge = 10000) {
   const group = String(groupId || "");
   const operator = String(operatorUid || "");
@@ -152,8 +152,8 @@ export function findGroupIncreaseCandidate(candidates, groupId, operatorUid = ""
     .sort((left, right) => Number(right.observedAt || 0) - Number(left.observedAt || 0))[0] || null;
 }
 
-/** Decode the OneBot event-bearing branches handled by NapCat's onRecvSysMsg. */
-export function decodeNapCatSystemNotice(payload) {
+/** 解码系统监听器处理的 OneBot 事件分支。 */
+export function decodeSystemNotice(payload) {
   const root = decodeProtoFields(payload);
   const response = nested(root, 1);
   const content = nested(root, 2);
@@ -236,7 +236,7 @@ export function parseEmojiLikeGrayTip(content) {
     : null;
 }
 
-/** Decode NapCat's raw OlPush group-reaction packet without a protobuf dependency. */
+/** 不依赖 protobuf 解码原始 OlPush 群表情回应数据包。 */
 export function parseGroupReactionPacket(payload) {
   try {
     const packet = typeof payload === "string"

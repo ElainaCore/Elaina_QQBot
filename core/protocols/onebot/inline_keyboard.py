@@ -1,4 +1,4 @@
-"""Inline-keyboard extraction helpers shared by OneBot transports."""
+"""OneBot 各传输方式共用的内联键盘提取工具。"""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ _HEX_PATTERN = re.compile(r'^(?:[0-9a-fA-F]{2})+$')
 def _encode_varint(value: int) -> bytes:
     value = int(value)
     if value < 0:
-        raise ValueError('protobuf varint cannot be negative')
+        raise ValueError('protobuf 变长整数不能为负数')
     result = bytearray()
     while value > 0x7f:
         result.append((value & 0x7f) | 0x80)
@@ -30,7 +30,7 @@ def _bytes_field(tag: int, value: bytes) -> bytes:
 
 
 def build_group_message_request(group_id: str | int, real_seq: str | int) -> str:
-    """Build the SsoGetGroupMsg protobuf request used by NapCat."""
+    """构建 Elaina 使用的 SsoGetGroupMsg protobuf 请求。"""
     group = int(group_id)
     sequence = int(real_seq)
     message_range = b''.join((
@@ -46,14 +46,14 @@ def _read_varint(data: bytes, offset: int) -> tuple[int, int]:
     shift = 0
     for _ in range(10):
         if offset >= len(data):
-            raise ValueError('truncated protobuf varint')
+            raise ValueError('protobuf 变长整数被截断')
         current = data[offset]
         offset += 1
         value |= (current & 0x7f) << shift
         if not current & 0x80:
             return value, offset
         shift += 7
-    raise ValueError('protobuf varint is too long')
+    raise ValueError('protobuf 变长整数过长')
 
 
 def _parse_fields(data: bytes) -> list[tuple[int, int, Any]]:
@@ -63,28 +63,28 @@ def _parse_fields(data: bytes) -> list[tuple[int, int, Any]]:
         key, offset = _read_varint(data, offset)
         tag, wire_type = key >> 3, key & 7
         if tag <= 0:
-            raise ValueError('invalid protobuf tag')
+            raise ValueError('无效的 protobuf 字段标记')
         if wire_type == 0:
             value, offset = _read_varint(data, offset)
         elif wire_type == 1:
             if offset + 8 > len(data):
-                raise ValueError('truncated protobuf fixed64')
+                raise ValueError('protobuf fixed64 被截断')
             value = int.from_bytes(data[offset:offset + 8], 'little')
             offset += 8
         elif wire_type == 2:
             length, offset = _read_varint(data, offset)
             end = offset + length
             if end > len(data):
-                raise ValueError('truncated protobuf bytes')
+                raise ValueError('protobuf 字节字段被截断')
             value = data[offset:end]
             offset = end
         elif wire_type == 5:
             if offset + 4 > len(data):
-                raise ValueError('truncated protobuf fixed32')
+                raise ValueError('protobuf fixed32 被截断')
             value = int.from_bytes(data[offset:offset + 4], 'little')
             offset += 4
         else:
-            raise ValueError(f'unsupported protobuf wire type: {wire_type}')
+            raise ValueError(f'不支持的 protobuf 线类型: {wire_type}')
         fields.append((tag, wire_type, value))
     return fields
 
@@ -159,7 +159,7 @@ def extract_inline_keyboard_buttons(
     *,
     bot_appid: str = '',
 ) -> list[dict[str, str]]:
-    """Extract the callback button embedded in an SsoGetGroupMsg response."""
+    """提取 SsoGetGroupMsg 响应中嵌入的回调按钮。"""
     payload = _hex_payload(response)
     if not payload:
         return []

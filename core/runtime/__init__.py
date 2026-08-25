@@ -1,1 +1,1 @@
-"""Application orchestration and managed runtimes."""
+"""应用编排与托管运行时。"""

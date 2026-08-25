@@ -498,13 +498,13 @@ class OneBotAPI:
         real_seq=None,
         bot_appid='',
     ) -> list[dict[str, str]]:
-        """Read an official-bot keyboard from a group message via raw protobuf."""
+        """通过原始 protobuf 读取群消息中的官方机器人键盘。"""
         sequence = real_seq
         detail = await self.call_api('get_msg', {'message_id': message_id})
         data = detail.get('data') if isinstance(detail, dict) else None
         if not isinstance(data, dict):
             data = detail if isinstance(detail, dict) else {}
-        embedded = data.get('_elaina_inline_keyboard')
+        embedded = data.get('_inline_keyboard')
         if isinstance(embedded, list) and embedded:
             return [item for item in embedded if isinstance(item, dict)]
         if not sequence:

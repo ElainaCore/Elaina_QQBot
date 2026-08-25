@@ -1,4 +1,4 @@
-"""Strictly asynchronous plugin registration decorators."""
+"""仅支持异步函数的插件注册装饰器。"""
 
 import contextvars
 import inspect
@@ -61,13 +61,13 @@ def registration_scope(registrations: PluginRegistrations | None = None):
 def _current_registrations() -> PluginRegistrations:
     current = _registrations.get()
     if current is None:
-        raise RuntimeError('plugin decorators may only be used while a plugin is loading')
+        raise RuntimeError('插件装饰器只能在插件加载期间使用')
     return current
 
 
 def _async_only(func: Callable, role: str) -> Callable:
     if not inspect.iscoroutinefunction(func):
-        raise TypeError(f'{role} must use async def: {func.__module__}.{func.__qualname__}')
+        raise TypeError(f'{role} 必须使用 async def 定义: {func.__module__}.{func.__qualname__}')
     return func
 
 
@@ -85,7 +85,7 @@ def handler(
     block=False,
     fallback=False,
 ):
-    """Register an asynchronous event handler."""
+    """注册异步事件处理器。"""
 
     def decorator(func):
         _async_only(func, 'handler')

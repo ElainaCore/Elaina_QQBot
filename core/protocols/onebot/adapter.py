@@ -101,24 +101,16 @@ class OneBotAdapter:
         return next(iter(identities)) if len(identities) == 1 else None
 
     def expected_ws_token(self, port=None, path=None) -> str:
-        """返回指定 (端口, 路径) 反向 WS 入口应校验的 token; 找不到则不校验"""
+        """返回指定 (端口, 路径) 反向 WS 入口应校验的 token。"""
         m = self.reverse_ws_tokens
         if port is not None and (port, path) in m:
             return m[(port, path)]
-        if port is not None:  # 同端口的别名路径 (如 /onebot/v11/ws) 复用该端口的 token
-            for (p, _pa), t in m.items():
-                if p == port:
-                    return t
         return ''
 
     def expected_http_secret(self, port=None, path=None) -> str:
         m = self.reverse_http_secrets
         if port is not None and (port, path) in m:
             return m[(port, path)]
-        if port is not None:
-            for (p, _pa), s in m.items():
-                if p == port:
-                    return s
         return ''
 
     def _check_signature(self, body: bytes, signature: str | None, secret: str = '') -> bool:

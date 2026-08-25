@@ -26,8 +26,9 @@ class LogService:
         self._queues: dict[tuple[str, str], deque] = {}  # 日志类型和账号映射到待写队列
         self._connections: dict[tuple[str, str], sqlite3.Connection] = {}  # 日志类型和账号映射到数据库连接
         self._queue_lock = threading.Lock()
-        self._db_lock = threading.RLock()
-        self._lock = asyncio.Lock()
+        self._connection_lock = threading.RLock()
+        self._database_locks: dict[tuple[str, str], threading.RLock] = {}
+        self._flush_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._running = False
         self._flush_task = None
         LogService._instance = self
@@ -47,14 +48,23 @@ class LogService:
         try:
             await self._flush_all()
         finally:
-            with self._db_lock:
-                for conn in self._connections.values():
-                    conn.close()
+            with self._connection_lock:
+                connections = tuple(self._connections.items())
                 self._connections.clear()
+            for key, connection in connections:
+                with self._database_lock(key):
+                    connection.close()
+
+    def _database_lock(self, key: tuple[str, str]) -> threading.RLock:
+        with self._connection_lock:
+            return self._database_locks.setdefault(key, threading.RLock())
+
+    def _flush_lock(self, key: tuple[str, str]) -> asyncio.Lock:
+        return self._flush_locks.setdefault(key, asyncio.Lock())
 
     def _get_conn(self, log_type: str, bot_qq: str = '') -> sqlite3.Connection:
         key = (log_type, bot_qq or '')
-        with self._db_lock:
+        with self._connection_lock:
             if key in self._connections:
                 return self._connections[key]
             if bot_qq:
@@ -116,7 +126,7 @@ class LogService:
             return conn
 
     def add_nowait(self, log_type: str, entry: dict, bot_qq: str = ''):
-        """同步入队 (供同步上下文使用, 如日志 handler); 仅追加到内存队列, 不做 IO"""
+        """同步入队，仅追加到内存队列，不执行磁盘读写。"""
         key = (log_type, bot_qq or '')
         with self._queue_lock:
             if key not in self._queues:
@@ -139,12 +149,13 @@ class LogService:
             await self.flush(log_type, bot_qq)
 
     async def execute(self, log_type: str, sql: str, params=None, bot_qq: str = '') -> int:
-        """异步执行写操作（UPDATE/DELETE）"""
+        """异步执行更新或删除操作。"""
         return await asyncio.to_thread(self._execute_sync, log_type, sql, params, bot_qq)
 
     def _execute_sync(self, log_type: str, sql: str, params=None, bot_qq: str = '') -> int:
         try:
-            with self._db_lock:
+            key = (log_type, bot_qq or '')
+            with self._database_lock(key):
                 conn = self._get_conn(log_type, bot_qq)
                 cursor = conn.execute(sql, params or [])
                 conn.commit()
@@ -154,36 +165,40 @@ class LogService:
             return 0
 
     async def query(self, log_type: str, sql: str, params=None, bot_qq: str = '') -> list:
-        """异步查询日志"""
-        # 面板读取前立即写出目标分库的待处理项，使内置 QQ 的最新历史无需等待定时 flush。
+        """异步查询日志。"""
+        # 面板读取前立即写出目标分库的待处理项，使最新历史无需等待定时写入。
         await self.flush(log_type, bot_qq)
         return await asyncio.to_thread(self._query_sync, log_type, sql, params, bot_qq)
 
     async def flush(self, log_type: str | None = None, bot_qq: str = '') -> None:
         """立即写出指定分库的待处理日志；不传类型时写出全部。"""
-        async with self._lock:
+        with self._queue_lock:
+            keys = tuple(self._queues) if log_type is None else ((str(log_type), str(bot_qq or '')),)
+        if keys:
+            await asyncio.gather(*(self._flush_key(key) for key in keys))
+
+    async def _flush_key(self, key: tuple[str, str]) -> None:
+        """合并并写出单个分库的待处理日志。"""
+        async with self._flush_lock(key):
             with self._queue_lock:
-                keys = list(self._queues) if log_type is None else [(str(log_type), str(bot_qq or ''))]
-            for key in keys:
+                queue = self._queues.get(key)
+                entries = list(queue) if queue else []
+                if queue:
+                    queue.clear()
+            if not entries:
+                return
+            try:
+                await asyncio.to_thread(self._write_entries, key[0], key[1], entries)
+            except Exception:
+                # 写入失败时把整批放回队首，保证消息和事件不会静默丢失。
                 with self._queue_lock:
-                    queue = self._queues.get(key)
-                    entries = list(queue) if queue else []
-                    if queue:
-                        queue.clear()
-                if not entries:
-                    continue
-                try:
-                    await asyncio.to_thread(self._write_entries, key[0], key[1], entries)
-                except Exception:
-                    # 写入失败时把整批放回队首，不能静默丢失消息和事件。
-                    with self._queue_lock:
-                        queue = self._queues.setdefault(key, deque())
-                        queue.extendleft(reversed(entries))
-                    raise
+                    self._queues.setdefault(key, deque()).extendleft(reversed(entries))
+                raise
 
     def _query_sync(self, log_type: str, sql: str, params=None, bot_qq: str = '') -> list:
         try:
-            with self._db_lock:
+            key = (log_type, bot_qq or '')
+            with self._database_lock(key):
                 conn = self._get_conn(log_type, bot_qq)
                 cursor = conn.execute(sql, params or [])
                 rows = cursor.fetchall()
@@ -204,7 +219,8 @@ class LogService:
         await self.flush()
 
     def _write_entries(self, log_type: str, bot_qq: str, entries: list):
-        with self._db_lock:
+        key = (log_type, bot_qq or '')
+        with self._database_lock(key):
             conn = self._get_conn(log_type, bot_qq)
             statement = (
                 'INSERT OR IGNORE INTO log ' if log_type == 'message' else 'INSERT INTO log '
@@ -237,15 +253,17 @@ class LogService:
                 raise
 
     async def cleanup(self):
-        """异步清理过期日志"""
+        """异步清理过期日志。"""
         if self._retention_days <= 0:
             return
         await asyncio.to_thread(self._cleanup_sync)
 
     def _cleanup_sync(self):
         cutoff = (datetime.datetime.now() - datetime.timedelta(days=self._retention_days)).strftime('%Y-%m-%d %H:%M:%S')
-        with self._db_lock:
-            for conn in tuple(self._connections.values()):
+        with self._connection_lock:
+            connections = tuple(self._connections.items())
+        for key, conn in connections:
+            with self._database_lock(key):
                 try:
                     conn.execute('DELETE FROM log WHERE timestamp < ?', (cutoff,))
                     conn.commit()

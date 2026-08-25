@@ -1,1 +1,1 @@
-"""External protocol implementations."""
+"""外部协议实现。"""

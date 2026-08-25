@@ -1,1 +1,1 @@
-"""Managed QQ distribution and launcher."""
+"""托管 QQ 发行版与启动器。"""

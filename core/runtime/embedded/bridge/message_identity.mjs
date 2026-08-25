@@ -12,7 +12,7 @@ function messagePeer(peerOrMessage = {}, fallbackChatType = 0, fallbackPeerUid =
   };
 }
 
-/** Use NapCat's MessageUnique.createUniqueMsgId wire-level algorithm. */
+/** 生成线路层使用的稳定 OneBot 消息编号。 */
 export function toOneBotMessageId(value, peerOrMessage = {}, fallbackChatType = 0, fallbackPeerUid = "") {
   const msgId = usableId(value) || String(value ?? "");
   const peer = messagePeer(peerOrMessage, fallbackChatType, fallbackPeerUid);

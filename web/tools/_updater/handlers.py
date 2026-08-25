@@ -35,12 +35,12 @@ def _remove_upload(path: str) -> None:
         os.remove(path)
 
 
-def set_context(base_dir: str):
+def set_context(app_instance, base_dir: str):
     global _base_dir, _updater
     _base_dir = base_dir
     from web.tools._updater.framework import FrameworkUpdater
 
-    _updater = FrameworkUpdater(base_dir)
+    _updater = FrameworkUpdater(base_dir, request_restart=app_instance.request_restart)
 
 
 def _get_updater():

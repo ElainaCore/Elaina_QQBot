@@ -18,6 +18,9 @@ from typing import Any
 
 import aiohttp
 
+from core.runtime.qq.archive import run_cpio_listing as _run_cpio_listing
+from core.runtime.qq.archive import validate_archive_listing as _validate_archive_listing
+from core.runtime.qq.archive import validate_deb_archive as _validate_deb_archive
 from core.runtime.qq.catalog import QQ_VERSIONS
 from core.services.files import write_json
 
@@ -61,63 +64,10 @@ class QQManager:
         self.install_dir = self.base_dir / 'client'
         self.config_file = self.base_dir / 'versions.json'
         self.base_dir.mkdir(parents=True, exist_ok=True)
-        self._migrate_legacy_layout()
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self.install_dir.mkdir(parents=True, exist_ok=True)
         self.installed_versions = self._load_config()
-        if self._rewrite_legacy_records():
-            self._save_config()
         self._locks: dict[str, asyncio.Lock] = {}
-
-    def _migrate_legacy_layout(self) -> None:
-        """将管理器拥有的文件从 data/qq_client 迁移到 data/qq。"""
-        if self.base_dir.name != 'qq':
-            return
-        legacy = self.base_dir.parent / 'qq_client'
-        if not legacy.is_dir():
-            return
-        for source_name, target_name in (('downloads', 'downloads'), ('qq_clients', 'client')):
-            source = legacy / source_name
-            target = self.base_dir / target_name
-            if not source.is_dir():
-                continue
-            target.mkdir(parents=True, exist_ok=True)
-            for item in source.iterdir():
-                destination = target / item.name
-                if destination.exists():
-                    continue
-                try:
-                    shutil.move(str(item), str(destination))
-                except OSError as exc:
-                    log.warning('迁移旧 QQ 数据失败: %s -> %s (%s)', item, destination, exc)
-        legacy_config = legacy / 'qq_versions.json'
-        if legacy_config.is_file() and not self.config_file.exists():
-            try:
-                shutil.copy2(legacy_config, self.config_file)
-            except OSError as exc:
-                log.warning('迁移旧 QQ 版本记录失败: %s', exc)
-
-    def _rewrite_legacy_records(self) -> bool:
-        if self.base_dir.name != 'qq':
-            return False
-        legacy = (self.base_dir.parent / 'qq_client').resolve()
-        changed = False
-        for record in self.installed_versions.values():
-            if not isinstance(record, dict):
-                continue
-            for key, value in list(record.items()):
-                if not isinstance(value, str) or not value:
-                    continue
-                try:
-                    relative = Path(value).expanduser().resolve().relative_to(legacy)
-                except (OSError, ValueError):
-                    continue
-                parts = list(relative.parts)
-                if parts and parts[0] == 'qq_clients':
-                    parts[0] = 'client'
-                record[key] = str(self.base_dir.joinpath(*parts))
-                changed = True
-        return changed
 
     def _load_config(self) -> dict[str, Any]:
         if not self.config_file.is_file():
@@ -578,6 +528,7 @@ class QQManager:
     def _extract_deb(package_path: Path, target: Path) -> None:
         dpkg_deb = shutil.which('dpkg-deb')
         if dpkg_deb:
+            _validate_deb_archive(package_path, dpkg_deb)
             _run_command([dpkg_deb, '-x', str(package_path), str(target)], timeout=300)
             return
         ar = shutil.which('ar')
@@ -621,10 +572,7 @@ class QQManager:
             )
             if members.returncode:
                 raise RuntimeError(f'DEB 数据目录读取失败: {(members.stderr or members.stdout).strip()}')
-            for name in members.stdout.splitlines():
-                normalized = name.replace('\\', '/').lstrip('./')
-                if name.startswith('/') or '..' in Path(normalized).parts:
-                    raise RuntimeError('DEB 安装包包含不安全的文件路径')
+            _validate_archive_listing(members.stdout, 'DEB')
             unpacked = subprocess.run(
                 [tar, '-xf', str(archive), '-C', str(target), '--no-same-owner'],
                 check=False,
@@ -639,17 +587,27 @@ class QQManager:
     def _extract_rpm(package_path: Path, target: Path) -> None:
         bsdtar = shutil.which('bsdtar')
         if bsdtar:
+            listing = _run_command([bsdtar, '-tf', str(package_path)], timeout=300)
+            _validate_archive_listing(listing.stdout, 'RPM')
             _run_command([bsdtar, '-xf', str(package_path), '-C', str(target)], timeout=300)
             return
         rpm2cpio = shutil.which('rpm2cpio')
         cpio = shutil.which('cpio')
         if not rpm2cpio or not cpio:
             raise RuntimeError('当前系统没有 bsdtar 或 rpm2cpio/cpio，无法在无 root 模式解包 RPM')
+        _validate_archive_listing(_run_cpio_listing(package_path, rpm2cpio, cpio), 'RPM')
         producer = subprocess.Popen([rpm2cpio, str(package_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if producer.stdout is None:
             producer.kill()
             raise RuntimeError('RPM 解包失败：无法读取 rpm2cpio 输出')
-        result = subprocess.run([cpio, '-idm'], cwd=str(target), stdin=producer.stdout, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(
+            [cpio, '-idm', '--no-absolute-filenames'],
+            cwd=str(target),
+            stdin=producer.stdout,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
         producer.stdout.close()
         producer_stderr = producer.stderr.read().decode(errors='replace').strip() if producer.stderr else ''
         producer_code = producer.wait(timeout=30)

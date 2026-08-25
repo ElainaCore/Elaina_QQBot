@@ -76,6 +76,7 @@ async def handle_save_connections(request: web.Request):
 
     cleaned = []
     names = set()
+    server_endpoints = set()
     for c in conns:
         if not isinstance(c, dict):
             continue
@@ -86,6 +87,11 @@ async def handle_save_connections(request: web.Request):
         if name in names:
             return error(f'连接名称重复: {name}')
         names.add(name)
+        if item['type'] in ('ws_reverse', 'http_server'):
+            endpoint = (item['type'], item['port'], '/' + item['path'].strip('/'))
+            if endpoint in server_endpoints:
+                return error(f'服务器接入端点重复: {item["port"]}{item["path"]}')
+            server_endpoints.add(endpoint)
         cleaned.append(item)
 
     cfg.set_value('connections', 'connections', cleaned)

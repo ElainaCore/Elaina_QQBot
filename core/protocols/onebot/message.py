@@ -1,4 +1,4 @@
-"""Shared OneBot message and action normalization for every transport."""
+"""所有传输方式共用的 OneBot 消息和动作规范化。"""
 
 import json
 import re
@@ -32,7 +32,7 @@ def _as_bool(value: Any, default: bool = False) -> bool:
 
 
 def parse_cq_message(value: str) -> list[dict]:
-    """Parse a CQ string into OneBot array segments without losing surrounding text."""
+    """将 CQ 字符串解析为 OneBot 消息段，并保留周围文本。"""
     segments: list[dict] = []
     offset = 0
     for match in _CQ_PATTERN.finditer(value):
@@ -52,7 +52,7 @@ def parse_cq_message(value: str) -> list[dict]:
 
 
 def normalize_message(message: Any, *, auto_escape: bool = False) -> list[dict]:
-    """Return the canonical OneBot array message used by local and network bots."""
+    """返回本机与网络机器人共用的标准 OneBot 数组消息。"""
     if isinstance(message, str):
         return [{'type': 'text', 'data': {'text': message}}] if auto_escape else parse_cq_message(message)
     if isinstance(message, dict):
@@ -90,7 +90,7 @@ def message_to_cq(message: Any) -> str:
 
 
 def normalize_action_request(action: str, params: dict | None) -> tuple[str, dict]:
-    """Normalize an API call before local/WebSocket/HTTP transport selection."""
+    """在选择本机、WebSocket 或 HTTP 传输前规范化 API 调用。"""
     normalized_action = _ACTION_SUFFIX.sub('', str(action or '').strip())
     normalized_params = dict(params or {})
     if normalized_action in _SEND_ACTIONS and 'message' in normalized_params:

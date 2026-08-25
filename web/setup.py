@@ -4,6 +4,7 @@ import gzip
 import logging
 import os
 import re
+import sys
 
 from aiohttp import web
 
@@ -15,6 +16,19 @@ from core.foundation.branding import public_text
 from web.protocol import api_protocol_middleware, prepare_response_headers
 
 log = logging.getLogger('ElainaQQ.web')
+
+
+def _disable_sendfile_on_windows() -> None:
+    """在 Windows 上使用 aiohttp 的分块回退，避免 Proactor sendfile 缓冲区复用损坏静态文件。"""
+    if sys.platform != 'win32':
+        return
+    os.environ.setdefault('AIOHTTP_NOSENDFILE', '1')
+    try:
+        import aiohttp.web_fileresponse as file_response
+
+        file_response.NOSENDFILE = True
+    except Exception:
+        pass
 
 
 class _WebPanelLogHandler(logging.Handler):
@@ -49,6 +63,7 @@ class _WebPanelLogHandler(logging.Handler):
 
 def setup_web(app: web.Application, bot_manager, base_dir: str):
     """将 Web 面板挂载到 aiohttp 应用 (bot_manager 即 Application 实例)"""
+    _disable_sendfile_on_windows()
     _auth.init(base_dir)
     _panel_api.set_context(bot_manager, base_dir)
     app.middlewares.append(api_protocol_middleware)

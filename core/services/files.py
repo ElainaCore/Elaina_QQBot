@@ -1,4 +1,4 @@
-"""Non-blocking filesystem helpers shared by the framework and plugins."""
+"""框架与插件共用的非阻塞文件工具。"""
 
 from __future__ import annotations
 
@@ -18,9 +18,9 @@ def replace_directory(
     staged: str | os.PathLike[str],
     target: str | os.PathLike[str],
     *,
-    preserve: tuple[str, ...] = ('data',),
+    preserve: tuple[str, ...] = ('config', 'data'),
 ) -> None:
-    """Atomically replace a directory while retaining selected runtime data."""
+    """保留指定运行数据并原子替换目录。"""
     staged_path = Path(os.path.abspath(staged))
     target_path = Path(os.path.abspath(target))
     target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -54,7 +54,7 @@ def replace_directory(
 
 
 async def run_sync(func: Callable[..., T], /, *args, **kwargs) -> T:
-    """Run unavoidable blocking work without occupying the event loop."""
+    """在线程中执行不可避免的阻塞操作，避免占用事件循环。"""
     return await asyncio.to_thread(func, *args, **kwargs)
 
 

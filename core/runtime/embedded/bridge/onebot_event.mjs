@@ -13,7 +13,7 @@ export function normalizeOneBotTimestamp(value, fallback = Math.floor(Date.now()
   return Math.floor(numeric > 100_000_000_000 ? numeric / 1000 : numeric);
 }
 
-/** Build the wire-level event shape used by NapCat OneBot 11. */
+/** 构建 OneBot 11 使用的线路层事件结构。 */
 export function createOneBotEvent(selfId, postType, fields = {}) {
   const { time, ...payload } = fields;
   return withoutUndefined({

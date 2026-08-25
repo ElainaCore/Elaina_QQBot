@@ -1,4 +1,4 @@
-"""框架更新 — FrameworkUpdater 更新流程类"""
+"""框架更新流程。"""
 
 import asyncio
 import fnmatch
@@ -8,13 +8,13 @@ import re
 import shutil
 import subprocess
 import zipfile
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
 import aiohttp as _aiohttp
 
 from core.foundation.archives import safe_extractall
-from core.runtime.layout import purge_legacy_core_layout
 from web.tools._updater.mirror import detect_environment
 from web.tools._updater.shared import (
     DEFAULT_SKIP,
@@ -38,8 +38,9 @@ def _append_download(path: Path, content: bytes) -> None:
 
 
 class FrameworkUpdater:
-    def __init__(self, base_dir: str):
+    def __init__(self, base_dir: str, request_restart: Callable[[], bool] | None = None):
         self.base_dir = Path(base_dir)
+        self._request_restart = request_restart
         self.version_file = self.base_dir / 'data' / 'version.json'
         self.settings_file = self.base_dir / 'data' / 'update_settings.json'
         (self.base_dir / 'data').mkdir(exist_ok=True)
@@ -435,17 +436,12 @@ class FrameworkUpdater:
                     shutil.copy2(src, dst)
                     result['updated'] += 1
 
-            removed_legacy = purge_legacy_core_layout(self.base_dir)
-
             shutil.rmtree(temp, ignore_errors=True)
             if os.path.exists(zip_file):
                 os.remove(zip_file)
 
             result['success'] = True
-            result['message'] = (
-                f'更新成功！更新 {result["updated"]} 个文件，跳过 {result["skipped"]} 个，'
-                f'清理 {len(removed_legacy)} 个废弃路径'
-            )
+            result['message'] = f'更新成功！更新 {result["updated"]} 个文件，跳过 {result["skipped"]} 个'
             self._report('completed', result['message'], 100, result['config_diff'])
         except Exception as e:
             result['message'] = f'更新失败: {e}'
@@ -494,18 +490,11 @@ class FrameworkUpdater:
             self._report('failed', f'获取版本失败: {e}', 0)
             return {'success': False, 'message': str(e)}
 
-    @staticmethod
-    def _trigger_restart():
-        """更新后重启: Windows 用外部脚本, Linux/Docker 走内部重启 + os.execv"""
+    def _trigger_restart(self):
+        """通过应用装配层提供的回调请求重启。"""
         try:
-            from core.runtime.application import get_app
-
-            app = get_app()
-            if app:
+            if self._request_restart and self._request_restart():
                 log.info('更新完成, 触发重启...')
-                app._restart_requested = True
-                if app._stop_event:
-                    app._stop_event.set()
                 return
         except Exception:
             pass

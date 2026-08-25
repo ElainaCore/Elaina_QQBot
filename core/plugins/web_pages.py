@@ -79,7 +79,7 @@ def register_route(method: str, path: str, handler=None, *, auth: bool = True):
 
     def _add(fn):
         if not inspect.iscoroutinefunction(fn):
-            raise TypeError(f'plugin HTTP route must use async def: {fn.__module__}.{fn.__qualname__}')
+            raise TypeError(f'插件 HTTP 路由必须使用 async def 定义: {fn.__module__}.{fn.__qualname__}')
         _routes[(method, path)] = {
             'method': method,
             'path': path,
@@ -122,7 +122,7 @@ def clear_routes_by_owner(owner: str) -> int:
 
 
 def clear_resources_by_owner(owner: str) -> int:
-    """Remove every page and route owned by one plugin."""
+    """移除指定插件注册的全部页面和路由。"""
     page_keys = [key for key, value in _registry.items() if value.get('owner') == owner]
     for key in page_keys:
         _registry.pop(key, None)
@@ -130,7 +130,7 @@ def clear_resources_by_owner(owner: str) -> int:
 
 
 def has_resources_by_owner(owner: str) -> bool:
-    """Return whether a plugin registered any page or HTTP route."""
+    """判断指定插件是否注册过页面或 HTTP 路由。"""
     return any(value.get('owner') == owner for value in _registry.values()) or any(
         value.get('owner') == owner for value in _routes.values()
     )

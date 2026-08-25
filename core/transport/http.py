@@ -2,8 +2,11 @@
 
 import asyncio
 import contextlib
+import inspect
+import ipaddress
 import json
 import time
+from collections.abc import Callable
 
 from aiohttp import web
 
@@ -28,12 +31,22 @@ def _local_port(request: web.Request):
     return request.url.port
 
 
+def _is_loopback_peer(remote: str | None) -> bool:
+    """只根据 TCP 对端地址判断本机连接，不信任可伪造的转发请求头。"""
+    try:
+        address = ipaddress.ip_address(str(remote or '').split('%', 1)[0])
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
+        return address.is_loopback
+    except ValueError:
+        return False
+
+
 class HttpServer:
     """aiohttp HTTP 服务器"""
 
-    def __init__(self, app_instance, base_dir: str):
+    def __init__(self, app_instance):
         self._app_instance = app_instance
-        self._base_dir = base_dir
         self._app: web.Application | None = None
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
@@ -41,6 +54,7 @@ class HttpServer:
         self._request_active = 0
         self._request_last_time = time.monotonic()
         self._request_last_total = 0
+        self._shutdown_callbacks: list[Callable[[], object]] = []
 
     @property
     def app(self) -> web.Application:
@@ -115,16 +129,20 @@ class HttpServer:
             'rate': round(rate, 2),
         }
 
-    def mount_web_panel(self):
-        """挂载 Web 面板"""
-        if self._app is None:
-            raise RuntimeError('HTTP 应用尚未初始化')
-        try:
-            from web.setup import setup_web
+    def add_shutdown_callback(self, callback: Callable[[], object]) -> None:
+        """注册装配层提供的关闭回调，避免传输层依赖上层组件。"""
+        if callback not in self._shutdown_callbacks:
+            self._shutdown_callbacks.append(callback)
 
-            setup_web(self._app, self._app_instance, self._base_dir)
-        except Exception as e:
-            log.error(f'Web 面板挂载失败: {e}')
+    async def _run_shutdown_callbacks(self) -> None:
+        callbacks, self._shutdown_callbacks = self._shutdown_callbacks, []
+        for callback in reversed(callbacks):
+            try:
+                result = callback()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as error:
+                log.warning('HTTP 扩展关闭失败: %s', error)
 
     async def start(self, bind_timeout: float = 15, retry_interval: float = 0.5):
         """启动 HTTP 服务器，端口短暂占用时在限定时间内重试。"""
@@ -156,8 +174,8 @@ class HttpServer:
                 await asyncio.sleep(max(0.05, retry_interval))
 
         log.info(f'HTTP 服务器启动: {host}:{port}')
-        log.info(f'OneBot: ws://{host}:{port}/OneBotv11')
-        log.info(f'Web: http://{host}:{port}/web/')
+        log.info(f'OneBot 地址: ws://{host}:{port}/OneBotv11')
+        log.info(f'Web 管理面板: http://{host}:{port}/web/')
 
     async def stop(self, timeout: float = 5):
         """停止服务器: 先主动断开所有长连接 (OneBot 反向 WS / 面板 WS/SSE) 再清理, 避免卡住"""
@@ -165,11 +183,8 @@ class HttpServer:
         if adapter:
             for ws in list(getattr(adapter, 'websockets', {}).values()):
                 with contextlib.suppress(Exception):
-                    await ws.close(code=1001, message=b'Server shutdown')
-        with contextlib.suppress(Exception):
-            from web.ws import get_broadcast
-
-            get_broadcast().shutdown()
+                    await ws.close(code=1001, message='服务关闭'.encode())
+        await self._run_shutdown_callbacks()
         if self._site:
             with contextlib.suppress(Exception):
                 await self._site.stop()
@@ -192,6 +207,9 @@ class HttpServer:
         connection_manager = self._app_instance.connection_manager
         if not connection_manager or not connection_manager.server_connection_enabled(ConnType.HTTP_SERVER, port, path):
             return web.Response(status=503, text='OneBot HTTP 网络接入未启用')
+
+        if not adapter.expected_http_secret(port, path) and not _is_loopback_peer(request.remote):
+            return web.Response(status=401, text='非本机 OneBot HTTP 接入必须配置签名密钥')
 
         body = await request.read()
         if not body:
@@ -219,6 +237,9 @@ class HttpServer:
         if not connection_manager or not connection_manager.server_connection_enabled(ConnType.WS_REVERSE, port, path):
             return web.Response(status=503, text='OneBot WebSocket 网络接入未启用')
 
+        if not adapter.expected_ws_token(port, path) and not _is_loopback_peer(request.remote):
+            return web.Response(status=401, text='非本机 OneBot WebSocket 接入必须配置访问令牌')
+
         headers = dict(request.headers)
         valid, self_id, error = adapter.validate_websocket_headers(headers, port=port, path=path)
         if not valid:
@@ -232,7 +253,7 @@ class HttpServer:
         embedded = getattr(self._app_instance, 'embedded_qq', None)
         if embedded and embedded_id:
             await embedded.on_onebot_connected(embedded_id, self_id)
-        log.info(f'OneBot 连接: {request.remote} | Bot {self_id}')
+        log.info(f'OneBot 连接: {request.remote} | 机器人 {self_id}')
 
         try:
             async for msg in ws:
@@ -247,14 +268,14 @@ class HttpServer:
                     if echo is not None and adapter.resolve_api_response(echo, data):
                         continue
                     if not await self._app_instance.ingest_event(data, self_id):
-                        log.warning('拒绝无效或无法入队的 OneBot WebSocket 事件: Bot %s', self_id)
+                        log.warning('拒绝无效或无法入队的 OneBot WebSocket 事件: 机器人 %s', self_id)
                 elif msg.type == web.WSMsgType.ERROR:
                     break
         finally:
             removed = adapter.unregister_bot(self_id, ws)
             if removed and embedded and embedded_id:
                 await embedded.on_onebot_disconnected(embedded_id, self_id)
-            log.info(f'OneBot 断开: Bot {self_id}')
+            log.info(f'OneBot 断开: 机器人 {self_id}')
 
         return ws
 

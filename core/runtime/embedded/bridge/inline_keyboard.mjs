@@ -14,7 +14,7 @@ function firstText(source, names) {
   return "";
 }
 
-/** Normalize QQNT inline-keyboard elements for framework consumers. */
+/** 将 QQNT 内联键盘元素规范化为框架统一格式。 */
 export function extractInlineKeyboardButtons(elements) {
   const result = [];
   const seen = new Set();

@@ -4,24 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import ctypes
 import inspect
 import itertools
 import json
 import logging
 import os
-import platform
 import re
 import shlex
 import shutil
-import signal
 import subprocess
 import sys
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import psutil
 from aiohttp import web
@@ -29,9 +26,29 @@ from aiohttp import web
 from core.foundation.branding import public_text
 from core.foundation.config import cfg
 from core.protocols.onebot.api import api_call_source, get_supported_actions
-from core.protocols.onebot.protocol import action_failed
+from core.protocols.onebot.protocol import action_failed, action_ok, normalize_action_response
+from core.runtime.embedded.output_filter import (
+    crash_dump_end,
+    crash_dump_start,
+    is_qq_noise,
+    qq_output_level,
+)
+from core.runtime.embedded.packet import (
+    PacketRequest,
+    build_group_special_title_packet,
+    build_poke_packet,
+    normalize_packet_action_response,
+    normalize_packet_request,
+)
+from core.runtime.embedded.process_control import (
+    ProcessMemoryMonitor,
+    process_memory_usage,
+    process_tree_pids,
+    reclaim_process_pages,
+    terminate_process_tree,
+)
 from core.runtime.qq.catalog import QQ_VERSIONS
-from core.runtime.qq.installer import QQInstaller
+from core.runtime.qq.distribution import QQManager
 from core.runtime.qq.launcher import QQLauncher
 from core.services.files import write_json
 
@@ -83,7 +100,7 @@ class EmbeddedQQManager:
         self._xvfb_process: asyncio.subprocess.Process | None = None
         self._xvfb_display = ''
         self._stopping: set[str] = set()
-        self._memory_cache: dict[str, tuple[float, int, dict[str, Any]]] = {}
+        self._memory_monitor = ProcessMemoryMonitor()
         self._control_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
         self._control_futures: dict[str, tuple[str, asyncio.Future[dict[str, Any]]]] = {}
         self._red_packet_listeners: dict[str, Any] = {}
@@ -95,7 +112,7 @@ class EmbeddedQQManager:
         self._accounts_file = self._base_dir / 'data' / 'embedded_qq' / 'accounts.json'
         self._deleted_accounts_file = self._accounts_file.with_name('deleted_accounts.json')
         self._accounts_file.parent.mkdir(parents=True, exist_ok=True)
-        self._installer = QQInstaller(self._base_dir / 'data' / 'qq')
+        self._qq_manager = QQManager(self._base_dir / 'data' / 'qq')
         self._deleted_bot_ids = self._load_deleted_accounts()
         self._load_accounts()
 
@@ -179,7 +196,7 @@ class EmbeddedQQManager:
             self.bots[bot_id] = EmbeddedBot(
                 bot_id=bot_id,
                 bridge_port=self._parse_bridge_port(item.get('bridge_port')),
-                qq_version_key=str(item.get('qq_version_key') or item.get('version_key') or self._installer.manager.detect_platform() or ''),
+                qq_version_key=str(item.get('qq_version_key') or item.get('version_key') or self._qq_manager.detect_platform() or ''),
                 uin=str(item.get('uin') or ''),
                 nickname=str(item.get('nickname') or ''),
                 force_quick_login=bool(item.get('force_quick_login', False)),
@@ -247,10 +264,10 @@ class EmbeddedQQManager:
                 log.error('保存 QQ 账号配置失败: %s', exc)
 
     def _normalize_version_key(self, version_key: str = '') -> str:
-        key = str(version_key or self._installer.manager.detect_platform() or '').strip()
+        key = str(version_key or self._qq_manager.detect_platform() or '').strip()
         if not key:
             raise ValueError('当前系统没有可用的 QQ 客户端版本')
-        if key not in self._installer.manager.compatible_version_keys():
+        if key not in self._qq_manager.compatible_version_keys():
             raise ValueError('所选 QQ 版本与当前系统不兼容')
         return key
 
@@ -316,13 +333,10 @@ class EmbeddedQQManager:
         return bot
 
     def _bridge_entry(self) -> Path:
-        configured = os.environ.get('ELAINAQQ_BRIDGE_ENTRY') or cfg.get('settings', 'embedded_qq.bridge_entry', '')
-        candidates = [Path(str(configured))] if configured else []
-        candidates.append(self._base_dir / 'core' / 'runtime' / 'embedded' / 'bridge' / 'elainaqq-runtime.mjs')
-        for candidate in candidates:
-            if candidate.is_file():
-                return candidate.resolve()
-        raise FileNotFoundError('未找到 ElainaQQ QQ 运行时入口: core/runtime/embedded/bridge/elainaqq-runtime.mjs')
+        candidate = self._base_dir / 'core' / 'runtime' / 'embedded' / 'bridge' / 'qq_runtime.mjs'
+        if candidate.is_file():
+            return candidate.resolve()
+        raise FileNotFoundError('未找到内置 QQ 运行时入口: core/runtime/embedded/bridge/qq_runtime.mjs')
 
     def _qq_path(self, bot: EmbeddedBot) -> Path:
         candidate = self._find_qq_path(bot)
@@ -334,10 +348,10 @@ class EmbeddedQQManager:
 
     def _find_qq_path(self, bot: EmbeddedBot | None = None) -> Path | None:
         if bot and bot.qq_version_key:
-            candidate = self._installer.get_qq_path(bot.qq_version_key)
+            candidate = self._qq_manager.get_qq_executable(bot.qq_version_key)
             return candidate.resolve() if candidate and candidate.is_file() else None
         configured = cfg.get('settings', 'embedded_qq.qq_path', '') or os.environ.get('QQ_PATH', '')
-        candidate = Path(str(configured)) if configured else self._installer.get_qq_path()
+        candidate = Path(str(configured)) if configured else self._qq_manager.get_qq_executable()
         if candidate and candidate.is_dir():
             names = ('QQ.exe', 'qq', 'QQ') if os.name == 'nt' else ('qq', 'QQ', 'QQ.exe')
             candidate = next((candidate / name for name in names if (candidate / name).is_file()), candidate)
@@ -433,9 +447,9 @@ class EmbeddedQQManager:
             return command, dict(launcher.launch_env)
         if os.name != 'nt':
             try:
-                qq_path.relative_to(self._installer.install_dir.resolve())
+                qq_path.relative_to(self._qq_manager.install_dir.resolve())
             except ValueError:
-                launcher = launcher.writable_runtime(self._installer.base_dir / 'runtime', force_copy=True)
+                launcher = launcher.writable_runtime(self._qq_manager.base_dir / 'runtime', force_copy=True)
         try:
             command = launcher.command(
                 data_dir,
@@ -470,69 +484,28 @@ class EmbeddedQQManager:
             or cfg.get('settings', 'embedded_qq.packet_backend', 'auto')
             or 'auto'
         )
-        result = {'ELAINAQQ_PACKET_BACKEND': mode}
-
-        platform_name = 'win32' if os.name == 'nt' else 'darwin' if sys.platform == 'darwin' else 'linux'
-        machine = platform.machine().lower()
-        arch = 'arm64' if machine in {'arm64', 'aarch64'} else 'x64' if machine in {'amd64', 'x86_64'} else machine
-        napcat_root = Path(
-            os.environ.get('NAPCAT_ROOT')
-            or str(self._base_dir.parent / 'NapCatQQ')
-        )
-
-        configured_native = (
-            os.environ.get('ELAINAQQ_PACKET_NATIVE_PATH')
-            or cfg.get('settings', 'embedded_qq.packet_native_path', '')
-        )
-        configured_offsets = (
-            os.environ.get('ELAINAQQ_PACKET_OFFSETS_PATH')
-            or cfg.get('settings', 'embedded_qq.packet_offsets_path', '')
-        )
-        configured_event_native = (
-            os.environ.get('ELAINAQQ_PACKET_EVENT_NATIVE_PATH')
-            or cfg.get('settings', 'embedded_qq.packet_event_native_path', '')
-        )
-        configured_event_offsets = (
-            os.environ.get('ELAINAQQ_PACKET_EVENT_OFFSETS_PATH')
-            or cfg.get('settings', 'embedded_qq.packet_event_offsets_path', '')
-        )
-        native_path = Path(str(configured_native)) if configured_native else (
-            napcat_root
-            / 'packages'
-            / 'napcat-native'
-            / 'napi2native'
-            / f'napi2native.{platform_name}.{arch}.node'
-        )
-        offsets_path = Path(str(configured_offsets)) if configured_offsets else (
-            napcat_root / 'packages' / 'napcat-core' / 'external' / 'napi2native.json'
-        )
-        event_native_path = Path(str(configured_event_native)) if configured_event_native else (
-            napcat_root
-            / 'packages'
-            / 'napcat-native'
-            / 'packet'
-            / f'MoeHoo.{platform_name}.{arch}.node'
-        )
-        event_offsets_path = Path(str(configured_event_offsets)) if configured_event_offsets else (
-            napcat_root / 'packages' / 'napcat-core' / 'external' / 'packet.json'
-        )
-        if configured_native and not native_path.is_absolute():
-            native_path = self._base_dir / native_path
-        if configured_offsets and not offsets_path.is_absolute():
-            offsets_path = self._base_dir / offsets_path
-        if configured_event_native and not event_native_path.is_absolute():
-            event_native_path = self._base_dir / event_native_path
-        if configured_event_offsets and not event_offsets_path.is_absolute():
-            event_offsets_path = self._base_dir / event_offsets_path
-        if native_path.is_file():
-            result['ELAINAQQ_PACKET_NATIVE_PATH'] = str(native_path.resolve())
-        if offsets_path.is_file():
-            result['ELAINAQQ_PACKET_OFFSETS_PATH'] = str(offsets_path.resolve())
-        if event_native_path.is_file():
-            result['ELAINAQQ_PACKET_EVENT_NATIVE_PATH'] = str(event_native_path.resolve())
-        if event_offsets_path.is_file():
-            result['ELAINAQQ_PACKET_EVENT_OFFSETS_PATH'] = str(event_offsets_path.resolve())
-        return result
+        bypass = cfg.get('settings', 'embedded_qq.packet_bypass', {}) or {}
+        if not isinstance(bypass, dict):
+            bypass = {}
+        bypass = {
+            key: bool(bypass.get(key, False))
+            for key in ('hook', 'window', 'module', 'process', 'container', 'js')
+        }
+        return {
+            'ELAINAQQ_PACKET_BACKEND': mode,
+            'ELAINAQQ_PACKET_VERBOSE': (
+                os.environ.get('ELAINAQQ_PACKET_VERBOSE')
+                or ('1' if cfg.get('settings', 'embedded_qq.packet_verbose', False) else '0')
+            ),
+            'ELAINAQQ_PACKET_O3_HOOK': (
+                os.environ.get('ELAINAQQ_PACKET_O3_HOOK')
+                or ('1' if cfg.get('settings', 'embedded_qq.packet_o3_hook', False) else '0')
+            ),
+            'ELAINAQQ_PACKET_BYPASS': (
+                os.environ.get('ELAINAQQ_PACKET_BYPASS')
+                or json.dumps(bypass, ensure_ascii=True, separators=(',', ':'))
+            ),
+        }
 
     def _env(
         self,
@@ -544,13 +517,7 @@ class EmbeddedQQManager:
         manager_url = f'http://127.0.0.1:{self._assign_bridge_port(bot)}'
         env = os.environ.copy()
         configured_command = cfg.get('settings', 'embedded_qq.command', '') if not sys.platform.startswith('linux') else ''
-        bridge_entry = ''
-        if not configured_command:
-            bridge_entry = str(self._bridge_entry())
-        else:
-            configured_bridge = os.environ.get('ELAINAQQ_BRIDGE_ENTRY') or cfg.get('settings', 'embedded_qq.bridge_entry', '')
-            if configured_bridge and Path(str(configured_bridge)).is_file():
-                bridge_entry = str(Path(str(configured_bridge)).resolve())
+        bridge_entry = str(self._bridge_entry())
 
         env.update(
             {
@@ -584,8 +551,7 @@ class EmbeddedQQManager:
             env.pop('NODE_PATH', None)
             env['MALLOC_ARENA_MAX'] = '2'
             env['MALLOC_TRIM_THRESHOLD_'] = '131072'
-        if bridge_entry:
-            env['ELAINAQQ_BRIDGE_ENTRY'] = bridge_entry
+        env['ELAINAQQ_BRIDGE_ENTRY'] = bridge_entry
         if launch_env:
             env.update(launch_env)
 
@@ -609,7 +575,6 @@ class EmbeddedQQManager:
         """为单个内置 QQ 启动仅限本机访问的控制桥接服务。"""
         if bot.bot_id in self._bridge_runners:
             return
-
         async def read_payload(request: web.Request) -> dict[str, Any]:
             try:
                 payload = await request.json()
@@ -795,7 +760,7 @@ class EmbeddedQQManager:
                     await self._ensure_xvfb()
                 command, launch_env = await asyncio.to_thread(self._command, bot, data_dir)
                 runtime = launch_env.get('ELAINAQQ_HEADLESS_RUNTIME', '')
-                bot.launch_mode = runtime or 'elainaqq-runtime'
+                bot.launch_mode = runtime or 'qq-runtime'
                 command_qq = self._command_qq_path(command)
                 kwargs: dict[str, Any] = {
                     'env': self._env(bot, data_dir, command, launch_env),
@@ -834,75 +799,8 @@ class EmbeddedQQManager:
                 log.error('内置 QQ 启动失败 [%s]: %s', bot.bot_id, public_text(exc), exc_info=True)
             return bot
 
-    @staticmethod
-    def _process_tree_pids(root_pid: int, data_dir: Path) -> set[int]:
-        pids: set[int] = {root_pid}
-        with contextlib.suppress(psutil.Error, OSError):
-            root = psutil.Process(root_pid)
-            pids.update(child.pid for child in root.children(recursive=True))
-
-        marker = os.path.normcase(str(data_dir.resolve()))
-        for item in psutil.process_iter(['pid', 'name', 'cmdline']):
-            try:
-                command = ' '.join(item.info.get('cmdline') or [])
-                if marker not in os.path.normcase(command):
-                    continue
-                pids.add(item.pid)
-                parent = item.parent()
-                while parent and parent.name().lower() in {'qq', 'qq.exe', 'linuxqq'}:
-                    pids.add(parent.pid)
-                    parent = parent.parent()
-            except (psutil.Error, OSError):
-                continue
-        return pids
-
-    @staticmethod
-    def _kill_pids(pids: set[int]) -> None:
-        processes = []
-        for pid in pids:
-            with contextlib.suppress(psutil.Error, OSError):
-                processes.append(psutil.Process(pid))
-        for item in sorted(processes, key=lambda value: value.pid, reverse=True):
-            with contextlib.suppress(psutil.Error, OSError):
-                item.kill()
-        with contextlib.suppress(psutil.Error, OSError):
-            psutil.wait_procs(processes, timeout=5)
-
-    async def _terminate_process_tree(
-        self,
-        process: asyncio.subprocess.Process,
-        data_dir: Path,
-        captured_pids: set[int],
-    ) -> None:
-        if os.name == 'nt':
-            await asyncio.to_thread(
-                subprocess.run,
-                ['taskkill', '/PID', str(process.pid), '/T', '/F'],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(process.wait(), 10)
-        else:
-            kill_process_group = cast(Any, os).killpg
-            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-                kill_process_group(process.pid, signal.SIGTERM)
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(process.wait(), 5)
-            if process.returncode is None:
-                force_signal = cast(Any, signal).SIGKILL
-                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-                    kill_process_group(process.pid, force_signal)
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(process.wait(), 5)
-        remaining = captured_pids | self._process_tree_pids(process.pid, data_dir)
-        await asyncio.to_thread(self._kill_pids, remaining)
-        if process.returncode is None:
-            with contextlib.suppress(Exception):
-                process.kill()
-            with contextlib.suppress(Exception):
-                await process.wait()
+    _process_tree_pids = staticmethod(process_tree_pids)
+    _terminate_process_tree = staticmethod(terminate_process_tree)
 
     async def stop(self, bot_id: str, disable: bool = True) -> bool:
         bot = self.bots.get(bot_id)
@@ -1036,10 +934,58 @@ class EmbeddedQQManager:
             self._control_futures.pop(request_id, None)
 
     async def action(self, bot_id: str, action: str, params: dict | None = None) -> dict:
+        params = params or {}
+        if action == 'send_packet':
+            try:
+                packet = normalize_packet_request(params)
+            except ValueError as error:
+                return action_failed(str(error), 1400)
+            response = await self._send_packet(bot_id, packet)
+            return normalize_packet_action_response(response, wait_response=packet.wait_response)
+        if action == 'set_group_special_title':
+            return await self._set_group_special_title(bot_id, params)
+        if action in {'send_poke', 'friend_poke', 'group_poke'}:
+            try:
+                packet = build_poke_packet(params)
+            except ValueError as error:
+                return action_failed(str(error), 1400)
+            response = normalize_action_response(
+                await self._send_packet(bot_id, packet),
+                action=action,
+            )
+            return response if response['status'] == 'failed' else action_ok()
         return await self._control_call(
             bot_id,
-            {'type': 'action', 'action': action, 'params': params or {}},
+            {'type': 'action', 'action': action, 'params': params},
         )
+
+    async def _send_packet(self, bot_id: str, packet: PacketRequest) -> dict[str, Any]:
+        return await self._control_call(
+            bot_id,
+            {'type': 'packet', 'packet': packet.bridge_payload()},
+        )
+
+    async def _set_group_special_title(self, bot_id: str, params: dict[str, Any]) -> dict[str, Any]:
+        group_id = str(params.get('group_id') or '').strip()
+        user_id = str(params.get('user_id') or '').strip()
+        if not group_id.isdecimal() or not user_id:
+            return action_failed('群号或成员 QQ 无效', 1400)
+        resolved = normalize_action_response(
+            await self._control_call(bot_id, {'type': 'resolve_uid', 'user_id': user_id}),
+            action='set_group_special_title',
+        )
+        if resolved['status'] == 'failed':
+            return resolved
+        uid = str(resolved.get('data') or '').strip()
+        try:
+            packet = build_group_special_title_packet(group_id, uid, params.get('special_title', ''))
+        except ValueError as error:
+            return action_failed(str(error), 1400)
+        response = normalize_action_response(
+            await self._send_packet(bot_id, packet),
+            action='set_group_special_title',
+        )
+        return response if response['status'] == 'failed' else action_ok()
 
     def register_red_packet_listener(self, owner: str, callback) -> None:
         """注册内置 QQ 原生红包回调；同一 owner 热重载时自动替换。"""
@@ -1271,7 +1217,7 @@ class EmbeddedQQManager:
                     process.pid,
                     use_swap and not cgroup_reclaimed,
                 )
-                self._memory_cache.pop(bot.bot_id, None)
+                self._memory_monitor.invalidate(bot.bot_id)
                 if use_swap:
                     await asyncio.sleep(3)
                     after = await asyncio.to_thread(self._process_memory_usage, process.pid)
@@ -1297,103 +1243,8 @@ class EmbeddedQQManager:
             if bot.reclaim_task is asyncio.current_task():
                 bot.reclaim_task = None
 
-    @staticmethod
-    def _reclaim_process_pages(root_pid: int, include_anonymous: bool = False) -> dict[str, int]:
-        if not hasattr(os, 'pidfd_open'):
-            return {'file': 0, 'anonymous': 0}
-
-        class IOVec(ctypes.Structure):
-            _fields_ = [('iov_base', ctypes.c_void_p), ('iov_len', ctypes.c_size_t)]
-
-        libc = ctypes.CDLL(None, use_errno=True)
-        process_madvise = getattr(libc, 'process_madvise', None)
-        if process_madvise is None:
-            return {'file': 0, 'anonymous': 0}
-        process_madvise.argtypes = (
-            ctypes.c_int,
-            ctypes.POINTER(IOVec),
-            ctypes.c_size_t,
-            ctypes.c_int,
-            ctypes.c_uint,
-        )
-        process_madvise.restype = ctypes.c_ssize_t
-
-        try:
-            root = psutil.Process(root_pid)
-            processes = [root, *root.children(recursive=True)]
-        except (psutil.Error, OSError):
-            return {'file': 0, 'anonymous': 0}
-
-        file_advised = 0
-        anonymous_advised = 0
-        anonymous: list[tuple[int, list[IOVec]]] = []
-        for item in processes:
-            file_mappings: list[IOVec] = []
-            anonymous_mappings: list[IOVec] = []
-            try:
-                lines = Path(f'/proc/{item.pid}/maps').read_text().splitlines()
-                for line in lines:
-                    fields = line.split(maxsplit=5)
-                    if len(fields) < 2 or 'r' not in fields[1] or 'p' not in fields[1]:
-                        continue
-                    name = fields[5].strip() if len(fields) >= 6 else ''
-                    if name.startswith(('[stack', '[vdso', '[vvar', '[vsyscall', '/dev/shm', 'memfd:', '/SYSV')):
-                        continue
-                    start, end = (int(value, 16) for value in fields[0].split('-'))
-                    vector = IOVec(start, end - start)
-                    if name.startswith('/'):
-                        file_mappings.append(vector)
-                    elif not name or name == '[heap]' or name.startswith('[anon:'):
-                        anonymous_mappings.append(vector)
-                pidfd = os.pidfd_open(item.pid)
-                try:
-                    if include_anonymous and anonymous_mappings:
-                        vectors = (IOVec * len(anonymous_mappings))(*anonymous_mappings)
-                        process_madvise(pidfd, vectors, len(vectors), 20, 0)
-                    if file_mappings:
-                        vectors = (IOVec * len(file_mappings))(*file_mappings)
-                        result = process_madvise(pidfd, vectors, len(vectors), 21, 0)
-                        if result > 0:
-                            file_advised += result
-                finally:
-                    os.close(pidfd)
-                if include_anonymous and anonymous_mappings:
-                    anonymous.append((item.pid, anonymous_mappings))
-            except (OSError, ValueError, psutil.Error):
-                continue
-
-        if include_anonymous and anonymous:
-            time.sleep(2)
-            for pid, mappings in anonymous:
-                try:
-                    vectors = (IOVec * len(mappings))(*mappings)
-                    pidfd = os.pidfd_open(pid)
-                    try:
-                        result = process_madvise(pidfd, vectors, len(vectors), 21, 0)
-                        if result > 0:
-                            anonymous_advised += result
-                    finally:
-                        os.close(pidfd)
-                except OSError:
-                    continue
-        return {'file': file_advised, 'anonymous': anonymous_advised}
-
-    @staticmethod
-    def _process_memory_usage(root_pid: int) -> dict[str, int]:
-        try:
-            root = psutil.Process(root_pid)
-            processes = [root, *root.children(recursive=True)]
-        except (psutil.Error, OSError):
-            return {'rss': 0, 'swap': 0}
-        rss = 0
-        swap = 0
-        for item in processes:
-            try:
-                rss += int(item.memory_info().rss)
-                swap += int(getattr(item.memory_full_info(), 'swap', 0) or 0)
-            except (psutil.Error, OSError):
-                continue
-        return {'rss': rss, 'swap': swap}
+    _reclaim_process_pages = staticmethod(reclaim_process_pages)
+    _process_memory_usage = staticmethod(process_memory_usage)
 
     async def on_onebot_disconnected(self, bot_id: str, self_id: str) -> None:
         bot = self.bots.get(bot_id)
@@ -1404,149 +1255,12 @@ class EmbeddedQQManager:
         await self._save_accounts()
 
     def _memory_snapshot(self, bot: EmbeddedBot) -> dict[str, Any]:
-        process = bot.process
-        empty = {
-            'memory_mb': 0.0,
-            'memory_rss_mb': 0.0,
-            'memory_pss_mb': 0.0,
-            'memory_uss_mb': 0.0,
-            'memory_swap_mb': 0.0,
-            'memory_processes': 0,
-        }
-        if not process or process.returncode is not None:
-            self._memory_cache.pop(bot.bot_id, None)
-            return empty
-        now = time.monotonic()
-        cached = self._memory_cache.get(bot.bot_id)
-        if cached and cached[1] == process.pid and now - cached[0] < 2.0:
-            return cached[2].copy()
-        try:
-            root = psutil.Process(process.pid)
-            processes = [root, *root.children(recursive=True)]
-        except (psutil.Error, OSError):
-            return empty
-        seen: set[int] = set()
-        rss = 0
-        pss = 0
-        uss = 0
-        swap = 0
-        count = 0
-        for item in processes:
-            try:
-                if item.pid in seen or not item.is_running():
-                    continue
-                seen.add(item.pid)
-                info = item.memory_info()
-                rss += int(getattr(info, 'rss', 0) or 0)
-                with contextlib.suppress(psutil.Error, OSError):
-                    full_info = item.memory_full_info()
-                    pss += int(getattr(full_info, 'pss', 0) or 0)
-                    uss += int(getattr(full_info, 'uss', 0) or 0)
-                    swap += int(getattr(full_info, 'swap', 0) or 0)
-                count += 1
-            except (psutil.Error, OSError):
-                continue
-        mib = 1024 * 1024
-        result = {
-            'memory_mb': round(rss / mib, 1),
-            'memory_rss_mb': round(rss / mib, 1),
-            'memory_pss_mb': round(pss / mib, 1),
-            'memory_uss_mb': round(uss / mib, 1),
-            'memory_swap_mb': round(swap / mib, 1),
-            'memory_processes': count,
-        }
-        self._memory_cache[bot.bot_id] = (now, process.pid, result)
-        return result.copy()
+        return self._memory_monitor.snapshot(bot.bot_id, bot.process)
 
-    @staticmethod
-    def _is_qq_noise(line: str) -> bool:
-        stripped = line.strip()
-        if len(stripped) >= 12 and not stripped.translate(str.maketrans('', '', '▄▀█ ')):
-            return True
-        return any(
-            pattern in line
-            for pattern in (
-                'DroppedFrame(',
-                'Failed to connect to the bus:',
-                'org.freedesktop.DBus.NameHasOwner',
-                'org.freedesktop.systemd1.Manager.StartTransientUnit',
-                'No suitable EGL configs found',
-                'Failed to get config for surface',
-                'CreateOffscreenGLSurface failed',
-                'Could not create surface for info collection',
-                'CollectGraphicsInfo failed',
-                'Exiting GPU process due to errors during initialization',
-                '[QQ hotUpdate]',
-                'not mini app.',
-                '[preload] succeeded.',
-                '状态变更: logging_in {"qrcodeUrl":',
-                '[LOGIN] onQRCodeGetPicture, qrcodeUrl:',
-                '[LOGIN] 轮询已开始',
-                '[LOGIN] onQRCodeSessionFailed: 1 3',
-                'AddContentDecryptionModules called',
-                'Widevine CDM path from switch:',
-                'Widevine CDM path not set',
-                'Widevine CDM not available',
-                'argv[',
-                'Boot Command:',
-                'Creating pipe:',
-                'resourcesPath:',
-                'loadSymbolFromShell: dlsym failed PerfTrace',
-                '[I] <MMKV',
-                '[I] <MemoryFile',
-                'linux-bugly: init bugly',
-                'InitBuglyManager',
-                'SetLogger',
-                'fatalSetup',
-                'GetDllPath:',
-                'pub_key_path:',
-                'BuglyManager/',
-                '[BuglyService.cpp][registBugly]',
-                '[BuglyService.cpp][registSignalHandler]',
-                'registBugly/',
-                '[BuglyService.cpp][setParam]',
-                'setParam/',
-                'StartWithOptions ',
-                'PostDelayedTask ',
-                '请扫描下面的二维码',
-                '二维码解码URL:',
-                '如果控制台二维码无法扫码',
-                '二维码已保存到',
-            )
-        )
-
-    @staticmethod
-    def _qq_output_level(line: str) -> int:
-        """为 QQ 子进程输出分配日志等级，正常登录链路仅在调试模式显示。"""
-        lowered = line.casefold()
-        warning_markers = (
-            'error',
-            'failed',
-            'exception',
-            'fatal',
-            '启动失败',
-            '登录失败',
-            '加载失败',
-            '初始化失败',
-            '崩溃',
-        )
-        return logging.WARNING if any(marker in lowered for marker in warning_markers) else logging.DEBUG
-
-    @staticmethod
-    def _crash_dump_start(line: str) -> bool:
-        return any(
-            pattern in line
-            for pattern in (
-                '[BuglyManager.cpp][UploadBugly]',
-                '[NativeCrashHandler.cpp]',
-                '[BuglyService.cpp][buglySignalHandler]',
-                'FATAL:electron/shell/browser/electron_browser_main_parts.cc',
-            )
-        )
-
-    @staticmethod
-    def _crash_dump_end(line: str) -> bool:
-        return '[NativeCrashHandler.cpp][onUploadEnd]' in line or '[UploadTask.cpp][onUploadEnd]' in line or 'upload success' in line.lower()
+    _is_qq_noise = staticmethod(is_qq_noise)
+    _qq_output_level = staticmethod(qq_output_level)
+    _crash_dump_start = staticmethod(crash_dump_start)
+    _crash_dump_end = staticmethod(crash_dump_end)
 
     async def _read_output(self, bot: EmbeddedBot) -> None:
         process = bot.process

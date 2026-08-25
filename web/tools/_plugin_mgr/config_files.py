@@ -15,6 +15,7 @@ from aiohttp import web
 from core.foundation.archives import is_within
 from core.services.files import read_text, run_sync
 from web.protocol import json_body
+from web.tools._plugin_mgr import context
 
 MAX_CONFIG_SIZE = 2 * 1024 * 1024
 
@@ -32,13 +33,6 @@ def _save_config_file(path: str, content: str) -> None:
         with contextlib.suppress(OSError):
             os.remove(temporary)
         raise
-
-
-def _manager():
-    from web.tools import plugin_mgr
-
-    return plugin_mgr
-
 
 def _yaml_scalar(value):
     if value is None:
@@ -115,18 +109,17 @@ def _extract_yaml_comments(raw_text):
 
 
 async def handle_read_config(request: web.Request):
-    manager = _manager()
     body = await json_body(request)
     if not body.get('path'):
         return web.json_response({'success': False, 'message': '缺少路径'}, status=400)
-    path, error = manager.validate_config_path(body['path'])
+    path, error = context.validate_config_path(body['path'])
     if error:
         return error
     if not os.path.isfile(path):
         return web.json_response({'success': False, 'message': '文件不存在'}, status=404)
     if os.path.getsize(path) > MAX_CONFIG_SIZE:
         return web.json_response({'success': False, 'message': '配置文件超过 2 MB 限制'}, status=413)
-    fmt = manager.detect_config_format(os.path.splitext(path)[1].lower())
+    fmt = context.detect_config_format(os.path.splitext(path)[1].lower())
     raw = await read_text(path)
     parsed, comments = None, {}
     if fmt == 'yaml':
@@ -149,14 +142,13 @@ async def handle_read_config(request: web.Request):
 
 
 async def handle_save_config(request: web.Request):
-    manager = _manager()
     body = await json_body(request)
     content, fmt = body.get('content'), body.get('format', 'raw')
     if not body.get('path') or not isinstance(content, str):
         return web.json_response({'success': False, 'message': '缺少参数'}, status=400)
     if len(content.encode('utf-8')) > MAX_CONFIG_SIZE:
         return web.json_response({'success': False, 'message': '配置文件超过 2 MB 限制'}, status=413)
-    path, error = manager.validate_config_path(body['path'])
+    path, error = context.validate_config_path(body['path'])
     if error:
         return error
     if fmt == 'yaml':
@@ -181,9 +173,9 @@ async def handle_save_config(request: web.Request):
     await run_sync(_save_config_file, path, content)
 
     reloaded = ''
-    modules_root = os.path.realpath(manager.modules_dir())
+    modules_root = os.path.realpath(context.modules_dir())
     if is_within(modules_root, path):
-        module_manager = manager.get_mm()
+        module_manager = context.get_mm()
         if module_manager:
             module_name = os.path.relpath(path, modules_root).split(os.sep)[0]
             if module_manager.is_enabled(module_name):

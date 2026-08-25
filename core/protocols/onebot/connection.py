@@ -108,7 +108,7 @@ class ConnectionManager:
             ws = self._adapter.websockets.get(sid)
             if ws is not None:
                 with contextlib.suppress(Exception):
-                    await ws.close(code=1001, message=b'Server shutdown')
+                    await ws.close(code=1001, message='服务关闭'.encode())
                 # 热重载必须立即清除账号状态，不能依赖连接处理协程稍后执行 finally。
                 self._adapter.unregister_bot(sid, ws)
 
@@ -164,13 +164,23 @@ class ConnectionManager:
             if not c.get('enable'):
                 continue
             port = int(c.get('port') or main_port)
-            path = str(c.get('path') or '/') or '/'
+            path = self._normalize_path(c.get('path') or '/')
             if c['type'] == ConnType.WS_REVERSE:
-                ws_tokens[(port, path)] = c.get('token', '') or ''
+                self._merge_server_credential(ws_tokens, (port, path), c.get('token', '') or '', 'token')
             elif c['type'] == ConnType.HTTP_SERVER:
-                http_secrets[(port, path)] = c.get('secret', '') or ''
+                self._merge_server_credential(http_secrets, (port, path), c.get('secret', '') or '', 'secret')
         self._adapter.reverse_ws_tokens = ws_tokens
         self._adapter.reverse_http_secrets = http_secrets
+
+    @staticmethod
+    def _merge_server_credential(target: dict, endpoint: tuple, credential: str, kind: str) -> None:
+        """重复端点优先保留非空凭据，冲突时拒绝被后续配置静默降级。"""
+        credential = str(credential or '')
+        if endpoint not in target or not target[endpoint]:
+            target[endpoint] = credential
+            return
+        if credential and target[endpoint] != credential:
+            logger.error('OneBot 端点 %s 存在冲突的 %s，保留首个非空凭据', endpoint, kind)
 
     # ── HTTP 客户端 ──
     def _register_http_clients(self):

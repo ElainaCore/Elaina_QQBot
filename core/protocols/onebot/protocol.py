@@ -41,7 +41,7 @@ def normalize_action_response(response: Any, *, action: str = '') -> dict[str, A
         retcode = 1500
 
     # QQNT 原生接口可能被包装成外层 OneBot success，但把真正的错误放在
-    # data.result/errMsg 中；NapCat 会在 action 层先检查这一层，框架也必须如此。
+    # data.result/errMsg 中；Elaina 在 action 层统一检查这一层。
     nested = None
     for candidate in (normalized.get('data'), normalized.get('rsp'), normalized.get('payload')):
         if isinstance(candidate, dict):

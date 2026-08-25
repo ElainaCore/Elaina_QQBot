@@ -298,17 +298,8 @@ def _start_restarter(base: str, restarter: str, script: str) -> None:
 
 
 async def handle_restart(request: web.Request):
-    try:
-        from core.runtime.application import get_app
-
-        app = get_app()
-        if app:
-            app._restart_requested = True
-            if app._stop_event:
-                app._stop_event.set()
-            return web.json_response({'success': True, 'message': '正在重启...'})
-    except Exception:
-        pass
+    if _app and _app.request_restart():
+        return web.json_response({'success': True, 'message': '正在重启...'})
 
     base = _common.base_dir()
     main_py = os.path.join(base, 'main.py')
