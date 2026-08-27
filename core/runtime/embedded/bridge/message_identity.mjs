@@ -64,9 +64,12 @@ export function resolveReplyReference(element, message) {
   return {
     messageId: toOneBotMessageId(key, message),
     nativeId,
+    recordId,
+    replyId,
     sequence: realSequence,
+    clientSequence: usableId(reply?.replyMsgClientSeq || record?.clientSeq),
     record,
-    senderUin: usableId(record?.senderUin) || usableId(reply?.senderUin),
+    senderUin: usableId(record?.senderUin) || usableId(reply?.senderUin || reply?.senderUinStr),
     senderUid: usableId(record?.senderUid) || usableId(reply?.senderUidStr),
     senderName: String(record?.sendMemberName || record?.sendNickName || ""),
     msgTime: usableId(record?.msgTime) || usableId(reply?.replyMsgTime),

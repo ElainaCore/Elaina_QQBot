@@ -198,6 +198,7 @@ SUPPORTED_ACTIONS = frozenset(
         'set_qq_profile',
         'set_restart',
         'set_self_longnick',
+        'test_download_stream',
         'trans_group_file',
         'translate_en2zh',
         'upload_file_stream',

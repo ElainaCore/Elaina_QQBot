@@ -35,10 +35,26 @@ from core.runtime.embedded.output_filter import (
 )
 from core.runtime.embedded.packet import (
     PacketRequest,
+    build_ai_characters_packet,
+    build_ai_voice_packet,
     build_group_special_title_packet,
+    build_group_ptt_url_packet,
+    build_group_sign_packet,
+    build_group_todo_packet,
+    build_mini_app_packet,
     build_poke_packet,
+    build_rkey_packet,
+    build_unidirectional_friend_packet,
     normalize_packet_action_response,
     normalize_packet_request,
+    packet_response_bytes,
+    parse_ai_characters_response,
+    parse_ai_voice_index,
+    parse_group_ptt_url_response,
+    parse_mini_app_response,
+    parse_oidb_response,
+    parse_rkey_response,
+    parse_unidirectional_friend_response,
 )
 from core.runtime.embedded.process_control import (
     ProcessMemoryMonitor,
@@ -1034,11 +1050,43 @@ class EmbeddedQQManager:
                 packet = build_poke_packet(params)
             except ValueError as error:
                 return action_failed(str(error), 1400)
-            response = normalize_action_response(
-                await self._send_packet(bot_id, packet),
-                action=action,
-            )
-            return response if response['status'] == 'failed' else action_ok()
+            return await self._oidb_void_action(bot_id, action, packet)
+        if action in {'nc_get_rkey', 'get_rkey', 'get_rkey_server'}:
+            return await self._get_rkeys(bot_id, action)
+        if action in {'set_group_todo', 'complete_group_todo', 'cancel_group_todo'}:
+            return await self._group_todo_action(bot_id, action, params)
+        if action in {'set_group_sign', 'send_group_sign'}:
+            bot = self.bots.get(bot_id)
+            try:
+                packet = build_group_sign_packet(bot.uin if bot else '', params.get('group_id'))
+            except ValueError as error:
+                return action_failed(str(error), 1400)
+            return await self._oidb_void_action(bot_id, action, packet)
+        if action == 'get_unidirectional_friend_list':
+            bot = self.bots.get(bot_id)
+            try:
+                packet = build_unidirectional_friend_packet(bot.uin if bot else '')
+                data = await self._packet_bytes(bot_id, action, packet)
+                return action_ok(parse_unidirectional_friend_response(data))
+            except ValueError as error:
+                return action_failed(str(error), 1500)
+        if action == 'get_ai_characters':
+            try:
+                packet = build_ai_characters_packet(params.get('group_id'), params.get('chat_type', 1))
+                data = await self._packet_bytes(bot_id, action, packet)
+                return action_ok(parse_ai_characters_response(data))
+            except (TypeError, ValueError) as error:
+                return action_failed(str(error), 1400)
+        if action in {'get_ai_record', 'send_group_ai_record'}:
+            return await self._ai_voice_action(bot_id, action, params)
+        if action == 'get_mini_app_ark':
+            try:
+                packet = build_mini_app_packet(params)
+                data = await self._packet_bytes(bot_id, action, packet)
+                raw = str(params.get('rawArkData') or '').casefold() == 'true'
+                return action_ok(parse_mini_app_response(data, raw=raw))
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                return action_failed(str(error), 1400)
         return await self._control_call(
             bot_id,
             {'type': 'action', 'action': action, 'params': params},
@@ -1049,6 +1097,88 @@ class EmbeddedQQManager:
             bot_id,
             {'type': 'packet', 'packet': packet.bridge_payload()},
         )
+
+    async def _packet_bytes(self, bot_id: str, action: str, packet: PacketRequest) -> bytes:
+        response = normalize_action_response(await self._send_packet(bot_id, packet), action=action)
+        if response['status'] == 'failed':
+            raise ValueError(response.get('message') or response.get('wording') or f'{action} 调用失败')
+        return packet_response_bytes(response.get('data'))
+
+    async def _oidb_void_action(self, bot_id: str, action: str, packet: PacketRequest) -> dict[str, Any]:
+        try:
+            parse_oidb_response(await self._packet_bytes(bot_id, action, packet))
+            return action_ok()
+        except ValueError as error:
+            return action_failed(str(error), 1500)
+
+    async def _get_rkeys(self, bot_id: str, action: str) -> dict[str, Any]:
+        try:
+            values = parse_rkey_response(await self._packet_bytes(bot_id, action, build_rkey_packet()))
+        except ValueError as error:
+            return action_failed(str(error), 1500)
+        if action == 'nc_get_rkey':
+            return action_ok(values)
+        if action == 'get_rkey':
+            return action_ok([
+                {
+                    'type': 'private' if item['type'] == 10 else 'group',
+                    'rkey': item['rkey'],
+                    'created_at': item['time'],
+                    'ttl': item['ttl'],
+                }
+                for item in values
+            ])
+        private = next((item for item in values if item['type'] == 10), None)
+        group = next((item for item in values if item['type'] == 20), None)
+        ttl_values = [item['ttl'] for item in (private, group) if item and item['ttl']]
+        return action_ok({
+            'private_rkey': private['rkey'] if private else None,
+            'group_rkey': group['rkey'] if group else None,
+            'expired_time': int(time.time()) + min(ttl_values) if ttl_values else None,
+            'name': 'NapCat 4',
+        })
+
+    async def _group_todo_action(self, bot_id: str, action: str, params: dict[str, Any]) -> dict[str, Any]:
+        sequence = str(params.get('message_seq') or '').strip()
+        if not sequence and params.get('message_id') is not None:
+            response = normalize_action_response(
+                await self._control_call(bot_id, {
+                    'type': 'action',
+                    'action': 'get_msg',
+                    'params': {'message_id': params.get('message_id')},
+                }),
+                action=action,
+            )
+            if response['status'] == 'failed':
+                return response
+            message = response.get('data') if isinstance(response.get('data'), dict) else {}
+            sequence = str(message.get('real_seq') or message.get('message_seq') or '').strip()
+        try:
+            packet = build_group_todo_packet(params.get('group_id'), sequence, action)
+        except ValueError as error:
+            return action_failed(str(error), 1400)
+        return await self._oidb_void_action(bot_id, action, packet)
+
+    async def _ai_voice_action(self, bot_id: str, action: str, params: dict[str, Any]) -> dict[str, Any]:
+        index = None
+        session_id = uuid.uuid4().int & 0xFFFFFFFF
+        try:
+            for _attempt in range(30):
+                packet = build_ai_voice_packet(
+                    params.get('group_id'), params.get('character'), params.get('text'),
+                    session_id=session_id,
+                )
+                index = parse_ai_voice_index(await self._packet_bytes(bot_id, action, packet))
+                if index:
+                    break
+            if not index:
+                raise ValueError('AI 语音生成未返回语音数据')
+            if action == 'send_group_ai_record':
+                return action_ok({'message_id': 0})
+            packet = build_group_ptt_url_packet(params.get('group_id'), index)
+            return action_ok(parse_group_ptt_url_response(await self._packet_bytes(bot_id, action, packet)))
+        except (TypeError, ValueError) as error:
+            return action_failed(str(error), 1500)
 
     async def _set_group_special_title(self, bot_id: str, params: dict[str, Any]) -> dict[str, Any]:
         group_id = str(params.get('group_id') or '').strip()
@@ -1066,11 +1196,7 @@ class EmbeddedQQManager:
             packet = build_group_special_title_packet(group_id, uid, params.get('special_title', ''))
         except ValueError as error:
             return action_failed(str(error), 1400)
-        response = normalize_action_response(
-            await self._send_packet(bot_id, packet),
-            action='set_group_special_title',
-        )
-        return response if response['status'] == 'failed' else action_ok()
+        return await self._oidb_void_action(bot_id, 'set_group_special_title', packet)
 
     def register_red_packet_listener(self, owner: str, callback) -> None:
         """注册内置 QQ 原生红包回调；同一 owner 热重载时自动替换。"""

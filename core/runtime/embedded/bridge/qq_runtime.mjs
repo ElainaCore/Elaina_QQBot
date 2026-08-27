@@ -1,3 +1,4 @@
+import http from 'http';
 import https from 'https';
 import { createHash, randomUUID } from 'crypto';
 import fs from 'fs';
@@ -24,6 +25,7 @@ import {
   findGroupIncreaseCandidate,
   groupIncreaseCandidateFromNotify,
   isThirdPartyGroupIncreaseGrayTip,
+  decodeProtoFields,
   parseEmojiLikeGrayTip,
   parseEssenceGrayTip,
   parseGroupReactionPacket,
@@ -68,6 +70,42 @@ const VIDEO_FORMAT_BY_EXTENSION = Object.freeze({
 });
 
 const botUinMap = /* @__PURE__ */ new Map();
+
+function encodeProtoVarint(value) {
+  let current = BigInt(value);
+  if (current < 0n) current &= (1n << 64n) - 1n;
+  const result = [];
+  do {
+    let byte = Number(current & 0x7fn);
+    current >>= 7n;
+    if (current) byte |= 0x80;
+    result.push(byte);
+  } while (current);
+  return Buffer.from(result);
+}
+
+function protoVarintField(number, value) {
+  return Buffer.concat([encodeProtoVarint(BigInt(number) << 3n), encodeProtoVarint(value)]);
+}
+
+function protoBytesField(number, value) {
+  const data = Buffer.from(value || []);
+  return Buffer.concat([
+    encodeProtoVarint((BigInt(number) << 3n) | 2n),
+    encodeProtoVarint(data.length),
+    data,
+  ]);
+}
+
+function protoFirstBytes(fields, number) {
+  const value = fields.get(number)?.find((field) => field.wire === 2)?.value;
+  return value ? Buffer.from(value) : Buffer.alloc(0);
+}
+
+function protoFirstInteger(fields, number, fallback = 0) {
+  const value = fields.get(number)?.find((field) => field.wire === 0)?.value;
+  return typeof value === "bigint" ? Number(value) : fallback;
+}
 function botTag(botId) {
   return botUinMap.get(botId) || botId.slice(0, 8);
 }
@@ -177,6 +215,8 @@ class QQInstance {
   pendingNativeEvents = /* @__PURE__ */ new Map();
   forwardSendTail = Promise.resolve();
   oneBotFiles = /* @__PURE__ */ new Map();
+  oneBotImageRkeys = null;
+  oneBotImageRkeyPromise = null;
   oneBotFileStreams = /* @__PURE__ */ new Map();
   oneBotStreamFiles = /* @__PURE__ */ new Set();
   oneBotOnlineClients = [];
@@ -600,6 +640,8 @@ class QQInstance {
         this.oneBotReplyTargets.clear();
         this.oneBotForwardMessages.clear();
         this.oneBotFiles.clear();
+        this.oneBotImageRkeys = null;
+        this.oneBotImageRkeyPromise = null;
         this.cleanOneBotStreams();
         this.redPackets.clear();
         return null;
@@ -744,6 +786,8 @@ class QQInstance {
       case "download_file_image_stream":
       case "download_file_record_stream":
         return this.downloadOneBotFileStream(action, params);
+      case "test_download_stream":
+        return this.testOneBotDownloadStream(params);
       case "upload_file_stream":
         return this.uploadOneBotFileStream(params);
       case "clean_stream_temp_file":
@@ -836,29 +880,33 @@ class QQInstance {
         return this.getOnlineClients();
       case "get_model_show":
       case "_get_model_show":
-        return { variants: [{ model_show: "ElainaQQ", need_pay: false }] };
+        return [{ variants: { model_show: "napcat", need_pay: false } }];
       case "set_model_show":
       case "_set_model_show":
         return null;
-      case "nc_get_rkey":
-        return this.unsupportedOneBotAction("get_rkey");
-      case "delete_qzone_msg":
-      case "get_ai_characters":
-      case "get_ai_record":
-      case "get_group_signed_list":
       case "get_guild_list":
       case "get_guild_service_profile":
+        return null;
+      case "get_group_signed_list":
+        return this.getGroupSignedList(params);
+      case "upload_image_to_qun_album":
+        return this.uploadImageToQunAlbum(params);
+      case "send_qzone_msg":
+        return this.sendQzoneMessage(params);
+      case "delete_qzone_msg":
+        return this.deleteQzoneMessage(params);
+      case "nc_get_rkey":
+      case "get_ai_characters":
+      case "get_ai_record":
       case "get_mini_app_ark":
       case "get_rkey":
       case "get_rkey_server":
       case "send_group_ai_record":
       case "send_group_sign":
-      case "send_qzone_msg":
       case "set_group_sign":
       case "set_group_todo":
       case "complete_group_todo":
       case "cancel_group_todo":
-      case "upload_image_to_qun_album":
         return this.unsupportedOneBotAction(action);
       default:
         return this.unsupportedOneBotAction(action);
@@ -902,7 +950,7 @@ class QQInstance {
       || (cached ? this.oneBotReplyTargets.get(cached.key) : null);
     if (context) {
       const raw = await this.fetchReplyTarget(context);
-      if (raw) return this.hydrateOneBotMessage(requestedId, raw, context.reference.nativeId);
+      if (raw) return this.hydrateOneBotMessage(requestedId, raw, nativeMessageKey(raw));
     }
     if (cached?.event && Array.isArray(cached.event.message) && cached.event.message.length) {
       return cached.event;
@@ -2164,6 +2212,12 @@ class QQInstance {
     } catch {
     }
   }
+  scheduleTemporaryFileCleanup(filePaths, delay = 60000) {
+    for (const filePath of new Set(Array.from(filePaths || []).map(String).filter(Boolean))) {
+      const timer = setTimeout(() => this.removeTemporaryFile(filePath), delay);
+      timer.unref?.();
+    }
+  }
   async getOneBotFileUrl(action, params) {
     const fileId = String(params.file_id || params.file || "");
     const cached = this.oneBotFiles.get(fileId);
@@ -2288,6 +2342,21 @@ class QQInstance {
       total_chunks: Math.ceil(buffer.length / chunkSize),
       total_bytes: buffer.length,
       packets,
+    };
+  }
+  testOneBotDownloadStream(params) {
+    if (this.asBoolean(params.error)) {
+      throw new OneBotActionError("This is a test error", 1400, "test_download_stream");
+    }
+    return {
+      type: "response",
+      data_type: "data_complete",
+      data: "Stream transmission complete",
+      packets: Array.from({ length: 10 }, (_, index) => ({
+        type: "stream",
+        data: "Index-> " + (index + 1),
+        data_type: "data_chunk",
+      })),
     };
   }
   oneBotStreamStatus(stream, status = "file_created") {
@@ -2467,6 +2536,194 @@ class QQInstance {
       }
     }
     return { domain: normalizedDomain, cookies };
+  }
+  cookieHeader(cookies) {
+    return Object.entries(cookies || {})
+      .filter(([, value]) => value !== undefined && value !== null && String(value))
+      .map(([key, value]) => key + "=" + value)
+      .join("; ");
+  }
+  async oneBotHttpRequest(url, { method = "GET", headers = {}, body = undefined, responseType = "json" } = {}) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30_000);
+    try {
+      const response = await fetch(url, { method, headers, body, signal: controller.signal });
+      const text = await response.text();
+      if (!response.ok) throw new OneBotActionError("QQ Web 接口失败: HTTP " + response.status, response.status, "web_api");
+      if (responseType === "text") return text;
+      if (!text) return {};
+      try {
+        return JSON.parse(text);
+      } catch {
+        throw new OneBotActionError("QQ Web 接口返回了无效 JSON", 1500, "web_api");
+      }
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  async qzoneAuth(domain = "qzone.qq.com") {
+    const { cookies } = await this.fetchOneBotCookies(domain);
+    const skey = String(cookies.skey || "");
+    let pskey = String(cookies.p_skey || "");
+    if (!pskey) pskey = await this.getDomainPskey(domain);
+    if (!skey || !pskey) throw new OneBotActionError("QQ Web 登录凭据不完整", 1500, "web_api");
+    const uin = String(this.getSelfUin());
+    return {
+      skey,
+      pskey,
+      uin,
+      gtk: this.bknFromSkey(skey),
+      cookie: this.cookieHeader({ p_uin: "o" + uin, p_skey: pskey, skey, uin: "o" + uin }),
+    };
+  }
+  parseQzoneImageUpload(raw) {
+    const start = String(raw).indexOf("frameElement.callback");
+    const end = String(raw).indexOf("</script>", start);
+    if (start < 0 || end < 0) throw new OneBotActionError("QQ 空间图片上传响应格式异常", 1500, "send_qzone_msg");
+    const segment = String(raw).slice(start + "frameElement.callback".length, end);
+    const left = segment.indexOf("(");
+    const right = segment.lastIndexOf(")");
+    if (left < 0 || right <= left) throw new OneBotActionError("QQ 空间图片上传响应解析失败", 1500, "send_qzone_msg");
+    const parsed = JSON.parse(segment.slice(left + 1, right));
+    if (Number(parsed?.code || 0) !== 0 || !parsed?.data) {
+      throw new OneBotActionError(String(parsed?.msg || "QQ 空间图片上传失败"), Number(parsed?.code || 1500), "send_qzone_msg");
+    }
+    const data = parsed.data;
+    return ["", data.albumid, data.lloc, data.lloc, data.type, data.height, data.width, "", data.height, data.width].join(",");
+  }
+  async uploadQzoneImage(file, auth) {
+    const materialized = await this.materializeFile(String(file || ""), ".jpg");
+    try {
+      const form = new URLSearchParams({
+        filename: "filename", uin: auth.uin, skey: auth.skey, zzpaneluin: auth.uin,
+        p_uin: auth.uin, p_skey: auth.pskey, uploadtype: "1", albumtype: "7",
+        exttype: "0", refer: "shuoshuo", output_type: "jsonhtml", charset: "utf-8",
+        output_charset: "utf-8", upload_hd: "1", hd_width: "2048", hd_height: "10000",
+        hd_quality: "96", base64: "1", jsonhtml_callback: "callback",
+        picfile: fs.readFileSync(materialized.path).toString("base64"),
+        qzreferrer: "https://user.qzone.qq.com/" + auth.uin + "/main",
+        backUrls: "http://upbak.photo.qzone.qq.com/cgi-bin/upload/cgi_upload_image,http://119.147.64.75/cgi-bin/upload/cgi_upload_image&url=https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image?g_tk=" + auth.gtk,
+      });
+      const raw = await this.oneBotHttpRequest(
+        "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image?g_tk=" + auth.gtk,
+        { method: "POST", headers: { Cookie: auth.cookie, "Content-Type": "application/x-www-form-urlencoded" }, body: form, responseType: "text" },
+      );
+      return this.parseQzoneImageUpload(raw);
+    } finally {
+      if (materialized.temporary) this.removeTemporaryFile(materialized.path);
+    }
+  }
+  async sendQzoneMessage(params) {
+    const rights = new Set([1, 4, 16, 64, 128]);
+    const ugcRight = Number(params.ugc_right ?? 1);
+    if (!rights.has(ugcRight)) throw new OneBotActionError("ugc_right 参数不合法", 1400, "send_qzone_msg");
+    const targetUins = Array.from(params.target_uins || []).map(Number).filter(Number.isFinite);
+    if ([16, 128].includes(ugcRight) && !targetUins.length) {
+      throw new OneBotActionError("ugc_right 为 16 或 128 时 target_uins 不能为空", 1400, "send_qzone_msg");
+    }
+    const auth = await this.qzoneAuth();
+    const richvals = [];
+    for (const image of Array.from(params.images || [])) richvals.push(await this.uploadQzoneImage(image, auth));
+    const body = new URLSearchParams({
+      syn_tweet_verson: "1", paramstr: "1", con: String(params.content || ""), feedversion: "1",
+      ver: "1", ugc_right: String(ugcRight), to_sign: "0", hostuin: auth.uin,
+      code_version: "1", format: "json", qzreferrer: "https://user.qzone.qq.com/" + auth.uin + "/main",
+    });
+    if (richvals.length) { body.set("richtype", "1"); body.set("richval", richvals.join("\t")); }
+    if (targetUins.length) { body.set("allow_uins", targetUins.join("|")); body.set("who", "1"); }
+    const result = await this.oneBotHttpRequest(
+      "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6?g_tk=" + auth.gtk,
+      { method: "POST", headers: { Cookie: auth.cookie, "Content-Type": "application/x-www-form-urlencoded" }, body },
+    );
+    const code = result?.subcode ?? result?.code ?? 0;
+    if (Number(code) !== 0) throw new OneBotActionError(String(result?.message || result?.msg || "QQ 空间发说说失败"), Number(code), "send_qzone_msg");
+    const tid = String(result?.t1_tid || result?.tid || "");
+    if (!tid) throw new OneBotActionError("QQ 空间发说说未返回 tid", 1500, "send_qzone_msg");
+    return { tid };
+  }
+  async deleteQzoneMessage(params) {
+    const tid = String(params.tid || "").trim();
+    if (!tid) throw new OneBotActionError("删除 QQ 空间说说缺少 tid", 1400, "delete_qzone_msg");
+    const auth = await this.qzoneAuth();
+    const body = new URLSearchParams({
+      hostuin: auth.uin, tid, t1_source: "1", code_version: "1", format: "json",
+      qzreferrer: "https://user.qzone.qq.com/" + auth.uin,
+    });
+    const result = await this.oneBotHttpRequest(
+      "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_delete_v6?g_tk=" + auth.gtk,
+      { method: "POST", headers: { Cookie: auth.cookie, "Content-Type": "application/x-www-form-urlencoded" }, body },
+    );
+    const code = result?.subcode ?? result?.code ?? 0;
+    if (Number(code) !== 0) throw new OneBotActionError(String(result?.message || result?.msg || "QQ 空间删说说失败"), Number(code), "delete_qzone_msg");
+    return null;
+  }
+  async getGroupSignedList(params) {
+    const groupId = String(params.group_id || "").trim();
+    if (!groupId) throw new OneBotActionError("获取群签到列表缺少 group_id", 1400, "get_group_signed_list");
+    const auth = await this.qzoneAuth("qun.qq.com");
+    const payload = {
+      dayYmd: new Date().toISOString().slice(0, 10).replace(/-/g, ""), offset: 0,
+      limit: 100, uid: auth.uin, groupId,
+    };
+    const result = await this.oneBotHttpRequest(
+      "https://qun.qq.com/v2/signin/trpc/GetDaySignedList?g_tk=" + this.bknFromSkey(auth.pskey),
+      { method: "POST", headers: { Cookie: auth.cookie, "Content-Type": "application/json" }, body: JSON.stringify(payload) },
+    );
+    const page = result?.response?.page;
+    if (!Array.isArray(page)) throw new OneBotActionError("无法获取该群组打卡列表", 1500, "get_group_signed_list");
+    return Array.from(page[0]?.infos || []).map((info) => ({
+      user_id: Number(info.uid || 0), nick: String(info.uidGroupNick || ""),
+      time: Number(info.signedTimeStamp || 0), rank: (Number(info.signInRank || 1) - 1) / 2 + 1,
+    }));
+  }
+  async uploadImageToQunAlbum(params) {
+    const groupId = String(params.group_id || "").trim();
+    const albumId = String(params.album_id || "").trim();
+    const albumName = String(params.album_name || "");
+    if (!groupId || !albumId || !params.file) throw new OneBotActionError("上传群相册图片缺少必要参数", 1400, "upload_image_to_qun_album");
+    const materialized = await this.materializeFile(String(params.file), ".jpg");
+    try {
+      const auth = await this.qzoneAuth();
+      const image = fs.readFileSync(materialized.path);
+      const md5 = createHash("md5").update(image).digest("hex");
+      const timestamp = Math.floor(Date.now() / 1000);
+      const controlBody = { control_req: [{
+        uin: auth.uin, token: { type: 4, data: auth.pskey, appid: 5 }, appid: "qun",
+        checksum: md5, check_type: 0, file_len: image.length,
+        env: { refer: "qzone", deviceInfo: "h5" }, model: 0,
+        biz_req: {
+          sPicTitle: path.basename(materialized.path), sPicDesc: "", sAlbumName: albumName, sAlbumID: albumId,
+          iAlbumTypeID: 0, iBitmap: 0, iUploadType: 0, iUpPicType: 0, iBatchID: timestamp,
+          sPicPath: "", iPicWidth: 0, iPicHight: 0, iWaterType: 0, iDistinctUse: 0,
+          iNeedFeeds: 1, iUploadTime: timestamp, mapExt: { appid: "qun", userid: groupId },
+          stExtendInfo: { mapParams: { photo_num: "1", video_num: "0", batch_num: "1" } },
+        }, session: "", asy_upload: 0, cmd: "FileUpload",
+      }] };
+      const control = await this.oneBotHttpRequest(
+        "https://h5.qzone.qq.com/webapp/json/sliceUpload/FileBatchControl/" + md5 + "?g_tk=" + auth.gtk,
+        { method: "POST", headers: { Cookie: auth.cookie, "Content-Type": "application/json" }, body: JSON.stringify(controlBody) },
+      );
+      const session = String(control?.data?.session || "");
+      if (!session) throw new OneBotActionError(String(control?.msg || "创建群相册上传会话失败"), 1500, "upload_image_to_qun_album");
+      const chunkSize = 16384;
+      for (let offset = 0, sequence = 0; offset < image.length; offset += chunkSize, sequence += 1) {
+        const end = Math.min(offset + chunkSize, image.length);
+        const form = new FormData();
+        form.append("uin", auth.uin); form.append("appid", "qun"); form.append("session", session);
+        form.append("offset", String(offset)); form.append("data", new Blob([image.subarray(offset, end)]), "blob");
+        form.append("checksum", ""); form.append("check_type", "0"); form.append("retry", "0");
+        form.append("seq", String(sequence)); form.append("end", String(end)); form.append("cmd", "FileUpload");
+        form.append("slice_size", String(chunkSize)); form.append("biz_req.iUploadType", "0");
+        const result = await this.oneBotHttpRequest(
+          "https://h5.qzone.qq.com/webapp/json/sliceUpload/FileUpload?seq=" + sequence + "&retry=0&offset=" + offset + "&end=" + end + "&total=" + image.length + "&type=form&g_tk=" + auth.gtk,
+          { method: "POST", headers: { Cookie: auth.cookie }, body: form },
+        );
+        if (Number(result?.ret || 0) !== 0) throw new OneBotActionError(String(result?.msg || "群相册分片上传失败"), Number(result?.ret || 1500), "upload_image_to_qun_album");
+      }
+      return null;
+    } finally {
+      if (materialized.temporary) this.removeTemporaryFile(materialized.path);
+    }
   }
   bknFromSkey(skey) {
     let hash = 5381;
@@ -3186,6 +3443,7 @@ class QQInstance {
     }
     const elements = [];
     const temporaryFiles = [];
+    let sendCompleted = false;
     try {
       for (const segment of segments) {
         const segmentType = String(segment.type || "").toLowerCase();
@@ -3246,7 +3504,8 @@ class QQInstance {
           });
         } else if (segmentType === "image") {
           const mediaId = String(data.file_id || "");
-          const file = String(mediaId.startsWith("elaina-media:") ? mediaId : data.file || data.url || "");
+          const hasCachedMediaId = mediaId && (mediaId.startsWith("elaina-media:") || this.oneBotFiles.has(mediaId));
+          const file = String(hasCachedMediaId ? mediaId : data.url || data.file || data.path || "");
           if (!file) throw new Error("图片消息缺少 file/url");
           const prepared = await this.imageElement(file, String(data.summary || ""), Number(data.sub_type || 0));
           elements.push(prepared.element);
@@ -3315,6 +3574,7 @@ class QQInstance {
       }
       if (!elements.length) throw new Error("消息内容为空");
       const result = await this.sendNativeElements(type, target, elements);
+      sendCompleted = true;
       const rawId = String(result?.msgId || result?.messageId || result?.msg_id || Date.now());
       const fallbackPeerUid = type === "private" ? await this.resolveUid(target) : target;
       const messageId = toOneBotMessageId(rawId, result, type === "group" ? 2 : 1, fallbackPeerUid);
@@ -3347,12 +3607,8 @@ class QQInstance {
       if (!emitted) this.oneBotEventCallback?.(event);
       return { message_id: messageId };
     } finally {
-      for (const file of new Set(temporaryFiles)) {
-        try {
-          fs.unlinkSync(file);
-        } catch {
-        }
-      }
+      if (sendCompleted) this.scheduleTemporaryFileCleanup(temporaryFiles);
+      else for (const file of new Set(temporaryFiles)) this.removeTemporaryFile(file);
     }
   }
   normalizeOneBotMessage(message, autoEscape = false) {
@@ -3826,7 +4082,8 @@ class QQInstance {
   }
   async fileLikeElement(segmentType, data) {
     const mediaId = String(data.file_id || "");
-    const input = String(mediaId.startsWith("elaina-media:") ? mediaId : data.file || data.url || data.path || "");
+    const hasCachedMediaId = mediaId && (mediaId.startsWith("elaina-media:") || this.oneBotFiles.has(mediaId));
+    const input = String(hasCachedMediaId ? mediaId : data.url || data.file || data.path || "");
     if (!input) throw new OneBotActionError(`${segmentType} 消息缺少 file/url`, 1400);
     const extension = segmentType === "record" ? ".silk" : segmentType === "video" ? ".mp4" : path.extname(String(data.name || input));
     const resolvedInput = await this.resolveOneBotMediaInput(input, "send_msg");
@@ -5636,6 +5893,13 @@ class QQInstance {
         peerUid: String(msg?.peerUid || msg?.peerUin || ""),
         guildId: "",
       },
+      parent: {
+        chatType: Number(msg?.chatType || 0),
+        peerUid: String(msg?.peerUid || ""),
+        peerUin: String(msg?.peerUin || ""),
+        msgId: String(msg?.msgId || msg?.messageId || ""),
+        msgSeq: String(msg?.msgSeq || msg?.clientSeq || ""),
+      },
     };
   }
   rememberReplyTargetContext(context) {
@@ -5645,24 +5909,70 @@ class QQInstance {
       this.oneBotReplyTargets.delete(this.oneBotReplyTargets.keys().next().value);
     }
   }
-  replyTargetFromResult(result, reference) {
-    const messages = collectionValues(result?.msgList || result?.data?.msgList || result);
+  replyTargetFromResult(result, context, allowSingle = false) {
+    const { reference } = context;
+    const containers = [
+      result?.msgList,
+      result?.data?.msgList,
+      result?.result?.msgList,
+      result?.data,
+      result?.result,
+      result,
+    ];
+    const messages = [];
+    const seen = new Set();
+    const appendMessage = (value) => {
+      if (!value || typeof value !== "object" || seen.has(value)) return;
+      if (!Array.isArray(value.elements) && !value.msgId && !value.messageId && !value.msgSeq) return;
+      seen.add(value);
+      messages.push(value);
+    };
+    for (const container of containers) {
+      appendMessage(container);
+      for (const value of collectionValues(container)) {
+        appendMessage(value);
+      }
+    }
     if (!messages.length) return null;
     const nativeId = String(reference.nativeId || "");
+    const recordId = String(reference.recordId || "");
+    const replyId = String(reference.replyId || "");
     const sequence = String(reference.sequence || "");
     const random = String(reference.msgRandom || "");
-    return messages.find((message) => nativeId && String(message?.msgId || message?.messageId || "") === nativeId)
+    const matched = messages.find((message) => {
+      const id = String(message?.msgId || message?.messageId || "");
+      return id && (id === nativeId || id === recordId || id === replyId);
+    })
       || messages.find((message) => random && String(message?.msgRandom || "") === random)
       || messages.find((message) => sequence && String(message?.msgSeq || message?.clientSeq || "") === sequence)
       || null;
+    return matched || (allowSingle && messages.length === 1 ? messages[0] : null);
+  }
+  normalizeReplyTarget(raw, context) {
+    if (!raw || typeof raw !== "object") return null;
+    const { reference, parent, peer } = context;
+    const record = reference.record && typeof reference.record === "object" ? reference.record : {};
+    return {
+      ...record,
+      ...raw,
+      chatType: Number(raw.chatType || record.chatType || parent.chatType || peer.chatType || 0),
+      peerUid: String(raw.peerUid || record.peerUid || parent.peerUid || peer.peerUid || ""),
+      peerUin: String(raw.peerUin || record.peerUin || parent.peerUin || ""),
+      msgId: String(raw.msgId || raw.messageId || record.msgId || record.messageId || reference.nativeId || ""),
+      msgSeq: String(raw.msgSeq || raw.clientSeq || record.msgSeq || reference.sequence || ""),
+      msgTime: String(raw.msgTime || record.msgTime || reference.msgTime || ""),
+      msgRandom: String(raw.msgRandom || record.msgRandom || reference.msgRandom || ""),
+      senderUin: String(raw.senderUin || record.senderUin || reference.senderUin || ""),
+      senderUid: String(raw.senderUid || record.senderUid || reference.senderUid || ""),
+      elements: Array.isArray(raw.elements) && raw.elements.length
+        ? raw.elements
+        : Array.isArray(record.elements) ? record.elements : [],
+    };
   }
   async fetchReplyTarget(context) {
     const { reference, peer } = context;
     const service = this.getMsgService();
     const attempts = [];
-    if (reference.nativeId && typeof service?.getMsgsByMsgId === "function") {
-      attempts.push(() => service.getMsgsByMsgId(peer, [String(reference.nativeId)]));
-    }
     let query = null;
     if (reference.sequence && typeof service?.queryMsgsWithFilterEx === "function") {
       query = (senderUid = "", msgTime = "0") => service.queryMsgsWithFilterEx(
@@ -5681,21 +5991,62 @@ class QQInstance {
         },
       );
       if (reference.senderUid && reference.msgTime) {
-        attempts.push(() => query(reference.senderUid, reference.msgTime));
+        attempts.push({ run: () => query(reference.senderUid, reference.msgTime), allowSingle: false });
       }
     }
     if (reference.sequence && typeof service?.getMsgsBySeqAndCount === "function") {
-      attempts.push(() => service.getMsgsBySeqAndCount(peer, String(reference.sequence), 1, true, true));
+      attempts.push({
+        run: () => service.getMsgsBySeqAndCount(peer, String(reference.sequence), 1, true, true),
+        allowSingle: false,
+      });
     }
     if (query) {
-      attempts.push(() => query());
-      if (reference.senderUid) attempts.push(() => query(reference.senderUid));
+      if (reference.senderUid) attempts.push({ run: () => query(reference.senderUid), allowSingle: false });
+      attempts.push({ run: () => query(), allowSingle: false });
+    }
+    if (reference.nativeId && typeof service?.getMsgsByMsgId === "function") {
+      attempts.push({
+        run: () => service.getMsgsByMsgId(peer, [String(reference.nativeId)]),
+        allowSingle: true,
+      });
+    }
+    const rootMsgId = String(context.parent?.msgId || "");
+    const replyMsgId = String(reference.replyId || reference.nativeId || reference.recordId || "");
+    if (rootMsgId && replyMsgId && typeof service?.getSourceOfReplyMsgV2 === "function") {
+      attempts.push({
+        run: () => service.getSourceOfReplyMsgV2(peer, rootMsgId, replyMsgId),
+        allowSingle: true,
+      });
+    }
+    if ((reference.clientSequence || reference.sequence) && reference.msgTime && replyMsgId
+      && typeof service?.getSourceOfReplyMsgByClientSeqAndTime === "function") {
+      attempts.push({
+        run: () => service.getSourceOfReplyMsgByClientSeqAndTime(
+          peer, String(reference.clientSequence || reference.sequence), String(reference.msgTime), replyMsgId,
+        ),
+        allowSingle: true,
+      });
+    }
+    if (reference.clientSequence && reference.msgTime
+      && typeof service?.getMsgByClientSeqAndTime === "function") {
+      attempts.push({
+        run: () => service.getMsgByClientSeqAndTime(
+          peer, String(reference.clientSequence), String(reference.msgTime),
+        ),
+        allowSingle: true,
+      });
+    }
+    if (rootMsgId && reference.sequence && typeof service?.getSourceOfReplyMsg === "function") {
+      attempts.push({
+        run: () => service.getSourceOfReplyMsg(peer, rootMsgId, String(reference.sequence)),
+        allowSingle: true,
+      });
     }
     let lastError = null;
     for (const attempt of attempts) {
       try {
-        const raw = this.replyTargetFromResult(await attempt(), reference);
-        if (raw) return raw;
+        const raw = this.replyTargetFromResult(await attempt.run(), context, attempt.allowSingle);
+        if (raw) return this.normalizeReplyTarget(raw, context);
       } catch (error) {
         lastError = error;
       }
@@ -5704,13 +6055,24 @@ class QQInstance {
       logErr(this.botConfig.id, "[消息] 查询引用目标失败:", lastError?.message || lastError);
     }
     return Array.isArray(reference.record?.elements) && reference.record.elements.length
-      ? reference.record
+      ? this.normalizeReplyTarget(reference.record, context)
       : null;
   }
   async cacheReplyTarget(reference, raw) {
     const event = await this.toOneBotEvent(raw);
-    if (!event) return null;
-    const nativeId = reference.nativeId || nativeMessageKey(raw);
+    const nativeId = nativeMessageKey(raw) || reference.nativeId;
+    if (!event) {
+      // 保留原生目标，后续 get_msg 仍可按 NapCat 链路重新转换图片等媒体。
+      const alias = String(reference.messageId);
+      this.oneBotRawMessages.set(alias, raw);
+      if (nativeId) this.oneBotNativeMessageIds.set(alias, String(nativeId));
+      while (this.oneBotRawMessages.size > 500) {
+        const oldest = this.oneBotRawMessages.keys().next().value;
+        this.oneBotRawMessages.delete(oldest);
+        this.oneBotNativeMessageIds.delete(oldest);
+      }
+      return null;
+    }
     this.rememberOneBotMessage(event, nativeId, raw);
     if (String(event.message_id) !== String(reference.messageId)) {
       this.rememberOneBotMessage(
@@ -5730,32 +6092,7 @@ class QQInstance {
       const raw = await this.fetchReplyTarget(context);
       if (raw) {
         await this.cacheReplyTarget(reference, raw);
-        continue;
       }
-      const isGroup = Number(msg.chatType) === 2;
-      const target = {
-        time: 0,
-        self_id: Number(this.getSelfUin()) || this.getSelfUin(),
-        post_type: "message",
-        message_type: isGroup ? "group" : "private",
-        sub_type: isGroup ? "normal" : "friend",
-        message_id: reference.messageId,
-        message_seq: reference.messageId,
-        real_id: reference.messageId,
-        real_seq: reference.sequence,
-        user_id: Number(reference.senderUin) || reference.senderUin || 0,
-        message: [],
-        raw_message: "",
-        message_format: "array",
-        font: 14,
-        sender: {
-          user_id: Number(reference.senderUin) || reference.senderUin || 0,
-          nickname: reference.senderName,
-          card: reference.senderName,
-        },
-      };
-      if (isGroup) target.group_id = Number(msg.peerUin) || msg.peerUin;
-      this.rememberOneBotMessage(target, reference.nativeId);
     }
   }
   encodeOneBotMediaId(msg, element, mediaType, inner = {}) {
@@ -5830,19 +6167,84 @@ class QQInstance {
     const normalized = String(filePath || "").replace(/\\/g, "/");
     return "file://" + (/^[A-Za-z]:\//.test(normalized) ? "/" : "") + normalized;
   }
-  incomingImageUrl(pic) {
+  async fetchOneBotImageRkeys() {
+    const now = Math.floor(Date.now() / 1000);
+    if (this.oneBotImageRkeys?.expiresAt > now + 30) return this.oneBotImageRkeys;
+    if (this.oneBotImageRkeyPromise) return this.oneBotImageRkeyPromise;
+    this.oneBotImageRkeyPromise = (async () => {
+      const common = Buffer.concat([protoVarintField(1, 1), protoVarintField(2, 202)]);
+      const scene = Buffer.concat([
+        protoVarintField(101, 2), protoVarintField(102, 1), protoVarintField(200, 0),
+      ]);
+      const client = protoVarintField(1, 2);
+      const requestHead = Buffer.concat([
+        protoBytesField(1, common), protoBytesField(2, scene), protoBytesField(3, client),
+      ]);
+      const keys = Buffer.concat([10, 20, 2].map((value) => protoVarintField(1, value)));
+      const request = Buffer.concat([protoBytesField(1, requestHead), protoBytesField(4, keys)]);
+      const packet = Buffer.concat([
+        protoVarintField(1, 0x9067), protoVarintField(2, 202),
+        protoBytesField(4, request), protoVarintField(12, 1),
+      ]);
+      const response = await this.sendNativePacket({
+        cmd: "OidbSvcTrpcTcp.0x9067_202",
+        data_base64: packet.toString("base64"),
+        rsp: true,
+      });
+      const encoded = response?.encoding === "base64" ? String(response.data || "") : "";
+      if (!encoded) throw new Error("动态 rkey 响应为空");
+      const root = decodeProtoFields(Buffer.from(encoded, "base64"));
+      const errorCode = protoFirstInteger(root, 3, 0);
+      if (errorCode) throw new Error("动态 rkey 请求失败: " + errorCode);
+      const body = decodeProtoFields(protoFirstBytes(root, 4));
+      const list = decodeProtoFields(protoFirstBytes(body, 4));
+      const values = {};
+      const expirations = [];
+      for (const entry of list.get(1) || []) {
+        if (entry.wire !== 2) continue;
+        const fields = decodeProtoFields(entry.value);
+        const type = protoFirstInteger(fields, 5, 0);
+        const rawRkey = protoFirstBytes(fields, 1).toString("utf8");
+        const rkey = rawRkey.replace(/^&?rkey=/, "");
+        const ttl = protoFirstInteger(fields, 2, 0);
+        const createdAt = protoFirstInteger(fields, 4, now) || now;
+        if (type === 10) values.private = rkey;
+        if (type === 20) values.group = rkey;
+        if (rkey && ttl) expirations.push(createdAt + ttl);
+      }
+      if (!values.private && !values.group) throw new Error("动态 rkey 响应缺少图片凭据");
+      const expiresAt = expirations.length
+        ? Math.max(now + 30, Math.min(...expirations))
+        : now + 60;
+      this.oneBotImageRkeys = { ...values, expiresAt };
+      return this.oneBotImageRkeys;
+    })().finally(() => {
+      this.oneBotImageRkeyPromise = null;
+    });
+    return this.oneBotImageRkeyPromise;
+  }
+  async incomingImageUrl(pic) {
     const originUrl = String(pic?.originImageUrl || pic?.url || "");
     const md5 = String(pic?.md5HexStr || pic?.fileMd5 || "").trim();
     if (originUrl) {
       const parsed = new URL(originUrl, "https://gchat.qpic.cn");
       const appid = String(parsed.searchParams.get("appid") || "");
       const fileid = String(parsed.searchParams.get("fileid") || "");
-      if (["1406", "1407"].includes(appid) && fileid && !parsed.searchParams.get("rkey")) {
-        const download = new URL("/download", "https://gchat.qpic.cn");
+      if (["1406", "1407"].includes(appid) && fileid) {
+        let rkey = FALLBACK_IMAGE_RKEYS[appid];
+        let online = false;
+        try {
+          const values = await this.fetchOneBotImageRkeys();
+          const current = appid === "1406" ? values.private : values.group;
+          if (current) { rkey = current; online = true; }
+        } catch (error) {
+          logErr(this.botConfig.id, "[消息] 获取动态图片 rkey 失败，使用 NapCat fallback:", error?.message || error);
+        }
+        const download = new URL("/download", online ? "https://multimedia.nt.qq.com.cn" : "https://gchat.qpic.cn");
         download.searchParams.set("appid", appid);
         download.searchParams.set("fileid", fileid);
-        download.searchParams.set("rkey", FALLBACK_IMAGE_RKEYS[appid]);
-        download.searchParams.set("spec", "0");
+        download.searchParams.set("rkey", rkey);
+        if (!online) download.searchParams.set("spec", "0");
         return download.toString();
       }
       if (!/^https?:\/\//i.test(originUrl) && ["1406", "1407"].includes(appid)) {
@@ -5967,13 +6369,13 @@ class QQInstance {
       const pic = element.picElement;
       const file = String(pic.fileName || pic.filePath || pic.sourcePath || pic.fileUuid || "");
       const mediaId = this.encodeOneBotMediaId(msg, element, "image", pic);
-      let url = this.incomingImageUrl(pic);
+      let url = await this.incomingImageUrl(pic);
       if (!url && pic.sourcePath && fs.existsSync(String(pic.sourcePath))) {
         url = this.localFileUrl(pic.sourcePath);
       }
       let localPath = "";
       let localUrl = "";
-      if (options.materializeImages) {
+      if (options.materializeImages && !url) {
         try {
           localPath = await this.downloadIncomingImage(msg, element);
           if (localPath) {
@@ -5987,11 +6389,10 @@ class QQInstance {
       }
       const data = {
         summary: pic.summary === undefined ? undefined : String(pic.summary),
-        file: localUrl || file,
-        file_id: mediaId || undefined,
+        file,
         sub_type: pic.picSubType === undefined ? undefined : Number(pic.picSubType),
         url,
-        file_size: String(pic.fileSize || ""),
+        file_size: pic.fileSize ?? "",
       };
       this.rememberOneBotFile(pic, {
         ...data,
@@ -6010,12 +6411,13 @@ class QQInstance {
       const mediaId = this.encodeOneBotMediaId(msg, element, "file", file);
       const data = {
         file: String(file.fileName || ""),
-        file_id: mediaId || String(file.fileUuid || element.elementId || file.fileName || ""),
-        file_size: String(file.fileSize || ""),
+        file_id: String(file.fileUuid || element.elementId || file.fileName || ""),
+        file_size: file.fileSize ?? "",
         url: file.url ? String(file.url) : undefined,
       };
       this.rememberOneBotFile(file, {
         ...data,
+        media_id: mediaId,
         name: String(file.fileName || ""),
         path: String(file.filePath || ""),
         element_id: String(element.elementId || ""),
@@ -6047,7 +6449,7 @@ class QQInstance {
         file: fileCode,
         path: String(ptt.filePath || ""),
         url: ptt.url || ptt.filePath ? String(ptt.url || ptt.filePath) : undefined,
-        file_size: String(ptt.fileSize || ""),
+        file_size: ptt.fileSize ?? "",
       };
       this.rememberOneBotFile(ptt, {
         ...data,
@@ -6069,7 +6471,7 @@ class QQInstance {
       const data = {
         file: fileCode,
         url: remoteUrl || video.url || video.filePath ? String(remoteUrl || video.url || video.filePath) : undefined,
-        file_size: String(video.fileSize || ""),
+        file_size: video.fileSize ?? "",
       };
       this.rememberOneBotFile(video, {
         ...data,
