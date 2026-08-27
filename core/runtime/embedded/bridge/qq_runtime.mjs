@@ -30,6 +30,7 @@ import {
   parseGroupInviteArk,
 } from './onebot_notice.mjs';
 import { PacketRuntime } from './packet_runtime.mjs';
+import { DEFAULT_VIDEO_THUMB, MediaRuntime } from './media_runtime.mjs';
 import { EmbeddedManagerChannel } from './manager_channel.mjs';
 import { findQQPath, getDataPaths, getQQInfo, loadWrapper } from './qq_platform.mjs';
 import {
@@ -47,6 +48,7 @@ import {
   oneBotGroupMember,
   normalizeNativeMemberListCallback,
 } from './onebot_data.mjs';
+
 import {
   ONEBOT_ACTIONS,
   OneBotActionError,
@@ -55,6 +57,15 @@ import {
   normalizeOneBotAction,
   requireNativeMethod
 } from './onebot_action_contract.mjs';
+
+const FALLBACK_IMAGE_RKEYS = Object.freeze({
+  1406: "CAQSKAB6JWENi5LM_xp9vumLbuThJSaYf-yzMrbZsuq7Uz2qEc3Rbib9LP4",
+  1407: "CAQSKAB6JWENi5LM_xp9vumLbuThJSaYf-yzMrbZsuq7Uz2qffcqm614gds",
+});
+const VIDEO_FORMAT_BY_EXTENSION = Object.freeze({
+  afs: 7, avi: 1, mkv: 4, mod: 9, mov: 8, mp4: 2, mts: 11,
+  rm: 6, rmvb: 5, ts: 10, wmv: 3,
+});
 
 const botUinMap = /* @__PURE__ */ new Map();
 function botTag(botId) {
@@ -149,6 +160,7 @@ class QQInstance {
   oneBotMessages = /* @__PURE__ */ new Map();
   oneBotNativeMessageIds = /* @__PURE__ */ new Map();
   oneBotRawMessages = /* @__PURE__ */ new Map();
+  oneBotReplyTargets = /* @__PURE__ */ new Map();
   oneBotForwardMessages = /* @__PURE__ */ new Map();
   oneBotNoticeKeys = /* @__PURE__ */ new Map();
   oneBotGroupCards = /* @__PURE__ */ new Map();
@@ -171,11 +183,15 @@ class QQInstance {
   redPackets = /* @__PURE__ */ new Map();
   redPacketCleanupAt = 0;
   runtime;
+  mediaRuntime;
   constructor(botConfig, qqInfo, wrapper, _baseDataDir) {
     this.botConfig = botConfig;
     this.qqInfo = qqInfo;
     this.wrapper = wrapper;
     this.runtime = { botId: botConfig.id, status: "offline" };
+    this.mediaRuntime = new MediaRuntime({
+      logger: (message) => logErr(botConfig.id, "[媒体]", message),
+    });
     if (botConfig.uin) botUinMap.set(botConfig.id, botConfig.uin);
   }
   setStatusCallback(cb) {
@@ -450,6 +466,7 @@ class QQInstance {
       this.oneBotGroupInviteArks.clear();
       this.oneBotGroupInviteRequests.clear();
       this.oneBotGroupMemberSnapshots.clear();
+      this.oneBotReplyTargets.clear();
       this.oneBotUidToUin.clear();
       this.oneBotUinPending.clear();
       this.oneBotGroupUinPending.clear();
@@ -580,6 +597,7 @@ class QQInstance {
         this.oneBotMessages.clear();
         this.oneBotNativeMessageIds.clear();
         this.oneBotRawMessages.clear();
+        this.oneBotReplyTargets.clear();
         this.oneBotForwardMessages.clear();
         this.oneBotFiles.clear();
         this.cleanOneBotStreams();
@@ -719,7 +737,7 @@ class QQInstance {
       case "get_file":
       case "get_image":
       case "get_record":
-        return this.getLocalOneBotFile(params);
+        return this.getLocalOneBotFile(params, action);
       case "download_file":
         return this.downloadOneBotFile(params);
       case "download_file_stream":
@@ -869,8 +887,39 @@ class QQInstance {
     if (!event && !raw) throw new OneBotActionError(`消息不存在或已过期: ${key}`, 1404, "get_msg");
     return { key: cacheKey, event, raw, nativeId: this.oneBotNativeMessageIds.get(cacheKey) || raw?.msgId || key };
   }
-  getOneBotMessage(messageId) {
-    return this.getCachedMessage(messageId).event;
+  async getOneBotMessage(messageId) {
+    const requestedId = String(messageId || "");
+    let cached = null;
+    try {
+      cached = this.getCachedMessage(requestedId);
+    } catch (error) {
+      if (!this.oneBotReplyTargets.has(requestedId)) throw error;
+    }
+    if (cached?.raw) {
+      return this.hydrateOneBotMessage(requestedId, cached.raw, cached.nativeId);
+    }
+    const context = this.oneBotReplyTargets.get(requestedId)
+      || (cached ? this.oneBotReplyTargets.get(cached.key) : null);
+    if (context) {
+      const raw = await this.fetchReplyTarget(context);
+      if (raw) return this.hydrateOneBotMessage(requestedId, raw, context.reference.nativeId);
+    }
+    if (cached?.event && Array.isArray(cached.event.message) && cached.event.message.length) {
+      return cached.event;
+    }
+    throw new OneBotActionError(`消息不存在或已过期: ${requestedId}`, 1404, "get_msg");
+  }
+  async hydrateOneBotMessage(messageId, raw, nativeId = "") {
+    const event = await this.toOneBotEvent(raw, { materializeImages: true });
+    if (!event) throw new OneBotActionError(`消息为空: ${messageId}`, 1404, "get_msg");
+    const canonicalId = String(event.message_id);
+    const resolvedNativeId = String(nativeId || nativeMessageKey(raw));
+    this.rememberOneBotMessage(event, resolvedNativeId, raw);
+    if (canonicalId === String(messageId)) return event;
+    const aliasId = Number(messageId) || String(messageId);
+    const aliased = { ...event, message_id: aliasId, message_seq: aliasId, real_id: aliasId };
+    this.rememberOneBotMessage(aliased, resolvedNativeId, raw);
+    return aliased;
   }
   peerFor(type, target) {
     return { chatType: type === "group" ? 2 : 1, peerUid: String(target), guildId: "" };
@@ -2127,27 +2176,66 @@ class QQInstance {
     }
     throw new OneBotActionError("当前 QQ 版本无法直接生成该文件下载地址", 1405, action);
   }
-  async getLocalOneBotFile(params) {
+  async getLocalOneBotFile(params, action = "get_file") {
     const key = String(params.file || params.file_id || "");
-    const cached = this.oneBotFiles.get(key);
-    const candidate = String(cached?.path || cached?.url || key);
-    if (!candidate) throw new OneBotActionError("缺少文件标识", 1400, "get_file");
-    if (/^https?:\/\//i.test(candidate)) return { file: "", url: candidate, file_name: path.basename(new URL(candidate).pathname) };
-    const materialized = await this.materializeFile(candidate, path.extname(candidate));
-    const stat = fs.statSync(materialized.path);
+    if (!key) throw new OneBotActionError("缺少文件标识", 1400, action);
+    let cached = this.oneBotFiles.get(key);
+    if (!cached) {
+      cached = this.decodeOneBotMediaId(key);
+      if (cached) this.oneBotFiles.set(key, cached);
+    }
+    if (cached?.msg_id && cached?.element_id && cached?.peer_uid) {
+      try {
+        const downloaded = await this.downloadOneBotMediaContext(cached, action);
+        if (downloaded) cached.path = downloaded;
+      } catch (error) {
+        if (!cached.url) throw error;
+        logErr(this.botConfig.id, `[${action}] QQNT 媒体下载失败，改用已有 URL:`, error?.message || error);
+      }
+    }
+    let candidate = String(cached?.path || cached?.url || (cached ? "" : key));
+    if (!candidate) throw new OneBotActionError("找不到消息媒体或文件已失效", 1404, action);
+    const outFormat = action === "get_record" ? String(params.out_format || "").trim().toLowerCase() : "";
+    if (/^https?:\/\//i.test(candidate) && !outFormat) {
+      return {
+        file: "",
+        url: candidate,
+        file_size: String(cached?.size || ""),
+        file_name: String(cached?.name || path.basename(new URL(candidate).pathname)),
+      };
+    }
+    const materialized = await this.materializeFile(candidate, path.extname(String(cached?.name || candidate)));
+    if (materialized.temporary) this.oneBotStreamFiles.add(materialized.path);
+    let filePath = materialized.path;
+    let forceBase64 = false;
+    if (outFormat) {
+      const supported = new Set(["mp3", "amr", "wma", "m4a", "spx", "ogg", "wav", "flac"]);
+      if (!supported.has(outFormat)) {
+        throw new OneBotActionError("转换失败: out_format 仅支持 mp3/amr/wma/m4a/spx/ogg/wav/flac", 1400, action);
+      }
+      const outputPath = `${filePath}.${outFormat}`;
+      if (!fs.existsSync(outputPath) || !fs.statSync(outputPath).size) {
+        await this.mediaRuntime.convertAudio(filePath, outputPath, outFormat);
+      }
+      filePath = outputPath;
+      this.oneBotStreamFiles.add(filePath);
+      forceBase64 = true;
+    }
+    const stat = fs.statSync(filePath);
     return {
-      file: materialized.path,
-      url: materialized.path,
+      file: filePath,
+      url: String(outFormat ? filePath : cached?.url || filePath),
       file_size: String(stat.size),
-      file_name: path.basename(materialized.path),
-      base64: this.asBoolean(params.base64) ? fs.readFileSync(materialized.path).toString("base64") : undefined,
+      file_name: String(cached?.name || path.basename(filePath)),
+      base64: forceBase64 || this.asBoolean(params.base64) ? fs.readFileSync(filePath).toString("base64") : undefined,
     };
   }
   async downloadOneBotFile(params) {
-    const source = params.base64
+    let source = params.base64
       ? "base64://" + String(params.base64)
       : String(params.url || params.file || params.file_id || "");
     if (!source) throw new OneBotActionError("下载文件缺少 url 或 base64", 1400, "download_file");
+    if (!params.base64) source = await this.resolveOneBotMediaInput(source, "download_file");
     const materialized = await this.materializeFile(
       source,
       path.extname(String(params.name || source)),
@@ -2165,8 +2253,7 @@ class QQInstance {
   }
   async resolveOneBotStreamFile(params, action) {
     const key = String(params.file || params.file_id || params.url || "");
-    const cached = this.oneBotFiles.get(key);
-    const candidate = String(cached?.path || cached?.url || key);
+    const candidate = await this.resolveOneBotMediaInput(key, action);
     if (!candidate) throw new OneBotActionError("文件流缺少 file 或 file_id", 1400, action);
     const materialized = await this.materializeFile(candidate, path.extname(candidate));
     if (materialized.temporary) this.oneBotStreamFiles.add(materialized.path);
@@ -3115,13 +3202,18 @@ class QQInstance {
         } else if (segmentType === "face") {
           const faceIndex = Number(data.id);
           if (!Number.isInteger(faceIndex) || faceIndex < 0) throw new Error(`无效的表情 ID: ${data.id}`);
+          const rawFace = data.raw && typeof data.raw === "object" ? data.raw : {};
           elements.push({
             elementType: 6,
             elementId: "",
             faceElement: {
               faceIndex,
-              faceType: faceIndex >= 222 ? 2 : 1,
-              sourceType: 1,
+              faceType: Number(data.face_type ?? rawFace.faceType ?? (faceIndex >= 222 ? 2 : 1)),
+              faceText: String(data.face_text ?? rawFace.faceText ?? ""),
+              stickerId: String(data.sticker_id ?? rawFace.stickerId ?? ""),
+              stickerType: Number(data.sticker_type ?? rawFace.stickerType ?? 0),
+              packId: String(data.pack_id ?? rawFace.packId ?? ""),
+              sourceType: Number(data.source_type ?? rawFace.sourceType ?? 1),
               resultId: data.resultId === undefined ? undefined : String(data.resultId),
               chainCount: data.chainCount === undefined ? undefined : Number(data.chainCount),
             },
@@ -3153,15 +3245,18 @@ class QQInstance {
             },
           });
         } else if (segmentType === "image") {
-          const file = String(data.file || data.url || "");
+          const mediaId = String(data.file_id || "");
+          const file = String(mediaId.startsWith("elaina-media:") ? mediaId : data.file || data.url || "");
           if (!file) throw new Error("图片消息缺少 file/url");
           const prepared = await this.imageElement(file, String(data.summary || ""), Number(data.sub_type || 0));
           elements.push(prepared.element);
           if (prepared.temporary) temporaryFiles.push(prepared.path);
+          temporaryFiles.push(...Array.from(prepared.cleanupPaths || []));
         } else if (["file", "record", "video", "onlinefile"].includes(segmentType)) {
           const prepared = await this.fileLikeElement(segmentType, data);
           elements.push(prepared.element);
           if (prepared.temporary) temporaryFiles.push(prepared.path);
+          temporaryFiles.push(...Array.from(prepared.cleanupPaths || []));
         } else if (segmentType === "json") {
           const content = typeof data.data === "string" ? data.data : JSON.stringify(data.data ?? data);
           elements.push(this.arkElement(content));
@@ -3252,7 +3347,7 @@ class QQInstance {
       if (!emitted) this.oneBotEventCallback?.(event);
       return { message_id: messageId };
     } finally {
-      for (const file of temporaryFiles) {
+      for (const file of new Set(temporaryFiles)) {
         try {
           fs.unlinkSync(file);
         } catch {
@@ -3579,90 +3674,260 @@ class QQInstance {
       throw error;
     }
   }
-  async imageElement(input, summary = "", subType = 0) {
-    const materialized = await this.materializeFile(input, ".png");
-    const stat = fs.statSync(materialized.path);
-    return {
-      ...materialized,
-      element: {
-        elementType: 2,
-        elementId: "",
-        picElement: {
-          fileSize: String(stat.size),
-          picWidth: 0,
-          picHeight: 0,
-          fileName: path.basename(materialized.path),
-          sourcePath: materialized.path,
-          original: true,
-          picType: 1e3,
-          picSubType: subType,
-          fileUuid: "",
-          fileSubId: "",
-          thumbFileSize: 0,
-          summary,
-          thumbPath: /* @__PURE__ */ new Map()
-        }
+  async resolveOneBotMediaInput(input, action = "send_msg") {
+    const key = String(input || "");
+    let cached = this.oneBotFiles.get(key);
+    if (!cached) {
+      cached = this.decodeOneBotMediaId(key);
+      if (cached) this.oneBotFiles.set(key, cached);
+    }
+    if (!cached) return key;
+    if (cached.msg_id && cached.element_id && cached.peer_uid) {
+      try {
+        const downloaded = await this.downloadOneBotMediaContext(cached, action);
+        if (downloaded) return downloaded;
+      } catch (error) {
+        if (!cached.url) throw error;
+        logErr(this.botConfig.id, `[${action}] QQNT 媒体下载失败，改用已有 URL:`, error?.message || error);
       }
+    }
+    return String(cached.path || cached.url || key);
+  }
+  async imageElement(input, summary = "", subType = 0) {
+    const resolvedInput = await this.resolveOneBotMediaInput(input, "send_msg");
+    const materialized = await this.materializeFile(resolvedInput, ".png");
+    try {
+      const image = this.inspectImageFile(materialized.path);
+      const originalName = path.basename(materialized.path, path.extname(materialized.path));
+      const fileName = originalName + image.extension;
+      const prepared = await this.prepareRichMediaFile(materialized.path, fileName, 2, subType);
+      return {
+        ...materialized,
+        cleanupPaths: prepared.cleanupPaths,
+        element: {
+          elementType: 2,
+          elementId: "",
+          picElement: {
+            md5HexStr: prepared.md5,
+            fileSize: String(prepared.size),
+            picWidth: image.width,
+            picHeight: image.height,
+            fileName: prepared.fileName,
+            sourcePath: prepared.path,
+            original: true,
+            picType: image.picType,
+            picSubType: subType,
+            fileUuid: "",
+            fileSubId: "",
+            thumbFileSize: 0,
+            summary,
+            thumbPath: /* @__PURE__ */ new Map()
+          }
+        }
+      };
+    } catch (error) {
+      if (materialized.temporary) this.removeTemporaryFile(materialized.path);
+      throw error;
+    }
+  }
+  async prepareRichMediaFile(filePath, fileName, elementType, elementSubType = 0) {
+    const stat = fs.statSync(filePath);
+    if (!stat.size) throw new Error("媒体文件大小为 0");
+    const md5 = await this.hashFile(filePath, "md5");
+    const msgService = this.getMsgService();
+    const getMediaPath = requireNativeMethod(msgService, "getRichMediaFilePathForGuild", "send_msg");
+    const mediaPath = String(await getMediaPath({
+      md5HexStr: md5,
+      fileName,
+      elementType,
+      elementSubType,
+      thumbSize: 0,
+      needCreate: true,
+      downloadType: 1,
+      file_uuid: "",
+    }) || "");
+    if (!mediaPath) throw new Error("QQ 未返回图片富媒体缓存路径");
+    fs.mkdirSync(path.dirname(mediaPath), { recursive: true });
+    const copiedToMediaCache = path.resolve(filePath).toLowerCase() !== path.resolve(mediaPath).toLowerCase();
+    if (copiedToMediaCache) fs.copyFileSync(filePath, mediaPath);
+    return {
+      path: mediaPath,
+      fileName,
+      size: stat.size,
+      md5,
+      cleanupPaths: copiedToMediaCache ? [mediaPath] : [],
     };
   }
+  hashFile(filePath, algorithm = "md5") {
+    return new Promise((resolve, reject) => {
+      const hash = createHash(algorithm);
+      const input = fs.createReadStream(filePath);
+      input.on("data", (chunk) => hash.update(chunk));
+      input.on("end", () => resolve(hash.digest("hex")));
+      input.on("error", reject);
+    });
+  }
+  inspectImageFile(filePath) {
+    const buffer = fs.readFileSync(filePath);
+    const fallback = { width: 1024, height: 1024, extension: ".jpg", picType: 1000 };
+    if (buffer.length >= 24 && buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+      return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20), extension: ".png", picType: 1000 };
+    }
+    if (buffer.length >= 10 && buffer.subarray(0, 3).toString("ascii") === "GIF") {
+      return { width: buffer.readUInt16LE(6), height: buffer.readUInt16LE(8), extension: ".gif", picType: 2000 };
+    }
+    if (buffer.length >= 26 && buffer.subarray(0, 2).toString("ascii") === "BM") {
+      return { width: Math.abs(buffer.readInt32LE(18)), height: Math.abs(buffer.readInt32LE(22)), extension: ".bmp", picType: 1000 };
+    }
+    if (buffer.length >= 30 && buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP") {
+      const kind = buffer.subarray(12, 16).toString("ascii");
+      if (kind === "VP8X") {
+        return {
+          width: 1 + buffer.readUIntLE(24, 3),
+          height: 1 + buffer.readUIntLE(27, 3),
+          extension: ".webp",
+          picType: 1000,
+        };
+      }
+      if (kind === "VP8L" && buffer.length >= 25) {
+        const bits = buffer.readUInt32LE(21);
+        return { width: 1 + (bits & 0x3fff), height: 1 + ((bits >>> 14) & 0x3fff), extension: ".webp", picType: 1000 };
+      }
+      if (kind === "VP8 " && buffer.length >= 30) {
+        return {
+          width: buffer.readUInt16LE(26) & 0x3fff,
+          height: buffer.readUInt16LE(28) & 0x3fff,
+          extension: ".webp",
+          picType: 1000,
+        };
+      }
+    }
+    if (buffer.length >= 4 && buffer[0] === 0xff && buffer[1] === 0xd8) {
+      let offset = 2;
+      while (offset + 9 < buffer.length) {
+        if (buffer[offset] !== 0xff) {
+          offset += 1;
+          continue;
+        }
+        const marker = buffer[offset + 1];
+        if (marker === 0xd8 || marker === 0xd9 || (marker >= 0xd0 && marker <= 0xd7)) {
+          offset += 2;
+          continue;
+        }
+        const length = buffer.readUInt16BE(offset + 2);
+        if (length < 2 || offset + length + 2 > buffer.length) break;
+        if ([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf].includes(marker)) {
+          return { width: buffer.readUInt16BE(offset + 7), height: buffer.readUInt16BE(offset + 5), extension: ".jpg", picType: 1000 };
+        }
+        offset += length + 2;
+      }
+    }
+    return fallback;
+  }
   async fileLikeElement(segmentType, data) {
-    const input = String(data.file || data.url || data.path || "");
+    const mediaId = String(data.file_id || "");
+    const input = String(mediaId.startsWith("elaina-media:") ? mediaId : data.file || data.url || data.path || "");
     if (!input) throw new OneBotActionError(`${segmentType} 消息缺少 file/url`, 1400);
     const extension = segmentType === "record" ? ".silk" : segmentType === "video" ? ".mp4" : path.extname(String(data.name || input));
-    const materialized = await this.materializeFile(input, extension);
-    const stat = fs.statSync(materialized.path);
-    const fileName = String(data.name || data.file_name || path.basename(materialized.path));
-    let element;
-    if (segmentType === "record") {
-      element = {
-        elementType: 4,
-        elementId: "",
-        pttElement: {
-          fileName,
-          filePath: materialized.path,
-          md5HexStr: "",
-          fileSize: String(stat.size),
-          duration: Number(data.duration || 1),
-          formatType: 1,
-          voiceType: 1,
-          voiceChangeType: 0,
-          canConvert2Text: true,
-          waveAmplitudes: [0, 18, 9, 23, 16, 17, 16, 15],
-          fileSubId: "",
-          playState: 1,
-          autoConvertText: 0,
-          storeID: 0,
-          otherBusinessInfo: { aiVoiceType: 0 },
-        },
-      };
-    } else if (segmentType === "video") {
-      element = {
-        elementType: 5,
-        elementId: "",
-        videoElement: {
-          fileName,
-          filePath: materialized.path,
-          fileSize: String(stat.size),
-          fileTime: Number(data.duration || 0),
-          fileWidth: Number(data.width || 0),
-          fileHeight: Number(data.height || 0),
-          thumbPath: new Map(),
-        },
-      };
-    } else {
-      const online = segmentType === "onlinefile";
-      element = {
-        elementType: online ? (this.asBoolean(data.is_dir ?? data.isDir) ? 30 : 23) : 3,
-        elementId: "",
-        fileElement: {
-          fileName,
-          filePath: materialized.path,
-          fileSize: String(stat.size),
-          folderId: String(data.folder_id || data.folder || ""),
-        },
-      };
+    const resolvedInput = await this.resolveOneBotMediaInput(input, "send_msg");
+    const materialized = await this.materializeFile(resolvedInput, extension);
+    const cleanupPaths = [];
+    try {
+      const fileName = String(data.name || data.file_name || path.basename(materialized.path));
+      let element;
+      if (segmentType === "record") {
+        const silkOutput = path.join(
+          os.tmpdir(),
+          `elaina_${process.pid}_${Date.now()}_${Math.random().toString(16).slice(2)}.silk`,
+        );
+        const silk = await this.mediaRuntime.convertToSilk(materialized.path, silkOutput);
+        if (silk.converted) cleanupPaths.push(silk.path);
+        const duration = Number(data.duration || await this.mediaRuntime.duration(materialized.path));
+        const silkName = path.basename(fileName, path.extname(fileName)) + ".silk";
+        const prepared = await this.prepareRichMediaFile(silk.path, silkName, 4, 0);
+        cleanupPaths.push(...prepared.cleanupPaths);
+        element = {
+          elementType: 4,
+          elementId: "",
+          pttElement: {
+            fileName: prepared.fileName,
+            filePath: prepared.path,
+            md5HexStr: prepared.md5,
+            fileSize: String(prepared.size),
+            duration: Math.max(1, duration),
+            formatType: 1,
+            voiceType: 1,
+            voiceChangeType: 0,
+            canConvert2Text: true,
+            waveAmplitudes: [0, 18, 9, 23, 16, 17, 16, 15, 44, 17, 24, 20, 14, 15, 17],
+            fileSubId: "",
+            playState: 1,
+            autoConvertText: 0,
+            storeID: 0,
+            otherBusinessInfo: { aiVoiceType: 0 },
+          },
+        };
+      } else if (segmentType === "video") {
+        const info = await this.mediaRuntime.videoInfo(materialized.path);
+        const videoName = path.extname(fileName) ? fileName : fileName + "." + (info.format || "mp4");
+        const videoExtension = path.extname(videoName).slice(1).toLowerCase() || String(info.format || "mp4").toLowerCase();
+        const prepared = await this.prepareRichMediaFile(materialized.path, videoName, 5, 0);
+        cleanupPaths.push(...prepared.cleanupPaths);
+        let thumbnail = info.thumbnail?.length ? Buffer.from(info.thumbnail) : DEFAULT_VIDEO_THUMB;
+        if (data.thumb) {
+          const thumbInput = await this.resolveOneBotMediaInput(String(data.thumb), "send_msg");
+          const thumbMaterialized = await this.materializeFile(thumbInput, ".jpg");
+          thumbnail = fs.readFileSync(thumbMaterialized.path);
+          if (thumbMaterialized.temporary) cleanupPaths.push(thumbMaterialized.path);
+        }
+        const thumbRoot = prepared.path.includes(`${path.sep}Ori${path.sep}`)
+          ? prepared.path.replace(`${path.sep}Ori${path.sep}`, `${path.sep}Thumb${path.sep}`)
+          : prepared.path;
+        const thumbExtension = thumbnail.length >= 2 && thumbnail[0] === 0xff && thumbnail[1] === 0xd8 ? ".jpg" : ".png";
+        const thumbPath = path.join(path.dirname(thumbRoot), `${prepared.md5}_0${thumbExtension}`);
+        fs.mkdirSync(path.dirname(thumbPath), { recursive: true });
+        fs.writeFileSync(thumbPath, thumbnail);
+        cleanupPaths.push(thumbPath);
+        const thumbMd5 = createHash("md5").update(thumbnail).digest("hex");
+        element = {
+          elementType: 5,
+          elementId: "",
+          videoElement: {
+            fileName: prepared.fileName,
+            filePath: prepared.path,
+            videoMd5: prepared.md5,
+            thumbMd5,
+            fileSize: String(prepared.size),
+            fileTime: Math.max(0, Math.round(Number(data.duration || info.duration))),
+            fileFormat: VIDEO_FORMAT_BY_EXTENSION[videoExtension] || 2,
+            fileWidth: Math.max(1, Number(data.width || info.width)),
+            fileHeight: Math.max(1, Number(data.height || info.height)),
+            thumbWidth: Math.max(1, Number(data.thumb_width || info.width)),
+            thumbHeight: Math.max(1, Number(data.thumb_height || info.height)),
+            thumbSize: thumbnail.length,
+            thumbPath: new Map([[0, thumbPath]]),
+          },
+        };
+      } else {
+        const stat = fs.statSync(materialized.path);
+        const online = segmentType === "onlinefile";
+        element = {
+          elementType: online ? (this.asBoolean(data.is_dir ?? data.isDir) ? 30 : 23) : 3,
+          elementId: "",
+          fileElement: {
+            fileName,
+            filePath: materialized.path,
+            fileSize: String(stat.size),
+            folderId: String(data.folder_id || data.folder || ""),
+          },
+        };
+      }
+      return { ...materialized, cleanupPaths, element };
+    } catch (error) {
+      for (const filePath of new Set(cleanupPaths)) this.removeTemporaryFile(filePath);
+      if (materialized.temporary) this.removeTemporaryFile(materialized.path);
+      throw error;
     }
-    return { ...materialized, element };
   }
   inferFileExtension(value, preferred = "") {
     let extension = String(preferred || "").toLowerCase();
@@ -4516,6 +4781,9 @@ class QQInstance {
     listenerImpl.onGroupFileInfoUpdate = (...args) => {
       self.emitNativeEvent("group_file_info", ...args);
     };
+    listenerImpl.onRichMediaDownloadComplete = (...args) => {
+      self.emitNativeEvent("rich_media_download", ...args);
+    };
     listenerImpl.onInputStatusPush = async (data) => {
       try {
         const userId = await self.resolveUin(String(data?.fromUin || ""));
@@ -5360,23 +5628,108 @@ class QQInstance {
       this.oneBotRawMessages.delete(oldest);
     }
   }
+  replyTargetContext(reference, msg) {
+    return {
+      reference,
+      peer: {
+        chatType: Number(msg?.chatType || 0),
+        peerUid: String(msg?.peerUid || msg?.peerUin || ""),
+        guildId: "",
+      },
+    };
+  }
+  rememberReplyTargetContext(context) {
+    const key = String(context.reference.messageId);
+    this.oneBotReplyTargets.set(key, context);
+    while (this.oneBotReplyTargets.size > 1000) {
+      this.oneBotReplyTargets.delete(this.oneBotReplyTargets.keys().next().value);
+    }
+  }
+  replyTargetFromResult(result, reference) {
+    const messages = collectionValues(result?.msgList || result?.data?.msgList || result);
+    if (!messages.length) return null;
+    const nativeId = String(reference.nativeId || "");
+    const sequence = String(reference.sequence || "");
+    const random = String(reference.msgRandom || "");
+    return messages.find((message) => nativeId && String(message?.msgId || message?.messageId || "") === nativeId)
+      || messages.find((message) => random && String(message?.msgRandom || "") === random)
+      || messages.find((message) => sequence && String(message?.msgSeq || message?.clientSeq || "") === sequence)
+      || null;
+  }
+  async fetchReplyTarget(context) {
+    const { reference, peer } = context;
+    const service = this.getMsgService();
+    const attempts = [];
+    if (reference.nativeId && typeof service?.getMsgsByMsgId === "function") {
+      attempts.push(() => service.getMsgsByMsgId(peer, [String(reference.nativeId)]));
+    }
+    let query = null;
+    if (reference.sequence && typeof service?.queryMsgsWithFilterEx === "function") {
+      query = (senderUid = "", msgTime = "0") => service.queryMsgsWithFilterEx(
+        "0",
+        "0",
+        String(reference.sequence),
+        {
+          chatInfo: peer,
+          filterMsgType: [],
+          filterSendersUid: senderUid ? [String(senderUid)] : [],
+          filterMsgToTime: String(msgTime || "0"),
+          filterMsgFromTime: String(msgTime || "0"),
+          isReverseOrder: false,
+          isIncludeCurrent: true,
+          pageLimit: 1,
+        },
+      );
+      if (reference.senderUid && reference.msgTime) {
+        attempts.push(() => query(reference.senderUid, reference.msgTime));
+      }
+    }
+    if (reference.sequence && typeof service?.getMsgsBySeqAndCount === "function") {
+      attempts.push(() => service.getMsgsBySeqAndCount(peer, String(reference.sequence), 1, true, true));
+    }
+    if (query) {
+      attempts.push(() => query());
+      if (reference.senderUid) attempts.push(() => query(reference.senderUid));
+    }
+    let lastError = null;
+    for (const attempt of attempts) {
+      try {
+        const raw = this.replyTargetFromResult(await attempt(), reference);
+        if (raw) return raw;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (lastError) {
+      logErr(this.botConfig.id, "[消息] 查询引用目标失败:", lastError?.message || lastError);
+    }
+    return Array.isArray(reference.record?.elements) && reference.record.elements.length
+      ? reference.record
+      : null;
+  }
+  async cacheReplyTarget(reference, raw) {
+    const event = await this.toOneBotEvent(raw);
+    if (!event) return null;
+    const nativeId = reference.nativeId || nativeMessageKey(raw);
+    this.rememberOneBotMessage(event, nativeId, raw);
+    if (String(event.message_id) !== String(reference.messageId)) {
+      this.rememberOneBotMessage(
+        { ...event, message_id: reference.messageId, message_seq: reference.messageId, real_id: reference.messageId },
+        nativeId,
+        raw,
+      );
+    }
+    return event;
+  }
   async rememberReplyTargets(msg) {
     for (const element of msg.elements || []) {
       const reference = resolveReplyReference(element, msg);
       if (!reference) continue;
-      if (reference.record) {
-        const event = await this.toOneBotEvent(reference.record);
-        if (event) {
-          const nativeId = reference.nativeId || nativeMessageKey(reference.record);
-          this.rememberOneBotMessage(event, nativeId, reference.record);
-          if (String(event.message_id) !== String(reference.messageId)) {
-            this.rememberOneBotMessage(
-              { ...event, message_id: reference.messageId },
-              nativeId,
-              reference.record,
-            );
-          }
-        }
+      const context = this.replyTargetContext(reference, msg);
+      this.rememberReplyTargetContext(context);
+      const raw = await this.fetchReplyTarget(context);
+      if (raw) {
+        await this.cacheReplyTarget(reference, raw);
         continue;
       }
       const isGroup = Number(msg.chatType) === 2;
@@ -5405,6 +5758,43 @@ class QQInstance {
       this.rememberOneBotMessage(target, reference.nativeId);
     }
   }
+  encodeOneBotMediaId(msg, element, mediaType, inner = {}) {
+    const context = {
+      version: 1,
+      chat_type: Number(msg?.chatType || 0),
+      peer_uid: String(msg?.peerUid || msg?.peerUin || ""),
+      msg_id: String(msg?.msgId || msg?.messageId || ""),
+      element_id: String(element?.elementId || inner?.elementId || ""),
+      media_type: String(mediaType || "file"),
+      name: String(inner?.fileName || ""),
+      size: String(inner?.fileSize || ""),
+    };
+    if (!context.msg_id || !context.element_id || !context.peer_uid) {
+      return String(inner?.fileUuid || inner?.fileSubId || inner?.fileName || context.element_id || "");
+    }
+    return "elaina-media:" + Buffer.from(JSON.stringify(context)).toString("base64url");
+  }
+  decodeOneBotMediaId(value) {
+    const token = String(value || "");
+    if (!token.startsWith("elaina-media:")) return null;
+    try {
+      const parsed = JSON.parse(Buffer.from(token.slice("elaina-media:".length), "base64url").toString("utf8"));
+      if (Number(parsed?.version) !== 1 || !parsed?.msg_id || !parsed?.element_id || !parsed?.peer_uid) return null;
+      return {
+        path: "",
+        url: "",
+        name: String(parsed.name || ""),
+        size: String(parsed.size || ""),
+        msg_id: String(parsed.msg_id),
+        chat_type: Number(parsed.chat_type || 0),
+        peer_uid: String(parsed.peer_uid),
+        element_id: String(parsed.element_id),
+        media_type: String(parsed.media_type || "file"),
+      };
+    } catch {
+      return null;
+    }
+  }
   rememberOneBotFile(element, data) {
     const value = {
       path: String(data.path || data.file_path || element?.filePath || element?.sourcePath || ""),
@@ -5412,10 +5802,16 @@ class QQInstance {
       name: String(data.name || data.file_name || element?.fileName || ""),
       size: String(data.file_size || element?.fileSize || ""),
       element_id: String(data.element_id || data.elementId || ""),
+      msg_id: String(data.msg_id || data.msgId || ""),
+      chat_type: Number(data.chat_type || data.chatType || 0),
+      peer_uid: String(data.peer_uid || data.peerUid || ""),
+      media_type: String(data.media_type || data.mediaType || "file"),
     };
     const keys = [
       data.file_id,
       data.file,
+      data.media_id,
+      data.file_code,
       data.element_id,
       data.elementId,
       element?.fileUuid,
@@ -5430,31 +5826,191 @@ class QQInstance {
   async oneBotTextSegment(textElement) {
     return oneBotTextSegment(textElement, (uid) => this.resolveUin(uid));
   }
-  async oneBotElement(element, msg) {
+  localFileUrl(filePath) {
+    const normalized = String(filePath || "").replace(/\\/g, "/");
+    return "file://" + (/^[A-Za-z]:\//.test(normalized) ? "/" : "") + normalized;
+  }
+  incomingImageUrl(pic) {
+    const originUrl = String(pic?.originImageUrl || pic?.url || "");
+    const md5 = String(pic?.md5HexStr || pic?.fileMd5 || "").trim();
+    if (originUrl) {
+      const parsed = new URL(originUrl, "https://gchat.qpic.cn");
+      const appid = String(parsed.searchParams.get("appid") || "");
+      const fileid = String(parsed.searchParams.get("fileid") || "");
+      if (["1406", "1407"].includes(appid) && fileid && !parsed.searchParams.get("rkey")) {
+        const download = new URL("/download", "https://gchat.qpic.cn");
+        download.searchParams.set("appid", appid);
+        download.searchParams.set("fileid", fileid);
+        download.searchParams.set("rkey", FALLBACK_IMAGE_RKEYS[appid]);
+        download.searchParams.set("spec", "0");
+        return download.toString();
+      }
+      if (!/^https?:\/\//i.test(originUrl) && ["1406", "1407"].includes(appid)) {
+        return new URL(originUrl, "https://multimedia.nt.qq.com.cn").toString();
+      }
+      return parsed.toString();
+    }
+    return md5 ? "https://gchat.qpic.cn/gchatpic_new/0/0-0-" + md5.toUpperCase() + "/0" : "";
+  }
+  richMediaFilePath(value) {
+    if (typeof value === "string") return value;
+    if (!value || typeof value !== "object") return "";
+    const direct = String(value.filePath || value.file_path || value.path || "");
+    if (direct) return direct;
+    for (const nested of [value.data, value.result, value.fileTransNotifyInfo, value.commonFileInfo]) {
+      const found = this.richMediaFilePath(nested);
+      if (found) return found;
+    }
+    return "";
+  }
+  incomingMediaInner(element) {
+    return element?.picElement || element?.videoElement || element?.pttElement || element?.fileElement || {};
+  }
+  async downloadIncomingMedia(msg, element, action = "get_file") {
+    const media = this.incomingMediaInner(element);
+    const existing = String(media?.sourcePath || media?.filePath || "");
+    if (existing && fs.existsSync(existing)) return existing;
+    const msgId = String(msg?.msgId || msg?.messageId || "");
+    const elementId = String(element?.elementId || media?.elementId || "");
+    const peerUid = String(msg?.peerUid || msg?.peerUin || "");
+    if (!msgId || !elementId || !peerUid) return "";
+    const method = requireNativeMethod(this.getMsgService(), "downloadRichMedia", action);
+    const matches = (value) => {
+      const filePath = this.richMediaFilePath(value);
+      if (!filePath) return false;
+      const callbackMsgId = String(value?.msgId || value?.messageId || value?.data?.msgId || "");
+      const callbackElementId = String(value?.msgElementId || value?.elementId || value?.data?.msgElementId || "");
+      return (!callbackMsgId || callbackMsgId === msgId)
+        && (!callbackElementId || callbackElementId === elementId);
+    };
+    const waited = await this.waitForNativeEvent(
+      "rich_media_download",
+      () => method({
+        fileModelId: "0",
+        downSourceType: 0,
+        downloadSourceType: 0,
+        triggerType: 1,
+        msgId,
+        chatType: Number(msg?.chatType || 0),
+        peerUid,
+        elementId,
+        thumbSize: 0,
+        downloadType: 1,
+        filePath: String(media?.thumbPath || ""),
+      }),
+      (...args) => args.some(matches),
+      matches,
+      15000,
+    );
+    const filePath = this.richMediaFilePath(waited.direct)
+      || waited.args.map((value) => this.richMediaFilePath(value)).find(Boolean)
+      || "";
+    return filePath && fs.existsSync(filePath) ? filePath : "";
+  }
+  async downloadIncomingImage(msg, element) {
+    return this.downloadIncomingMedia(msg, element, "get_msg");
+  }
+  async downloadOneBotMediaContext(cached, action = "get_file") {
+    const existing = String(cached?.path || "");
+    if (existing && fs.existsSync(existing)) return existing;
+    const mediaType = String(cached?.media_type || "file");
+    const innerKey = mediaType === "image" ? "picElement"
+      : mediaType === "video" ? "videoElement"
+        : mediaType === "record" ? "pttElement" : "fileElement";
+    const inner = {
+      fileName: String(cached?.name || ""),
+      fileSize: String(cached?.size || ""),
+      filePath: existing,
+    };
+    const filePath = await this.downloadIncomingMedia({
+      msgId: String(cached.msg_id),
+      chatType: Number(cached.chat_type || 0),
+      peerUid: String(cached.peer_uid),
+    }, {
+      elementId: String(cached.element_id),
+      [innerKey]: inner,
+    }, action);
+    if (!filePath) throw new OneBotActionError("QQNT 未返回媒体下载路径", 1404, action);
+    cached.path = filePath;
+    return filePath;
+  }
+  async incomingVideoUrl(msg, element) {
+    const service = this.session?.getRichMediaService?.();
+    if (typeof service?.getVideoPlayUrlV2 !== "function") return "";
+    try {
+      const parentIds = Array.from(msg?.parentMsgIdList || []);
+      const useParentId = ["284840486", "1094950020"].includes(String(msg?.peerUin || "")) && parentIds.length;
+      const result = await service.getVideoPlayUrlV2({
+        chatType: Number(msg?.chatType || 0),
+        peerUid: String(msg?.peerUid || msg?.peerUin || ""),
+        guildId: "0",
+      }, String(useParentId ? parentIds[0] : msg?.msgId || msg?.messageId || ""), String(element?.elementId || ""), 0, {
+        downSourceType: 1,
+        triggerType: 1,
+      });
+      const domainUrl = result?.urlResult?.domainUrl;
+      if (typeof domainUrl === "string") return domainUrl;
+      for (const value of collectionValues(domainUrl)) {
+        const url = typeof value === "string" ? value : String(value?.url || "");
+        if (url) return url;
+      }
+    } catch (error) {
+      logErr(this.botConfig.id, "[消息] 获取视频 URL 失败，保留下载标识:", error?.message || error);
+    }
+    return "";
+  }
+  async oneBotElement(element, msg, options = {}) {
     const reference = resolveReplyReference(element, msg);
     if (reference) return { type: "reply", data: { id: String(reference.messageId) } };
     if (element?.textElement) return this.oneBotTextSegment(element.textElement);
     if (element?.picElement) {
       const pic = element.picElement;
       const file = String(pic.fileName || pic.filePath || pic.sourcePath || pic.fileUuid || "");
+      const mediaId = this.encodeOneBotMediaId(msg, element, "image", pic);
+      let url = this.incomingImageUrl(pic);
+      if (!url && pic.sourcePath && fs.existsSync(String(pic.sourcePath))) {
+        url = this.localFileUrl(pic.sourcePath);
+      }
+      let localPath = "";
+      let localUrl = "";
+      if (options.materializeImages) {
+        try {
+          localPath = await this.downloadIncomingImage(msg, element);
+          if (localPath) {
+            pic.sourcePath = localPath;
+            localUrl = this.localFileUrl(localPath);
+            if (!url) url = localUrl;
+          }
+        } catch (error) {
+          logErr(this.botConfig.id, "[消息] 下载引用图片失败，保留远程地址:", error?.message || error);
+        }
+      }
       const data = {
         summary: pic.summary === undefined ? undefined : String(pic.summary),
-        file,
+        file: localUrl || file,
+        file_id: mediaId || undefined,
         sub_type: pic.picSubType === undefined ? undefined : Number(pic.picSubType),
-        url: String(pic.originImageUrl || pic.url || ""),
+        url,
         file_size: String(pic.fileSize || ""),
       };
       this.rememberOneBotFile(pic, {
         ...data,
-        file_id: String(pic.fileUuid || element.elementId || file),
+        file_id: mediaId || String(pic.fileUuid || element.elementId || file),
+        path: localPath || String(pic.sourcePath || pic.filePath || ""),
+        msg_id: String(msg?.msgId || ""),
+        chat_type: Number(msg?.chatType || 0),
+        peer_uid: String(msg?.peerUid || msg?.peerUin || ""),
+        element_id: String(element?.elementId || ""),
+        media_type: "image",
       });
       return { type: "image", data };
     }
     if (element?.fileElement) {
       const file = element.fileElement;
+      const mediaId = this.encodeOneBotMediaId(msg, element, "file", file);
       const data = {
         file: String(file.fileName || ""),
-        file_id: String(file.fileUuid || element.elementId || file.fileName || ""),
+        file_id: mediaId || String(file.fileUuid || element.elementId || file.fileName || ""),
         file_size: String(file.fileSize || ""),
         url: file.url ? String(file.url) : undefined,
       };
@@ -5463,6 +6019,10 @@ class QQInstance {
         name: String(file.fileName || ""),
         path: String(file.filePath || ""),
         element_id: String(element.elementId || ""),
+        msg_id: String(msg?.msgId || ""),
+        chat_type: Number(msg?.chatType || 0),
+        peer_uid: String(msg?.peerUid || msg?.peerUin || ""),
+        media_type: "file",
       });
       if (Number(element.elementType) === 23 || Number(element.elementType) === 30) {
         const isDir = Number(element.elementType) === 30;
@@ -5481,7 +6041,8 @@ class QQInstance {
     }
     if (element?.pttElement) {
       const ptt = element.pttElement;
-      const fileCode = String(ptt.fileName || randomUUID().replace(/-/g, ""));
+      const fileCode = this.encodeOneBotMediaId(msg, element, "record", ptt)
+        || String(ptt.fileName || randomUUID().replace(/-/g, ""));
       const data = {
         file: fileCode,
         path: String(ptt.filePath || ""),
@@ -5491,21 +6052,35 @@ class QQInstance {
       this.rememberOneBotFile(ptt, {
         ...data,
         file_id: fileCode,
+        name: String(ptt.fileName || ""),
+        msg_id: String(msg?.msgId || ""),
+        chat_type: Number(msg?.chatType || 0),
+        peer_uid: String(msg?.peerUid || msg?.peerUin || ""),
+        element_id: String(element?.elementId || ""),
+        media_type: "record",
       });
       return { type: "record", data };
     }
     if (element?.videoElement) {
       const video = element.videoElement;
-      const fileCode = String(video.fileName || randomUUID().replace(/-/g, ""));
+      const fileCode = this.encodeOneBotMediaId(msg, element, "video", video)
+        || String(video.fileName || randomUUID().replace(/-/g, ""));
+      const remoteUrl = await this.incomingVideoUrl(msg, element);
       const data = {
         file: fileCode,
-        url: video.url || video.filePath ? String(video.url || video.filePath) : undefined,
+        url: remoteUrl || video.url || video.filePath ? String(remoteUrl || video.url || video.filePath) : undefined,
         file_size: String(video.fileSize || ""),
       };
       this.rememberOneBotFile(video, {
         ...data,
         file_id: fileCode,
         path: String(video.filePath || ""),
+        name: String(video.fileName || ""),
+        msg_id: String(msg?.msgId || ""),
+        chat_type: Number(msg?.chatType || 0),
+        peer_uid: String(msg?.peerUid || msg?.peerUin || ""),
+        element_id: String(element?.elementId || ""),
+        media_type: "video",
       });
       return { type: "video", data };
     }
@@ -5549,7 +6124,11 @@ class QQInstance {
       return { type: "json", data: { data: content } };
     }
     if (element?.structLongMsgElement) {
-      return null;
+      const struct = element.structLongMsgElement;
+      return {
+        type: "xml",
+        data: { data: String(struct.xmlContent || ""), resid: String(struct.resId || "") },
+      };
     }
     if (element?.markdownElement) {
       const markdown = element.markdownElement;
@@ -5566,7 +6145,19 @@ class QQInstance {
       };
     }
     if (element?.shareLocationElement) {
-      return null;
+      const location = element.shareLocationElement;
+      let ext = {};
+      try { ext = JSON.parse(String(location.ext || "{}")); } catch {
+      }
+      return {
+        type: "location",
+        data: {
+          lat: Number(ext.lat ?? ext.latitude ?? 0),
+          lon: Number(ext.lon ?? ext.lng ?? ext.longitude ?? 0),
+          title: String(ext.title || location.text || ""),
+          content: String(ext.content || ext.address || ""),
+        },
+      };
     }
     if (element?.walletElement) {
       return null;
@@ -5576,9 +6167,9 @@ class QQInstance {
   toOneBotRawMessage(message) {
     return encodeOneBotCqMessage(message);
   }
-  async toOneBotEvent(msg) {
+  async toOneBotEvent(msg, options = {}) {
     const converted = await Promise.allSettled(
-      Array.from(msg.elements || []).map((element) => this.oneBotElement(element, msg))
+      Array.from(msg.elements || []).map((element) => this.oneBotElement(element, msg, options))
     );
     const message = [];
     for (const result of converted) {

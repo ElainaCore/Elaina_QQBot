@@ -67,6 +67,9 @@ export function resolveReplyReference(element, message) {
     sequence: realSequence,
     record,
     senderUin: usableId(record?.senderUin) || usableId(reply?.senderUin),
+    senderUid: usableId(record?.senderUid) || usableId(reply?.senderUidStr),
     senderName: String(record?.sendMemberName || record?.sendNickName || ""),
+    msgTime: usableId(record?.msgTime) || usableId(reply?.replyMsgTime),
+    msgRandom: usableId(record?.msgRandom),
   };
 }
