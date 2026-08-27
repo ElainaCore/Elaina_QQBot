@@ -434,9 +434,16 @@ class EmbeddedQQManager:
     def _command(self, bot: EmbeddedBot, data_dir: Path) -> tuple[list[str], dict[str, str]]:
         configured = cfg.get('settings', 'embedded_qq.command', '')
         if configured and not sys.platform.startswith('linux'):
-            if isinstance(configured, list):
-                return [str(item) for item in configured], {}
-            return shlex.split(str(configured), posix=os.name != 'nt'), {}
+            command = (
+                [str(item) for item in configured]
+                if isinstance(configured, list)
+                else shlex.split(str(configured), posix=os.name != 'nt')
+            )
+            if os.name == 'nt':
+                qq_path = self._command_qq_path(command) or self._find_qq_path() or self._qq_path(bot)
+                launcher = QQLauncher(qq_path, self._bridge_entry())
+                return command, {'QQ_PATH': str(qq_path), 'QQ_VERSION': launcher.validate_windows_version()}
+            return command, {}
         qq_path = self._qq_path(bot)
         launcher = QQLauncher(qq_path, self._bridge_entry())
         if sys.platform.startswith('linux'):
@@ -559,8 +566,11 @@ class EmbeddedQQManager:
             env.update(launch_env)
 
         command_qq = self._command_qq_path(command or [])
+        validated_qq = launch_env.get('QQ_PATH') if launch_env else ''
         configured_qq = cfg.get('settings', 'embedded_qq.qq_path', '') or os.environ.get('QQ_PATH', '')
-        if command_qq:
+        if validated_qq:
+            env['QQ_PATH'] = str(Path(validated_qq).resolve())
+        elif command_qq:
             env['QQ_PATH'] = str(command_qq)
         elif configured_qq:
             env['QQ_PATH'] = str(Path(str(configured_qq)).resolve())

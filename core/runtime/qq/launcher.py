@@ -13,6 +13,10 @@ from pathlib import Path
 
 log = logging.getLogger('ElainaQQ.qq_launcher')
 
+_WINDOWS_APPID_TABLE = (
+    Path(__file__).parents[1] / 'embedded' / 'bridge' / 'qq_windows_appid.json'
+)
+
 
 class QQLauncher:
     """构建隔离的 QQ 进程命令，同时复用同一份 QQ 安装。"""
@@ -22,11 +26,77 @@ class QQLauncher:
         self.bridge_entry = Path(bridge_entry).resolve()
         self.launch_env: dict[str, str] = {}
 
+    @staticmethod
+    def _read_json(path: Path) -> dict:
+        try:
+            value = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise RuntimeError(f'读取 QQ 版本信息失败: {path}: {exc}') from exc
+        if not isinstance(value, dict):
+            raise RuntimeError(f'QQ 版本信息不是 JSON 对象: {path}')
+        return value
+
+    @classmethod
+    def windows_supported_versions(cls) -> frozenset[str]:
+        table = cls._read_json(_WINDOWS_APPID_TABLE)
+        return frozenset(str(version) for version in table)
+
+    def windows_version(self) -> str:
+        """按 NapCat 的目录规则读取 Windows QQNT 的真实版本。"""
+        base = self.executable.parent
+        config_candidates = (
+            base / 'versions' / 'config.json',
+            base / 'resources' / 'app' / 'versions' / 'config.json',
+        )
+        for config_path in config_candidates:
+            if not config_path.is_file():
+                continue
+            config = self._read_json(config_path)
+            version = str(config.get('curVersion') or '').strip()
+            if not version:
+                raise RuntimeError(f'QQ 快更配置缺少 curVersion: {config_path}')
+            return version
+
+        package_candidates = [base / 'resources' / 'app' / 'package.json']
+        versions_dir = base / 'versions'
+        if versions_dir.is_dir():
+            version_dirs = [item for item in versions_dir.iterdir() if item.is_dir()]
+            version_dirs.sort(key=lambda item: item.stat().st_mtime_ns, reverse=True)
+            package_candidates.extend(item / 'resources' / 'app' / 'package.json' for item in version_dirs)
+        legacy_versions_dir = base / 'resources' / 'app' / 'versions'
+        if legacy_versions_dir.is_dir():
+            legacy_dirs = [item for item in legacy_versions_dir.iterdir() if item.is_dir()]
+            legacy_dirs.sort(key=lambda item: item.stat().st_mtime_ns, reverse=True)
+            package_candidates.extend(item / 'package.json' for item in legacy_dirs)
+
+        for package_path in package_candidates:
+            if not package_path.is_file():
+                continue
+            package = self._read_json(package_path)
+            version = str(package.get('version') or '').strip()
+            if version:
+                return version
+        raise RuntimeError(f'无法从 QQ 安装目录读取 Windows QQ 版本: {self.executable}')
+
+    def validate_windows_version(self) -> str:
+        version = self.windows_version()
+        if version not in self.windows_supported_versions():
+            raise RuntimeError(f'Windows QQ {version} 不在 NapCat 兼容版本列表中，已拒绝启动')
+        return version
+
     def app_dir(self) -> Path:
         base = self.executable.parent
         candidates: list[Path] = []
         if sys.platform == 'darwin':
             candidates.append(base.parent / 'Resources' / 'app')
+        if sys.platform == 'win32':
+            version = self.validate_windows_version()
+            candidates.extend(
+                (
+                    base / 'versions' / version / 'resources' / 'app',
+                    base / 'resources' / 'app' / 'versions' / version,
+                )
+            )
 
         versions_dir = base / 'versions'
         if versions_dir.is_dir():
@@ -199,6 +269,8 @@ class QQLauncher:
         if sys.platform.startswith('linux'):
             return self._linux_command(data_dir, quick_login, linux_display)
         if sys.platform == 'win32':
+            version = self.validate_windows_version()
+            self.launch_env = {'QQ_VERSION': version}
             self.install_loader()
             args = [str(self.executable), '--user-data-dir', str(data_dir / 'chromium')]
             if headless:

@@ -3,6 +3,11 @@ import os from 'os';
 import path from 'path';
 
 export const BUILTIN_QQ_VERSION = "3.2.32-52194";
+export const WINDOWS_QQ_APPID_TABLE = Object.fromEntries(
+  Object.entries(JSON.parse(
+    fs.readFileSync(new URL("./qq_windows_appid.json", import.meta.url), "utf8")
+  )).map(([version, info]) => [version, { appid: String(info.appid), qua: String(info.qua) }])
+);
 export const QQ_APPID_TABLE = {
   "3.2.12-28060": { appid: "537246140", qua: "V1_LNX_NQ_3.2.12_28060_GW_B" },
   "3.2.12-28131": { appid: "537246140", qua: "V1_LNX_NQ_3.2.12_28131_GW_B" },
@@ -54,7 +59,8 @@ export const QQ_APPID_TABLE = {
   "3.2.25-45758": { appid: "537340249", qua: "V1_LNX_NQ_3.2.25_45758_GW_B" },
   "3.2.30-50828": { appid: "537358775", qua: "V1_LNX_NQ_3.2.30_50828_GW_B" },
   "3.2.30-50969": { appid: "537376344", qua: "V1_LNX_NQ_3.2.30_50969_GW_B" },
-  "3.2.32-52194": { appid: "537379447", qua: "V1_LNX_NQ_3.2.32_52194_GW_B" }
+  "3.2.32-52194": { appid: "537379447", qua: "V1_LNX_NQ_3.2.32_52194_GW_B" },
+  ...WINDOWS_QQ_APPID_TABLE
 };
 export function findQQPath() {
   if (process.env["QQ_PATH"]) return process.env["QQ_PATH"];
@@ -96,12 +102,17 @@ export function getQQInfo(execPath) {
     versionConfigPath = fs.existsSync(alt) ? alt : void 0;
   }
   if (versionConfigPath && fs.existsSync(versionConfigPath)) {
+    let versionConfig;
     try {
-      const versionConfig = JSON.parse(fs.readFileSync(versionConfigPath, "utf-8"));
-      console.log(`[QQ信息] 使用快更配置: ${versionConfig.curVersion}`);
-      return buildQQInfo(execPath, versionConfig.curVersion);
+      versionConfig = JSON.parse(fs.readFileSync(versionConfigPath, "utf-8"));
     } catch (e) {
       console.log(`[QQ信息] 读取快更配置失败: ${e}`);
+    }
+    if (versionConfig) {
+      const version = String(versionConfig.curVersion || "").trim();
+      if (!version) throw new Error(`QQ 快更配置缺少 curVersion: ${versionConfigPath}`);
+      console.log(`[QQ信息] 使用快更配置: ${version}`);
+      return buildQQInfo(execPath, version);
     }
   }
   let pkgPath;
@@ -113,20 +124,25 @@ export function getQQInfo(execPath) {
     pkgPath = path.join(path.dirname(execPath), "./resources/app/package.json");
   }
   if (fs.existsSync(pkgPath)) {
+    let packageInfo;
     try {
-      const packageInfo = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
-      if (packageInfo.version) {
-        console.log(`[QQ信息] 从 package.json 读取: ${packageInfo.version}`);
-        return buildQQInfo(execPath, packageInfo.version);
-      }
+      packageInfo = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
     } catch (e) {
       console.log(`[QQ信息] 读取 package.json 失败: ${e}`);
+    }
+    if (packageInfo?.version) {
+      const version = String(packageInfo.version).trim();
+      console.log(`[QQ信息] 从 package.json 读取: ${version}`);
+      return buildQQInfo(execPath, version);
     }
   }
   console.log(`[QQ信息] 使用内置版本: ${BUILTIN_QQ_VERSION}`);
   return buildQQInfo(execPath, BUILTIN_QQ_VERSION);
 }
 export function buildQQInfo(execPath, version) {
+  if (os.platform() === "win32" && !WINDOWS_QQ_APPID_TABLE[version]) {
+    throw new Error(`Windows QQ ${version} 不在 NapCat 兼容版本列表中，已拒绝加载`);
+  }
   const buildVersion = version.split("-")[1] || "";
   let appid;
   let qua;
@@ -134,7 +150,7 @@ export function buildQQInfo(execPath, version) {
     appid = QQ_APPID_TABLE[version].appid;
     qua = QQ_APPID_TABLE[version].qua;
   } else {
-    // 未知版本从 QQ native 模块读取 AppID。
+    // 非 Windows 的未知版本从 QQ native 模块读取 AppID。
     appid = readAppidFromMajor(execPath, version);
     const platformAppid = { win32: "537246092", darwin: "537246140", linux: "537246140" };
     appid = appid || platformAppid[os.platform()] || "537246092";
@@ -256,4 +272,3 @@ export function getDataPaths(wrapper) {
   const dataPathGlobal = path.resolve(dataPath, "./nt_qq/global");
   return [dataPath, dataPathGlobal];
 }
-
