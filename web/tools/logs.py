@@ -24,24 +24,62 @@ async def _query_recent(log_type: str, bot_qq: str = '') -> list:
     return rows
 
 
+def _raw_response(row: dict):
+    """Return the original structured payload when one was persisted."""
+    raw_data = row.get('raw_data', '')
+    if raw_data not in ('', None):
+        if isinstance(raw_data, str):
+            with contextlib.suppress(TypeError, ValueError):
+                return json.loads(raw_data)
+        return raw_data
+    return dict(row)
+
+
+def _transform_generic_rows(rows: list) -> list:
+    result = []
+    for row in rows:
+        item = dict(row)
+        item['raw_response'] = _raw_response(item)
+        result.append(item)
+    return result
+
+
 def _transform_message_rows(rows: list, bot_qq: str = '') -> list:
     """将 DB 行转换为前端 Logs.vue 期望的字段格式"""
     result = []
     for r in rows:
         extra = r.get('extra', '')
-        direction = 'send' if extra == 'send' else 'receive'
-        bot_id = r.get('source', '') or bot_qq
+        extra_data = {}
+        if isinstance(extra, str) and extra not in ('', 'send', 'recalled'):
+            with contextlib.suppress(TypeError, ValueError):
+                extra_data = json.loads(extra) or {}
+        direction = 'send' if extra == 'send' or extra_data.get('direction') == 'send' else 'receive'
+        bot_id = str(r.get('source', '') or bot_qq)
+        user_id = str(r.get('user_id', '') or '')
+        group_id = str(r.get('group_id', '') or '')
+        message_type = str(r.get('message_type', '') or ('group' if group_id else 'private'))
+        location = f'群 {group_id}' if group_id else f'QQ {user_id}' if user_id else ''
+        nickname = str(extra_data.get('nickname') or '')
+        sender_qq = user_id or (bot_id if direction == 'send' else '')
         result.append(
             {
                 'timestamp': r.get('timestamp', ''),
                 'content': r.get('content', ''),
-                'user_id': r.get('user_id', ''),
-                'group_id': r.get('group_id', ''),
+                'user_id': user_id,
+                'group_id': group_id,
                 'message_id': r.get('message_id', ''),
-                'message_type': r.get('message_type', ''),
+                'message_type': message_type,
                 'bot_qq': bot_id,
+                'source': bot_id,
                 'direction': direction,
+                'direction_label': '发送' if direction == 'send' else '接收',
+                'nickname': nickname,
+                'sender': nickname or sender_qq,
+                'sender_name': nickname,
+                'sender_qq': sender_qq,
+                'location': location,
                 'raw_message': r.get('raw_data', ''),
+                'raw_response': _raw_response(r),
             }
         )
     return result
@@ -54,19 +92,27 @@ def _transform_lifecycle_rows(rows: list, bot_qq: str = '') -> list:
         event_type = r.get('message_type', '')
         raw_data = r.get('raw_data', '')
         sub_type = ''
+        raw_payload = {}
         if raw_data:
             with contextlib.suppress(TypeError, ValueError):
-                sub_type = str((json.loads(raw_data) or {}).get('sub_type') or '')
+                raw_payload = json.loads(raw_data) or {}
+                sub_type = str(raw_payload.get('sub_type') or '')
+        user_id = str(r.get('user_id', '') or raw_payload.get('user_id') or '')
+        group_id = str(r.get('group_id', '') or raw_payload.get('group_id') or '')
+        event_bot = str(r.get('source', '') or raw_payload.get('self_id') or bot_qq)
         result.append({
             'timestamp': r.get('timestamp', ''),
             'type': event_type,
             'event_type': event_type,
             'type_label': event_label(event_type, sub_type),
-            'user_id': r.get('user_id', ''),
-            'group_id': r.get('group_id', ''),
-            'bot_qq': r.get('source', '') or bot_qq,
+            'user_id': user_id,
+            'group_id': group_id,
+            'bot_qq': event_bot,
+            'source': event_bot,
+            'location': f'群 {group_id}' if group_id else f'QQ {user_id}' if user_id else '',
             'content': r.get('content', ''),
             'raw_message': raw_data,
+            'raw_response': _raw_response(r),
         })
     return result
 
@@ -85,8 +131,8 @@ async def handle_recent_logs(request: web.Request):
     fallback_bot = requested or (bot_ids[0] if len(bot_ids) == 1 else '')
     payload = {
         'message': _transform_message_rows(msg_rows, fallback_bot),
-        'framework': await _query_recent('framework'),
-        'error': await _query_recent('error'),
+        'framework': _transform_generic_rows(await _query_recent('framework')),
+        'error': _transform_generic_rows(await _query_recent('error')),
         'lifecycle': _transform_lifecycle_rows(lc_rows, fallback_bot),
     }
     return web.json_response(payload)
@@ -119,8 +165,12 @@ async def handle_get_logs(request: web.Request):
         )
         total_rows = await _common.query_log(log_type, 'SELECT MAX(id) AS cnt FROM log')
         total = (total_rows[0].get('cnt') or 0) if total_rows else 0
-    if log_type == 'lifecycle':
+    if log_type == 'message':
+        rows = _transform_message_rows(rows, requested)
+    elif log_type == 'lifecycle':
         rows = _transform_lifecycle_rows(rows, requested)
+    else:
+        rows = _transform_generic_rows(rows)
     return web.json_response(
         {
             'logs': rows,

@@ -500,8 +500,13 @@ class OneBotAPI:
             'send_msg', params, self_id=str(self_id) if self_id is not None else None
         )
 
-    async def delete_msg(self, message_id) -> dict | None:
-        return await self.call_api('delete_msg', {'message_id': int(message_id)})
+    async def delete_msg(self, message_id, **kwargs) -> dict | None:
+        self_id = kwargs.pop('self_id', kwargs.pop('_self_id', None))
+        return await self.call_api(
+            'delete_msg',
+            {'message_id': int(message_id), **kwargs},
+            self_id=str(self_id) if self_id is not None else None,
+        )
 
     async def get_msg(self, message_id) -> dict | None:
         return await self.call_api('get_msg', {'message_id': int(message_id)})

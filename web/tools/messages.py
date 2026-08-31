@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import time
 from datetime import datetime
 from typing import Any
@@ -21,6 +22,9 @@ _directory_cache: dict[tuple[str, str], tuple[float, dict[str, dict]]] = {}
 _directory_tasks: dict[tuple[str, str], asyncio.Task] = {}
 _DIRECTORY_TTL = 600
 _INVALID_NAMES = {'[object Map]', '[object Object]', 'undefined', 'null'}
+_MENTION_RE = re.compile(r'@([0-9]{4,12})')
+_group_member_name_cache: dict[tuple[str, str, str], tuple[float, str]] = {}
+_GROUP_MEMBER_NAME_TTL = 600
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -37,6 +41,20 @@ def _display_text(value: Any) -> str:
         return ''
     if isinstance(value, str):
         text = value.strip()
+        bad_positions = [
+            index
+            for index, char in enumerate(text)
+            if ord(char) < 32 or char == '\ufffd'
+        ]
+        bad_positions.extend(
+            index for marker in ('\\u0010', '\\u0011')
+            if (index := text.find(marker)) >= 0
+        )
+        if bad_positions:
+            bad_index = min(bad_positions)
+            boundary = text.rfind('<$', 0, bad_index)
+            text = text[:boundary if boundary >= 0 else bad_index].strip()
+        text = ''.join(char for char in text if ord(char) >= 32 and char != '\x7f').strip()
         return '' if text in _INVALID_NAMES else text
     if isinstance(value, (int, float)):
         return str(value)
@@ -98,6 +116,42 @@ async def handle_get_nicknames_batch(request: web.Request):
     bot_qq = str(body.get('bot_qq') or _primary_id())
     result = await _common.batch_nicknames(uids, bot_qq)
     return web.json_response({'success': True, 'data': {'nicknames': result}})
+
+
+async def _group_member_names(group_id: str, user_ids: set[str], bot_qq: str) -> dict[str, str]:
+    """优先读取群名片或群昵称，并用短期缓存避免重复请求。"""
+    if not group_id or not user_ids:
+        return {}
+    now = time.time()
+    result: dict[str, str] = {}
+    missing: list[str] = []
+    for user_id in user_ids:
+        key = (bot_qq, group_id, user_id)
+        cached = _group_member_name_cache.get(key)
+        if cached and now - cached[0] < _GROUP_MEMBER_NAME_TTL:
+            result[user_id] = cached[1]
+        else:
+            missing.append(user_id)
+
+    async def resolve(user_id: str) -> tuple[str, str]:
+        try:
+            response = await _api().get_group_member_info(
+                group_id,
+                user_id,
+                no_cache=False,
+                self_id=bot_qq or None,
+            )
+            data = _as_dict(_onebot_data(response, {}))
+            name = _display_text(data.get('card')) or _display_text(data.get('nickname'))
+            return user_id, name
+        except Exception:
+            return user_id, ''
+
+    for user_id, name in await asyncio.gather(*(resolve(value) for value in missing)):
+        if name:
+            result[user_id] = name
+            _group_member_name_cache[(bot_qq, group_id, user_id)] = (now, name)
+    return result
 
 
 # ──────────── 聊天列表 ────────────
@@ -183,7 +237,11 @@ async def _fetch_directory(api, chat_type: str, bot_qq: str) -> dict[str, dict]:
         for item in _onebot_data(response, []) or []:
             if not isinstance(item, dict):
                 continue
-            key = str(item.get('user_id') if chat_type == 'user' else item.get('group_id') or '')
+            if chat_type == 'user':
+                key_value = item.get('user_id') or item.get('userId') or item.get('uin')
+            else:
+                key_value = item.get('group_id') or item.get('groupId') or item.get('peerUin') or item.get('id')
+            key = str(key_value or '')
             if key:
                 result[key] = item
         return result
@@ -264,6 +322,11 @@ async def _db_chat_stats(chat_type: str, bot_qq: str) -> dict[str, dict]:
             raw = json.loads(row.get('raw_data') or '{}')
         if _is_channel_payload(raw):
             continue
+        if chat_type == 'group':
+            row = dict(row)
+            row['group_name'] = _display_text(
+                raw.get('group_name') or raw.get('groupName') or raw.get('peerName')
+            )
         result[chat_id] = row
     return result
 
@@ -276,12 +339,16 @@ def _directory_chats(chat_type: str, directory: dict[str, dict], stats: dict[str
         item = directory.get(chat_id, {})
         stat = stats.get(chat_id, {})
         remark = _display_text(item.get('remark')) if chat_type == 'user' else _remark_name(remarks.get(chat_id))
-        name = remark or _display_text(item.get('nickname')) or _display_text(item.get('group_name')) or chat_id
+        group_name = _display_text(
+            item.get('group_name') or item.get('groupName') or item.get('name')
+        ) or _display_text(stat.get('group_name'))
+        name = remark or _display_text(item.get('nickname')) or group_name or chat_id
         chats.append(
             {
                 'chat_id': chat_id,
                 'bot_qq': bot_qq,
                 'nickname': str(name),
+                'group_name': group_name if chat_type == 'group' else '',
                 'remark': str(remark or ''),
                 'group_qq': _remark_qq(remarks.get(chat_id)) if chat_type == 'group' else '',
                 'last_id': str(stat.get('last_id') or ''),
@@ -315,6 +382,34 @@ async def _fetch_chats(chat_type, bot_qq=''):
         item['chat_id']: item
         for item in _directory_chats(chat_type, directory, stats, bot_qq)
     }
+
+    async def resolve_missing_group_names() -> None:
+        if chat_type != 'group' or not _onebot_ok(recent_response):
+            return
+        missing = [
+            chat_id
+            for chat_id, item in chats_by_id.items()
+            if str(chat_id).isdigit() and not _display_text(item.get('group_name'))
+        ][:50]
+        if not missing:
+            return
+
+        async def resolve(chat_id: str):
+            try:
+                response = await api.get_group_info(chat_id, self_id=bot_qq)
+                data = _as_dict(_onebot_data(response, {}))
+                name = _display_text(data.get('group_name') or data.get('groupName') or data.get('name'))
+                return chat_id, name
+            except Exception:
+                return chat_id, ''
+
+        for chat_id, name in await asyncio.gather(*(resolve(value) for value in missing)):
+            if name:
+                chats_by_id[chat_id]['group_name'] = name
+                if chats_by_id[chat_id].get('nickname') == chat_id:
+                    chats_by_id[chat_id]['nickname'] = name
+
+    await resolve_missing_group_names()
     if not _onebot_ok(recent_response):
         chats = list(chats_by_id.values())
         chats.sort(key=lambda item: (item['last_time'], item['nickname']), reverse=True)
@@ -339,7 +434,12 @@ async def _fetch_chats(chat_type, bot_qq=''):
         directory_item = directory.get(chat_id, {})
         if chat_type == 'group':
             remark = _remark_name(remarks.get(chat_id))
-            name = remark or _display_text(contact.get('peerName')) or _display_text(directory_item.get('group_name')) or chat_id
+            group_name = (
+                _display_text(contact.get('peerName') or contact.get('groupName'))
+                or _display_text(directory_item.get('group_name') or directory_item.get('groupName'))
+                or _display_text(stats.get(chat_id, {}).get('group_name'))
+            )
+            name = remark or group_name or chat_id
         else:
             remark = _display_text(contact.get('remark')) or _display_text(directory_item.get('remark'))
             name = (
@@ -353,6 +453,7 @@ async def _fetch_chats(chat_type, bot_qq=''):
             'chat_id': chat_id,
             'bot_qq': bot_qq,
             'nickname': str(name),
+            'group_name': group_name if chat_type == 'group' else '',
             'remark': str(remark),
             'group_qq': _remark_qq(remarks.get(chat_id)) if chat_type == 'group' else '',
             'last_id': str(contact.get('msgId') or latest.get('message_id') or ''),
@@ -522,6 +623,7 @@ async def _query_db_history(chat_type: str, chat_id: str, bot_qq: str, count: in
 
     missing_names = set()
     prepared = []
+    mention_ids: set[str] = set()
     for row in rows:
         raw: dict[str, Any] = {}
         with contextlib.suppress(TypeError, ValueError):
@@ -530,17 +632,50 @@ async def _query_db_history(chat_type: str, chat_id: str, bot_qq: str, count: in
         extra = str(row.get('extra') or '')
         is_self = extra == 'send' or str(raw.get('user_id') or sender.get('user_id') or '') == bot_qq
         nickname = _display_text(sender.get('card')) or _display_text(sender.get('nickname'))
-        user_id = str(row.get('user_id') or '')
+        user_id = str(row.get('user_id') or raw.get('user_id') or sender.get('user_id') or '')
         if user_id and not is_self and not nickname:
             missing_names.add(user_id)
+        for segment in _as_list(raw.get('message')):
+            if not isinstance(segment, dict) or str(segment.get('type') or '') != 'at':
+                continue
+            data = _as_dict(segment.get('data'))
+            target = str(data.get('qq') or data.get('user_id') or data.get('target') or '')
+            if target.isdigit():
+                mention_ids.add(target)
+        mention_ids.update(_MENTION_RE.findall(str(row.get('content') or '')))
         prepared.append((row, raw, sender, extra, is_self, nickname, user_id))
 
-    nicknames = await _common.batch_nicknames(missing_names, bot_qq) if missing_names else {}
+    member_names = (
+        await _group_member_names(chat_id, mention_ids, bot_qq)
+        if chat_type == 'group' and mention_ids
+        else {}
+    )
+    nickname_ids = missing_names | (mention_ids - member_names.keys())
+    nicknames = await _common.batch_nicknames(nickname_ids, bot_qq) if nickname_ids else {}
+    nicknames.update(member_names)
     messages = []
     for row, raw, sender, extra, is_self, nickname, user_id in prepared:
         segments = _as_list(raw.get('message'))
         reply = next((item for item in segments if isinstance(item, dict) and item.get('type') == 'reply'), None)
         message_id = str(row.get('message_id') or '')
+        display_segments = []
+        mention_names = {}
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            if str(segment.get('type') or '') != 'at':
+                display_segments.append(segment)
+                continue
+            data = _as_dict(segment.get('data'))
+            target = str(data.get('qq') or data.get('user_id') or data.get('target') or '')
+            if target == 'all':
+                display_segments.append({**segment, 'data': {**data, 'name': '全体成员'}})
+                mention_names[target] = '全体成员'
+                continue
+            name = _display_text(data.get('name')) or nicknames.get(target, target)
+            if target:
+                mention_names[target] = name
+            display_segments.append({**segment, 'data': {**data, 'name': name} if target else data})
         messages.append(
             {
                 'id': f"db:{row.get('id')}",
@@ -549,9 +684,14 @@ async def _query_db_history(chat_type: str, chat_id: str, bot_qq: str, count: in
                 'message_seq': _event_cursor(raw),
                 'reference_id': str(((reply or {}).get('data') or {}).get('id') or ''),
                 'user_id': user_id,
+                'sender_qq': user_id,
                 'bot_qq': str(row.get('source') or bot_qq),
                 'nickname': (bot_qq or 'Bot') if is_self else nickname or nicknames.get(user_id, user_id),
                 'content': str(row.get('content') or ''),
+                'message_segments': display_segments,
+                'mentions': mention_names,
+                'raw_content': str(raw.get('raw_message') or row.get('content') or ''),
+                'raw_pb': raw.get('raw_pb') if isinstance(raw.get('raw_pb'), (dict, str)) else None,
                 'timestamp': str(row.get('timestamp') or ''),
                 'is_self': is_self,
                 'role': str(sender.get('role') or ''),
@@ -623,6 +763,33 @@ async def handle_get_chat_history(request: web.Request):
 # ──────────── 发送 / 撤回 ────────────
 
 
+def _outbound_segments(
+    content: str,
+    msg_type: str,
+    image_data: bytes | None,
+    reply_message_id: str = '',
+    reply_message_seq: str = '',
+) -> list[dict[str, Any]]:
+    """构造 OneBot 消息段，引用段必须位于实际消息内容之前。"""
+    segments: list[dict[str, Any]] = []
+    if reply_message_id:
+        reply_data = {'id': reply_message_id}
+        if reply_message_seq:
+            reply_data['seq'] = reply_message_seq
+        segments.append({'type': 'reply', 'data': reply_data})
+    if content:
+        if msg_type == 'media':
+            segments.append({'type': 'image', 'data': {'file': content}})
+        else:
+            segments.append({'type': 'text', 'data': {'text': content}})
+    if image_data:
+        import base64
+
+        b64 = base64.b64encode(image_data).decode()
+        segments.append({'type': 'image', 'data': {'file': f'base64://{b64}'}})
+    return segments
+
+
 async def handle_send_message(request: web.Request):
     try:
         if request.content_type and 'multipart' in request.content_type:
@@ -649,26 +816,27 @@ async def handle_send_message(request: web.Request):
         bot_qq = str(fields.get('bot_qq') or fields.get('self_id') or _primary_id())
         msg_type = fields.get('msg_type', 'text')
         content = (fields.get('content', '') or '').strip()
+        reply_message_id = str(fields.get('reply_message_id') or '').strip()
+        reply_message_seq = str(fields.get('reply_message_seq') or '').strip()
 
         if not chat_type or not chat_id:
             return web.json_response({'success': False, 'message': '缺少 chat_type/chat_id'}, status=400)
         if not content and not image_data:
             return web.json_response({'success': False, 'message': '消息内容为空'}, status=400)
+        if reply_message_id and not re.fullmatch(r'-?\d+', reply_message_id):
+            return web.json_response({'success': False, 'message': '引用消息 ID 无效'}, status=400)
+        if reply_message_seq and not re.fullmatch(r'\d+', reply_message_seq):
+            return web.json_response({'success': False, 'message': '引用消息序号无效'}, status=400)
         if not _common.connected_ids():
             return web.json_response({'success': False, 'message': '无可用机器人连接'}, status=400)
 
-        # 构造 OneBot 消息段
-        segments = []
-        if content:
-            if msg_type == 'media':
-                segments.append({'type': 'image', 'data': {'file': content}})
-            else:
-                segments.append({'type': 'text', 'data': {'text': content}})
-        if image_data:
-            import base64
-
-            b64 = base64.b64encode(image_data).decode()
-            segments.append({'type': 'image', 'data': {'file': f'base64://{b64}'}})
+        segments = _outbound_segments(
+            content,
+            msg_type,
+            image_data,
+            reply_message_id,
+            reply_message_seq,
+        )
 
         api = _api()
         if chat_type == 'group':
@@ -704,7 +872,8 @@ async def handle_recall_message(request: web.Request):
         with contextlib.suppress(Exception):
             await _mark_recalled(message_id, bot_qq)
         return web.json_response({'success': True})
-    return web.json_response({'success': False, 'message': '撤回失败'})
+    error = (resp or {}).get('message') or (resp or {}).get('wording') or (resp or {}).get('error') or '撤回失败'
+    return web.json_response({'success': False, 'message': str(error)})
 
 
 async def _mark_recalled(message_id, bot_qq=''):

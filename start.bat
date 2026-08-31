@@ -1,22 +1,58 @@
 @echo off
-setlocal
-cd /d "%~dp0"
-set "ELAINABOT_WINDOWS_LAUNCHER=%~f0"
-set "ELAINABOT_ROOT=%~dp0"
-set "ELAINABOT_FIRST_ARGUMENT=%~1"
-set "ELAINABOT_SECOND_ARGUMENT=%~2"
-chcp 65001 >nul
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -OutputFormat Text -EncodedCommand JABsAD0ARwBlAHQALQBDAG8AbgB0AGUAbgB0ACAALQBMAGkAdABlAHIAYQBsAFAAYQB0AGgAIAAkAGUAbgB2ADoARQBMAEEASQBOAEEAQgBPAFQAXwBXAEkATgBEAE8AVwBTAF8ATABBAFUATgBDAEgARQBSACAALQBFAG4AYwBvAGQAaQBuAGcAIABVAFQARgA4ADsAJABtAD0AWwBhAHIAcgBhAHkAXQA6ADoASQBuAGQAZQB4AE8AZgAoACQAbAAsACcAIwAgAIVRTF0gAFAAbwB3AGUAcgBTAGgAZQBsAGwAIADjTgF4JwApADsAaQBmACgAJABtAC0AbAB0ADAAKQB7AHQAaAByAG8AdwAgACcAKmd+YjBShVFMXYR2IABQAG8AdwBlAHIAUwBoAGUAbABsACAA404BeAIwJwB9ADsAJABwAD0AJABsAFsAKAAkAG0AKwAxACkALgAuACgAJABsAC4AQwBvAHUAbgB0AC0AMQApAF0ALQBqAG8AaQBuAFsARQBuAHYAaQByAG8AbgBtAGUAbgB0AF0AOgA6AE4AZQB3AEwAaQBuAGUAOwAmACgAWwBzAGMAcgBpAHAAdABiAGwAbwBjAGsAXQA6ADoAQwByAGUAYQB0AGUAKAAkAHAAKQApAA==
-set "ELAINABOT_EXIT_CODE=%ERRORLEVEL%"
-exit /b %ELAINABOT_EXIT_CODE%
+@setlocal
+@cd /d "%~dp0"
+@set "ELAINABOT_WINDOWS_LAUNCHER=%~f0"
+@set "ELAINABOT_ROOT=%~dp0"
+@set "ELAINABOT_FIRST_ARGUMENT=%~1"
+@set "ELAINABOT_SECOND_ARGUMENT=%~2"
+@set "PYTHONUTF8=1"
+@set "PYTHONIOENCODING=utf-8"
+@powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -OutputFormat Text -EncodedCommand JABsAD0ARwBlAHQALQBDAG8AbgB0AGUAbgB0ACAALQBMAGkAdABlAHIAYQBsAFAAYQB0AGgAIAAkAGUAbgB2ADoARQBMAEEASQBOAEEAQgBPAFQAXwBXAEkATgBEAE8AVwBTAF8ATABBAFUATgBDAEgARQBSACAALQBFAG4AYwBvAGQAaQBuAGcAIABVAFQARgA4ADsAJABtAD0AWwBhAHIAcgBhAHkAXQA6ADoASQBuAGQAZQB4AE8AZgAoACQAbAAsACcAIwAgAIVRTF0gAFAAbwB3AGUAcgBTAGgAZQBsAGwAIADjTgF4JwApADsAaQBmACgAJABtAC0AbAB0ADAAKQB7AHQAaAByAG8AdwAgACcAKmd+YjBShVFMXYR2IABQAG8AdwBlAHIAUwBoAGUAbABsACAA404BeAIwJwB9ADsAJABwAD0AJABsAFsAKAAkAG0AKwAxACkALgAuACgAJABsAC4AQwBvAHUAbgB0AC0AMQApAF0ALQBqAG8AaQBuAFsARQBuAHYAaQByAG8AbgBtAGUAbgB0AF0AOgA6AE4AZQB3AEwAaQBuAGUAOwAmACgAWwBzAGMAcgBpAHAAdABiAGwAbwBjAGsAXQA6ADoAQwByAGUAYQB0AGUAKAAkAHAAKQApAA==
+@set "ELAINABOT_EXIT_CODE=%ERRORLEVEL%"
+@if not "%ELAINABOT_EXIT_CODE%"=="0" (
+    @echo(
+    @echo [ElainaBot] Startup failed with exit code %ELAINABOT_EXIT_CODE%.
+    @echo [ElainaBot] Review the error above, then press any key to close this window...
+    @pause >nul
+) else (
+    @echo(
+    @echo [ElainaBot] Startup completed. Press any key to close this window...
+    @pause >nul
+)
+@exit /b %ELAINABOT_EXIT_CODE%
 
 # 内嵌 PowerShell 代码
+$Utf8Encoding = New-Object Text.UTF8Encoding($false)
+$WindowsVersion = [Environment]::OSVersion.Version
+$UseLegacyWindowsPath = $WindowsVersion.Major -lt 10
+$UseSystemBrowserPanel = $UseLegacyWindowsPath
+$ProgressPreference = 'SilentlyContinue'
+$env:PYTHONUTF8 = '1'
+$env:PYTHONIOENCODING = [Console]::OutputEncoding.WebName
+[Net.ServicePointManager]::SecurityProtocol =
+    [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+function Write-ConsoleLine {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [ConsoleColor]$Color = [Console]::ForegroundColor
+    )
+
+    try {
+        [Console]::Out.WriteLine($Message)
+    } catch {
+        # Some legacy consoles cannot accept Unicode writes; keep the failure readable.
+        $asciiMessage = [Text.RegularExpressions.Regex]::Replace($Message, '[^\x00-\x7F]', '?')
+        try { [Console]::Out.WriteLine($asciiMessage) } catch { }
+    }
+}
+
 $SetupOnly = $false
 $FirstArgument = [string]$env:ELAINABOT_FIRST_ARGUMENT
 $SecondArgument = [string]$env:ELAINABOT_SECOND_ARGUMENT
 
 if ($SecondArgument) {
-    Write-Host '[ElainaBot] 错误：不支持多个启动参数。' -ForegroundColor Red
+    Write-ConsoleLine '[ElainaBot] 错误：不支持多个启动参数。' Red
     exit 2
 }
 
@@ -25,15 +61,15 @@ switch ($FirstArgument.ToLowerInvariant()) {
     '-setuponly' { $SetupOnly = $true }
     '--setup-only' { $SetupOnly = $true }
     '-h' {
-        Write-Host '用法：start.bat [-SetupOnly]'
+        Write-ConsoleLine '用法：start.bat [-SetupOnly]'
         exit 0
     }
     '--help' {
-        Write-Host '用法：start.bat [-SetupOnly]'
+        Write-ConsoleLine '用法：start.bat [-SetupOnly]'
         exit 0
     }
     default {
-        Write-Host "[ElainaBot] 错误：未知参数：$FirstArgument" -ForegroundColor Red
+        Write-ConsoleLine "[ElainaBot] 错误：未知参数：$FirstArgument" Red
         exit 2
     }
 }
@@ -41,10 +77,34 @@ switch ($FirstArgument.ToLowerInvariant()) {
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$BootstrapVersion = '1'
-$PythonVersion = '3.13'
+$BootstrapVersion = '5'
+$MinimumPythonVersion = '3.11'
+$ManagedPythonVersion = '3.13'
+$DefaultPythonInstallMirror = 'https://registry.npmmirror.com/-/binary/python'
+$PythonInstallMirror = if (-not [string]::IsNullOrWhiteSpace($env:ELAINAQQ_PYTHON_MIRROR)) {
+    $env:ELAINAQQ_PYTHON_MIRROR.Trim().TrimEnd('/')
+} elseif (-not [string]::IsNullOrWhiteSpace($env:ELAINABOT_PYTHON_MIRROR)) {
+    $env:ELAINABOT_PYTHON_MIRROR.Trim().TrimEnd('/')
+} else {
+    $DefaultPythonInstallMirror
+}
 $PipMirror = 'https://pypi.tuna.tsinghua.edu.cn/simple'
 $OfficialPipSource = 'https://pypi.org/simple'
+$FrameworkArchiveUrl = 'https://github.com/ElainaCore/Elaina_QQBot/archive/refs/heads/main.zip'
+$FrameworkManualDownloadUrl = 'https://codeload.github.com/ElainaCore/Elaina_QQBot/zip/refs/heads/main'
+$FrameworkMirrors = @(
+    'https://github.chenc.dev/'
+    'https://fastgit.cc/'
+    'https://gh.dpik.top/'
+    'https://gh.jasonzeng.dev/'
+    'https://ghf.xn--eqrr82bzpe.top/'
+    'https://gh.xxooo.cf/'
+    'https://ghproxy.imciel.com/'
+    'https://ghproxy.cxkpro.top/'
+    'https://gh.927223.xyz/'
+    'https://gitproxy.mrhjx.cn/'
+)
+$WebPanelPackage = 'pywebview>=6.2,<7'
 $RootDir = [IO.Path]::GetFullPath($env:ELAINABOT_ROOT)
 $VenvDir = Join-Path $RootDir '.venv'
 $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
@@ -54,7 +114,7 @@ Set-Location $RootDir
 
 function Write-Step {
     param([string]$Message)
-    Write-Host "[ElainaBot] $Message" -ForegroundColor Cyan
+    Write-ConsoleLine "[ElainaBot] $Message" Cyan
 }
 
 function Refresh-ProcessPath {
@@ -69,7 +129,7 @@ function Invoke-Checked {
         [Parameter(Mandatory = $true)][string[]]$Arguments
     )
 
-    & $FilePath @Arguments | Out-Host
+    & $FilePath @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "命令执行失败，退出代码 ${LASTEXITCODE}：$FilePath $($Arguments -join ' ')"
     }
@@ -79,7 +139,7 @@ function Invoke-PipInstall {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
 
     Write-Step '正在优先使用清华 PyPI 镜像安装依赖...'
-    & $VenvPython -m pip install --disable-pip-version-check --index-url $PipMirror @Arguments | Out-Host
+    & $VenvPython -m pip install --disable-pip-version-check --index-url $PipMirror @Arguments
     if ($LASTEXITCODE -eq 0) {
         return
     }
@@ -103,8 +163,7 @@ function Get-CommandPath {
 function Test-PythonCandidate {
     param(
         [string]$FilePath,
-        [string[]]$BaseArguments = @(),
-        [string]$RequiredVersion = ''
+        [string[]]$BaseArguments = @()
     )
 
     if (-not $FilePath) {
@@ -112,11 +171,8 @@ function Test-PythonCandidate {
     }
     $previousPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    $versionCheck = "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
-    if ($RequiredVersion) {
-        $parts = $RequiredVersion.Split('.')
-        $versionCheck = "import sys; raise SystemExit(0 if sys.version_info[:2] == ($($parts[0]), $($parts[1])) else 1)"
-    }
+    $minimumParts = $MinimumPythonVersion.Split('.')
+    $versionCheck = "import sys; raise SystemExit(0 if sys.version_info >= ($($minimumParts[0]), $($minimumParts[1])) else 1)"
     try {
         & $FilePath @BaseArguments -c $versionCheck *> $null
         $probeExitCode = $LASTEXITCODE
@@ -139,66 +195,114 @@ function Test-PythonCandidate {
 function Find-PreferredPython {
     $pyLauncher = Get-CommandPath 'py'
     if ($pyLauncher) {
-        $candidate = Test-PythonCandidate -FilePath $pyLauncher -BaseArguments @('-3.13') -RequiredVersion $PythonVersion
+        $candidate = Test-PythonCandidate -FilePath $pyLauncher -BaseArguments @('-3')
         if ($candidate) {
             return $candidate
         }
     }
 
-    foreach ($name in @('python3.13', 'python3', 'python')) {
+    foreach ($name in @('python', 'python3', 'python3.14', 'python3.13', 'python3.12', 'python3.11')) {
         $path = Get-CommandPath $name
-        $candidate = Test-PythonCandidate -FilePath $path -RequiredVersion $PythonVersion
+        $candidate = Test-PythonCandidate -FilePath $path
         if ($candidate) {
             return $candidate
+        }
+    }
+
+    $pythonPaths = @()
+    foreach ($root in @(
+        (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\Python'),
+        [Environment]::GetEnvironmentVariable('ProgramFiles'),
+        [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+    )) {
+        if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -LiteralPath $root)) { continue }
+        $pythonPaths += Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'Python*' } |
+            ForEach-Object { Join-Path $_.FullName 'python.exe' }
+    }
+    $pythonPaths += @(
+        (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Microsoft\WindowsApps\python.exe'),
+        (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\Python\Launcher\py.exe')
+    )
+    foreach ($path in @($pythonPaths | Select-Object -Unique)) {
+        $candidate = Test-PythonCandidate -FilePath $path
+        if ($candidate) { return $candidate }
+    }
+
+    foreach ($registryPath in @(
+        'HKCU:\Software\Python\PythonCore',
+        'HKLM:\Software\Python\PythonCore',
+        'HKLM:\Software\WOW6432Node\Python\PythonCore'
+    )) {
+        foreach ($versionKey in @(Get-ChildItem -Path $registryPath -ErrorAction SilentlyContinue | Sort-Object PSChildName -Descending)) {
+            $installPath = (Get-ItemProperty -LiteralPath $versionKey.PSPath -Name InstallPath -ErrorAction SilentlyContinue).InstallPath
+            if ($installPath) {
+                $candidate = Test-PythonCandidate -FilePath (Join-Path $installPath 'python.exe')
+                if ($candidate) { return $candidate }
+            }
         }
     }
     return $null
 }
 
-function Install-PythonWithWinget {
-    $wingetPath = Get-CommandPath 'winget'
-    if (-not $wingetPath) {
-        return $null
+function Get-LatestPythonInstaller {
+    param([Parameter(Mandatory = $true)][string]$MirrorRoot)
+
+    $listing = Invoke-WebRequest -UseBasicParsing -Uri "$MirrorRoot/" -TimeoutSec 60
+    $entries = @($listing.Content | ConvertFrom-Json)
+    $latestEntry = @($entries |
+        Where-Object { $_.name -like '3.13.*' -and $_.name.EndsWith('/') } |
+        Sort-Object { [version]$_.name.TrimEnd('/') } -Descending |
+        Select-Object -First 1)
+    if ($latestEntry.Count -eq 0) {
+        throw '镜像目录中没有找到可用的 Python 3.13.x 版本。'
     }
 
-Write-Step '未找到 Python 3.13，正在安装 Python 3.13...'
-    Invoke-Checked $wingetPath @(
-        'install', '--id', 'Python.Python.3.13', '--exact', '--source', 'winget',
-        '--scope', 'user', '--accept-package-agreements', '--accept-source-agreements', '--silent'
-    )
-    Refresh-ProcessPath
-return Find-PreferredPython
+    $version = $latestEntry[0].name.TrimEnd('/')
+    $architecture = [Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITEW6432')
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        $architecture = [Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITECTURE')
+    }
+    $installerName = switch ($architecture) {
+        'ARM64' { "python-$version-arm64.exe" }
+        'x86' { "python-$version.exe" }
+        default { "python-$version-amd64.exe" }
+    }
+    return [PSCustomObject]@{
+        Version = $version
+        Name = $installerName
+        Url = "$MirrorRoot/$version/$installerName"
+    }
 }
 
-function Ensure-Uv {
-    $uvPath = Get-CommandPath 'uv'
-    if ($uvPath) {
-        return $uvPath
-    }
+function Install-PythonFromMirror {
+    $installer = Get-LatestPythonInstaller -MirrorRoot $PythonInstallMirror
+    $installerPath = Join-Path ([IO.Path]::GetTempPath()) "elainaqq-$($installer.Name)"
 
-    $localUv = Join-Path $ToolsDir 'uv.exe'
-    if (Test-Path -LiteralPath $localUv) {
-        return $localUv
-    }
-
-    Write-Step '正在安装项目专用的 Python 环境引导工具...'
-    New-Item -ItemType Directory -Path $ToolsDir -Force | Out-Null
-    $installerPath = Join-Path ([IO.Path]::GetTempPath()) 'elainabot-uv-install.ps1'
+    Write-Step "winget 安装不可用，正在通过镜像下载 Python $($installer.Version)..."
     try {
-        Invoke-WebRequest -Uri 'https://astral.sh/uv/install.ps1' -OutFile $installerPath
-        $env:UV_INSTALL_DIR = $ToolsDir
-        $env:UV_NO_MODIFY_PATH = '1'
-        Invoke-Checked 'powershell.exe' @(
-            '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $installerPath
+        Invoke-WebRequest -UseBasicParsing -Uri $installer.Url -OutFile $installerPath -TimeoutSec 300
+        Write-Step 'Python 安装包下载完成，正在以当前用户权限静默安装...'
+        $installerArguments = @(
+            '/quiet', 'InstallAllUsers=0', 'PrependPath=0', 'Include_launcher=1',
+            'InstallLauncherAllUsers=0', 'Include_pip=1', 'Include_test=0',
+            'Include_doc=0', 'Include_debug=0', 'Include_symbols=0'
         )
+        $installerProcess = Start-Process -FilePath $installerPath -ArgumentList $installerArguments -Wait -PassThru
+        $installerExitCode = $installerProcess.ExitCode
+        if ($installerExitCode -notin @(0, 3010)) {
+            throw "Python 安装程序退出代码：$installerExitCode"
+        }
     } finally {
         Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
     }
 
-    if (-not (Test-Path -LiteralPath $localUv)) {
-        throw '无法安装项目专用的 Python 环境引导工具。'
+    Refresh-ProcessPath
+    $python = Find-PreferredPython
+    if (-not $python) {
+        throw 'Python 安装程序已结束，但没有找到可用的 Python 3.11+。'
     }
-    return $localUv
+    return $python
 }
 
 function Backup-InvalidVenv {
@@ -211,50 +315,371 @@ function Backup-InvalidVenv {
 }
 
 function Ensure-VirtualEnvironment {
-    Write-Step '[1/5] 正在检查 Python 3.11 或更高版本...'
+    Write-Step "[1/6] 正在检查 Python $MinimumPythonVersion 或更高版本..."
     if (Test-Path -LiteralPath $VenvPython) {
         $existing = Test-PythonCandidate $VenvPython
         if ($existing) {
-            Write-Step "[1/5] Python 已就绪：$($existing.Version)"
-            Write-Step '[2/5] 已有虚拟环境可用：.venv'
+            Write-Step "[1/6] Python 已就绪：$($existing.Version)"
+            Write-Step '[2/6] 已有虚拟环境可用：.venv'
             return
         }
     }
 
     Backup-InvalidVenv
-$python = Find-PreferredPython
+    $python = Find-PreferredPython
     if (-not $python) {
+        $wingetPath = Get-CommandPath 'winget'
+        if ($wingetPath) {
+            Write-Step '未找到 Python 3.11+，正在以当前用户权限安装 Python 3.13...'
+            $previousPreference = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'Continue'
+                & $wingetPath install --id Python.Python.3.13 --exact --source winget --scope user --accept-package-agreements --accept-source-agreements --silent | Out-Host
+            } finally {
+                $ErrorActionPreference = $previousPreference
+            }
+            Refresh-ProcessPath
+            $python = Find-PreferredPython
+        }
+    }
+    if (-not $python) {
+        $python = Install-PythonFromMirror
+    }
+
+    Write-Step "[1/6] 已找到兼容的 Python：$($python.Version)"
+    Write-Step '[2/6] 正在创建项目虚拟环境：.venv...'
+    & $python.FilePath @($python.Arguments) -m venv $VenvDir
+    if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $VenvPython)) {
+        Write-Step '[2/6] 虚拟环境创建成功。'
+        return
+    }
+    if (Test-Path -LiteralPath $VenvDir) {
+        $failedName = ".venv.failed-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+        Move-Item -LiteralPath $VenvDir -Destination (Join-Path $RootDir $failedName)
+    }
+    throw '系统 Python 无法创建虚拟环境，请确认 Python 安装包含 venv 模块。'
+}
+
+function Test-FrameworkComplete {
+    $required = @(
+        'main.py',
+        'requirements.txt',
+        'pyproject.toml',
+        'config/settings.example.yaml',
+        'config/connections.example.yaml',
+        'core/runtime/application.py',
+        'core/foundation/config.py',
+        'core/runtime/embedded/manager.py',
+        'core/runtime/embedded/bridge/qq_runtime.mjs',
+        'web/setup.py',
+        'web/dist/index.html'
+    )
+    foreach ($relativePath in $required) {
+        if (-not (Test-Path -LiteralPath (Join-Path $RootDir $relativePath) -PathType Leaf)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Get-FrameworkDownloadUrls {
+    $customMirror = [string]$env:ELAINAQQ_FRAMEWORK_MIRROR
+    if ([string]::IsNullOrWhiteSpace($customMirror)) {
+        $customMirror = [string]$env:ELAINABOT_FRAMEWORK_MIRROR
+    }
+    if (-not [string]::IsNullOrWhiteSpace($customMirror)) {
+        $customMirror = $customMirror.Trim().TrimEnd('/')
+        if ($customMirror -match '\.(zip)(\?.*)?$') {
+            Write-Output $customMirror
+        } else {
+            Write-Output ("$customMirror/$FrameworkArchiveUrl")
+        }
+    }
+    foreach ($mirror in $FrameworkMirrors) {
+        Write-Output ("$($mirror.TrimEnd('/'))/$FrameworkArchiveUrl")
+    }
+    Write-Output $FrameworkArchiveUrl
+}
+
+function Get-AvailableFrameworkDownloadUrl {
+    $urls = @(Get-FrameworkDownloadUrls | Select-Object -Unique)
+    if ($urls.Count -eq 0) {
+        throw '没有可用的框架下载地址。'
+    }
+
+    Write-Step "正在依次检测框架下载源，找到可用源后立即下载..."
+    foreach ($url in $urls) {
+        Write-Step "正在检测框架镜像: $url"
+        $response = $null
+        $stream = $null
         try {
-            $python = Install-PythonWithWinget
+            $request = [Net.HttpWebRequest]::Create($url)
+            $request.Method = 'GET'
+            $request.AllowAutoRedirect = $true
+            $request.Timeout = 6000
+            $request.ReadWriteTimeout = 6000
+            $request.UserAgent = 'ElainaQQ-Startup-Mirror-Test'
+            $request.Accept = 'application/zip, application/octet-stream;q=0.9, */*;q=0.1'
+            $request.Headers['Accept-Encoding'] = 'identity'
+            $request.AddRange(0, 3)
+
+            $response = $request.GetResponse()
+            $stream = $response.GetResponseStream()
+            $signature = New-Object byte[] 4
+            $bytesRead = 0
+            while ($bytesRead -lt $signature.Length) {
+                $count = $stream.Read($signature, $bytesRead, $signature.Length - $bytesRead)
+                if ($count -le 0) {
+                    break
+                }
+                $bytesRead += $count
+            }
+
+            $isZip = $bytesRead -eq 4 -and
+                $signature[0] -eq 0x50 -and
+                $signature[1] -eq 0x4B -and
+                (($signature[2] -eq 0x03 -and $signature[3] -eq 0x04) -or
+                 ($signature[2] -eq 0x05 -and $signature[3] -eq 0x06) -or
+                 ($signature[2] -eq 0x07 -and $signature[3] -eq 0x08))
+            if ($isZip) {
+                Write-Step "已找到可用框架镜像: $url"
+                return $url
+            }
+            Write-Step '当前镜像响应不是有效 ZIP，继续检测下一个来源。'
         } catch {
-            Write-Step 'winget 无法安装 Python 3.13，将改用项目专用的 Python。'
-            $python = $null
+            Write-Step "当前镜像不可用，继续检测下一个来源：$($_.Exception.Message)"
+        } finally {
+            if ($null -ne $stream) {
+                $stream.Dispose()
+            }
+            if ($null -ne $response) {
+                $response.Dispose()
+            }
         }
     }
 
-    if ($python) {
-Write-Step "[1/5] 已找到 Python 3.13：$($python.Version)"
-        Write-Step '[2/5] 正在创建项目虚拟环境：.venv...'
-        & $python.FilePath @($python.Arguments) -m venv $VenvDir
-        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $VenvPython)) {
-            Write-Step '[2/5] 虚拟环境创建成功。'
-            return
+    throw "下载框架失败，请手动下载：[https://github.com/ElainaCore/Elaina_QQBot]($FrameworkManualDownloadUrl)"
+}
+function Invoke-FrameworkArchiveDownload {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$DestinationPath
+    )
+
+    $downloadSource = @'
+import os
+import shutil
+import socket
+import sys
+import urllib.request
+from pathlib import Path
+
+url = os.environ['ELAINAQQ_DOWNLOAD_URL']
+destination = Path(os.environ['ELAINAQQ_DOWNLOAD_DESTINATION'])
+partial = destination.with_name(destination.name + '.part')
+
+default_getaddrinfo = socket.getaddrinfo
+def ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    results = default_getaddrinfo(host, port, family, type, proto, flags)
+    ipv4_results = [item for item in results if item[0] == socket.AF_INET]
+    return ipv4_results or results
+socket.getaddrinfo = ipv4_getaddrinfo
+
+proxy_config = urllib.request.getproxies()
+openers = [('direct-ipv4', urllib.request.build_opener(urllib.request.ProxyHandler({})))]
+if any(name in proxy_config for name in ('http', 'https', 'all')):
+    openers.append(('system-proxy-ipv4', urllib.request.build_opener(urllib.request.ProxyHandler(proxy_config))))
+
+errors = []
+for mode, opener in openers:
+    try:
+        request = urllib.request.Request(
+            url,
+            headers={
+                'User-Agent': 'ElainaQQ-Startup-Downloader',
+                'Accept': 'application/zip, application/octet-stream;q=0.9, */*;q=0.1',
+                'Accept-Encoding': 'identity',
+            },
+        )
+        with opener.open(request, timeout=30) as response, partial.open('wb') as output:
+            shutil.copyfileobj(response, output, length=1024 * 1024)
+        os.replace(partial, destination)
+        print(mode)
+        raise SystemExit(0)
+    except Exception as exc:
+        partial.unlink(missing_ok=True)
+        errors.append(f'{mode}: {type(exc).__name__}: {exc}')
+
+print(' | '.join(errors), file=sys.stderr)
+raise SystemExit(1)
+'@
+    $previousUrl = $env:ELAINAQQ_DOWNLOAD_URL
+    $previousDestination = $env:ELAINAQQ_DOWNLOAD_DESTINATION
+    try {
+        $env:ELAINAQQ_DOWNLOAD_URL = $Url
+        $env:ELAINAQQ_DOWNLOAD_DESTINATION = $DestinationPath
+        $previousPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $downloadOutput = @($downloadSource | & $VenvPython - 2>&1)
+            $downloadExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousPreference
         }
-        if (Test-Path -LiteralPath $VenvDir) {
-            $failedName = ".venv.failed-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-            Move-Item -LiteralPath $VenvDir -Destination (Join-Path $RootDir $failedName)
-        }
-        Write-Step '系统 Python 无法创建虚拟环境，将改用项目专用的 Python。'
+    } finally {
+        if ($null -eq $previousUrl) { Remove-Item Env:ELAINAQQ_DOWNLOAD_URL -ErrorAction SilentlyContinue } else { $env:ELAINAQQ_DOWNLOAD_URL = $previousUrl }
+        if ($null -eq $previousDestination) { Remove-Item Env:ELAINAQQ_DOWNLOAD_DESTINATION -ErrorAction SilentlyContinue } else { $env:ELAINAQQ_DOWNLOAD_DESTINATION = $previousDestination }
+    }
+    if ($downloadExitCode -ne 0) {
+        $details = ($downloadOutput | Select-Object -Last 5 | ForEach-Object { $_.ToString() }) -join ' '
+        throw "下载失败：$details"
+    }
+    $downloadMode = ($downloadOutput | Select-Object -Last 1).ToString()
+    Write-Step "框架压缩包下载完成（$downloadMode）。"
+}
+
+function Restore-FrameworkArchive {
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$StagingPath
+    )
+
+    $restoreSource = @'
+import os
+import shutil
+import stat
+import sys
+import zipfile
+from pathlib import Path
+
+archive = Path(os.environ['ELAINAQQ_RESTORE_ARCHIVE'])
+staging = Path(os.environ['ELAINAQQ_RESTORE_STAGING'])
+root = Path(os.environ['ELAINAQQ_RESTORE_ROOT'])
+staging = staging.resolve()
+root = root.resolve()
+with zipfile.ZipFile(archive) as zf:
+    for info in zf.infolist():
+        name = info.filename.replace('\\', '/')
+        relative = Path(name)
+        if relative.is_absolute() or '..' in relative.parts:
+            raise RuntimeError(f'压缩包包含不安全路径: {name}')
+        mode = (info.external_attr >> 16) & 0o170000
+        if mode == stat.S_IFLNK:
+            raise RuntimeError(f'压缩包包含不安全符号链接: {name}')
+        target = (staging / relative).resolve()
+        if target != staging and staging not in target.parents:
+            raise RuntimeError(f'压缩包包含不安全路径: {name}')
+        if info.is_dir() or name.endswith('/'):
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(info) as source, target.open('wb') as destination:
+            shutil.copyfileobj(source, destination)
+
+entries = list(staging.iterdir())
+source = entries[0] if len(entries) == 1 and entries[0].is_dir() else staging
+required = (
+    'main.py',
+    'requirements.txt',
+    'pyproject.toml',
+    'config/settings.example.yaml',
+    'config/connections.example.yaml',
+    'core/runtime/application.py',
+    'core/foundation/config.py',
+    'core/runtime/embedded/manager.py',
+    'core/runtime/embedded/bridge/qq_runtime.mjs',
+    'web/setup.py',
+    'web/dist/index.html',
+)
+missing = [relative for relative in required if not (source / relative).is_file()]
+if missing:
+    raise RuntimeError('压缩包缺少框架基本文件: ' + ', '.join(missing))
+
+for item in source.rglob('*'):
+    relative = item.relative_to(source)
+    destination = root / relative
+    resolved_destination = destination.resolve()
+    if resolved_destination != root and root not in resolved_destination.parents:
+        raise RuntimeError(f'目标路径超出项目目录: {relative}')
+    if item.is_dir():
+        if destination.exists() and not destination.is_dir():
+            continue
+        destination.mkdir(parents=True, exist_ok=True)
+    elif item.is_file() and not os.path.lexists(destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(item, destination)
+'@
+    $previousArchive = $env:ELAINAQQ_RESTORE_ARCHIVE
+    $previousStaging = $env:ELAINAQQ_RESTORE_STAGING
+    $previousRoot = $env:ELAINAQQ_RESTORE_ROOT
+    try {
+        $env:ELAINAQQ_RESTORE_ARCHIVE = $ArchivePath
+        $env:ELAINAQQ_RESTORE_STAGING = $StagingPath
+        $env:ELAINAQQ_RESTORE_ROOT = $RootDir
+        $restoreSource | & $VenvPython -
+        $restoreExitCode = $LASTEXITCODE
+    } finally {
+        if ($null -eq $previousArchive) { Remove-Item Env:ELAINAQQ_RESTORE_ARCHIVE -ErrorAction SilentlyContinue } else { $env:ELAINAQQ_RESTORE_ARCHIVE = $previousArchive }
+        if ($null -eq $previousStaging) { Remove-Item Env:ELAINAQQ_RESTORE_STAGING -ErrorAction SilentlyContinue } else { $env:ELAINAQQ_RESTORE_STAGING = $previousStaging }
+        if ($null -eq $previousRoot) { Remove-Item Env:ELAINAQQ_RESTORE_ROOT -ErrorAction SilentlyContinue } else { $env:ELAINAQQ_RESTORE_ROOT = $previousRoot }
+    }
+    if ($restoreExitCode -ne 0) {
+        return $false
+    }
+    return $true
+}
+
+function Ensure-Framework {
+    $required = @(
+        'main.py',
+        'requirements.txt',
+        'pyproject.toml',
+        'config/settings.example.yaml',
+        'config/connections.example.yaml',
+        'core/runtime/application.py',
+        'core/foundation/config.py',
+        'core/runtime/embedded/manager.py',
+        'core/runtime/embedded/bridge/qq_runtime.mjs',
+        'web/setup.py',
+        'web/dist/index.html'
+    )
+    $missing = @($required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $RootDir $_) -PathType Leaf) })
+    if ($missing.Count -eq 0) {
+        Write-Step '[3/6] 框架基本文件完整，无需下载。'
+        return
     }
 
-    $uvPath = Ensure-Uv
-    Write-Step "[1/5] 正在下载项目专用的 Python $PythonVersion..."
-    Write-Step '[2/5] 正在创建项目虚拟环境：.venv...'
-    Invoke-Checked $uvPath @('venv', '--python', $PythonVersion, $VenvDir)
-    if (-not (Test-Path -LiteralPath $VenvPython)) {
-        throw '虚拟环境创建结束，但未找到可用的 python.exe。'
+    Write-Step ("[3/6] 缺少框架基本文件: $($missing -join ', ')，正在检测镜像...")
+    $downloadUrl = Get-AvailableFrameworkDownloadUrl
+    $staging = Join-Path ([IO.Path]::GetTempPath()) ("elainaqq-framework-$([guid]::NewGuid().ToString('N'))")
+    $extractPath = Join-Path $staging 'extracted'
+    $archivePath = Join-Path $staging 'framework.zip'
+    New-Item -ItemType Directory -Path $extractPath -Force | Out-Null
+    try {
+        foreach ($url in @($downloadUrl)) {
+            Write-Step "正在下载框架镜像: $url"
+            Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
+            try {
+                Invoke-FrameworkArchiveDownload -Url $url -DestinationPath $archivePath
+                & $VenvPython -c "import zipfile,sys; raise SystemExit(0 if zipfile.is_zipfile(sys.argv[1]) else 1)" $archivePath
+                if ($LASTEXITCODE -ne 0) {
+                    throw '下载内容不是有效 ZIP'
+                }
+                Remove-Item -LiteralPath $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+                New-Item -ItemType Directory -Path $extractPath -Force | Out-Null
+                if ((Restore-FrameworkArchive -ArchivePath $archivePath -StagingPath $extractPath) -and (Test-FrameworkComplete)) {
+                    Write-Step '框架基本文件已从镜像恢复。'
+                    return
+                }
+                Write-Step '镜像压缩包解压后仍缺少框架文件，尝试下一个来源。'
+            } catch {
+                Write-Step "镜像下载或解压失败，尝试下一个来源：$($_.Exception.Message)"
+            }
+        }
+        throw "下载框架失败，请手动下载：[https://github.com/ElainaCore/Elaina_QQBot]($FrameworkManualDownloadUrl)"
+    } finally {
+        Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
     }
-    Write-Step '[2/5] 虚拟环境创建成功。'
 }
 
 function Get-RequirementFiles {
@@ -298,17 +723,26 @@ function Get-RequirementsFingerprint {
 }
 
 function Test-CoreDependencies {
-    & $VenvPython -c "import aiohttp, psutil, yaml" 2>$null
-    return $LASTEXITCODE -eq 0
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $VenvPython -c "import aiohttp, psutil, yaml" *> $null
+        $importExitCode = $LASTEXITCODE
+    } catch {
+        $importExitCode = 1
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    return $importExitCode -eq 0
 }
 
 function Ensure-Dependencies {
-    Write-Step '[3/5] 正在扫描框架、模块和插件的依赖文件...'
+    Write-Step '[4/6] 正在扫描框架、模块和插件的依赖文件...'
     $requirements = @(Get-RequirementFiles)
     if ($requirements.Count -eq 0) {
         throw '未找到任何依赖文件。'
     }
-    Write-Step "[3/5] 已找到 $($requirements.Count) 个依赖文件。"
+    Write-Step "[4/6] 已找到 $($requirements.Count) 个依赖文件。"
 
     $fingerprint = Get-RequirementsFingerprint $requirements
     $savedFingerprint = if (Test-Path -LiteralPath $StampFile) {
@@ -318,11 +752,11 @@ function Ensure-Dependencies {
     }
 
     if ($savedFingerprint -eq $fingerprint -and (Test-CoreDependencies)) {
-        Write-Step '[4/5] 依赖已经安装且为最新状态，无需重复安装。'
+        Write-Step '[5/6] 依赖已经安装且为最新状态，无需重复安装。'
         return
     }
 
-    Write-Step "[4/5] 正在根据 $($requirements.Count) 个依赖文件安装依赖..."
+    Write-Step "[5/6] 正在根据 $($requirements.Count) 个依赖文件安装依赖..."
     & $VenvPython -m ensurepip --upgrade 2>$null
     Invoke-PipInstall -Arguments @('--upgrade', 'pip', 'setuptools', 'wheel')
 
@@ -336,26 +770,271 @@ function Ensure-Dependencies {
         throw '依赖安装已经结束，但仍有一个或多个核心包无法导入。'
     }
     Set-Content -LiteralPath $StampFile -Value $fingerprint -Encoding ASCII
-    Write-Step '[4/5] 依赖安装完成并通过验证。'
+    Write-Step '[5/6] 依赖安装完成并通过验证。'
+}
+
+function Test-WebPanelDependency {
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $VenvPython -c "import webview" *> $null
+        $importExitCode = $LASTEXITCODE
+    } catch {
+        $importExitCode = 1
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    return $importExitCode -eq 0
+}
+
+function Ensure-WebPanelDependency {
+    if ($UseSystemBrowserPanel) {
+        Write-Step '[5/6] 当前 Windows 不支持内嵌桌面窗口，将使用外部浏览器打开管理面板。'
+        return
+    }
+
+    Write-Step '[5/6] 正在检查 Windows 桌面窗口组件...'
+    if (Test-WebPanelDependency) {
+        Write-Step '[5/6] Windows 桌面窗口组件已经安装，无需重复安装。'
+        return
+    }
+
+    Write-Step '[5/6] 正在安装启动脚本专用的 Windows 桌面窗口组件...'
+    & $VenvPython -m ensurepip --upgrade 2>$null
+    Invoke-PipInstall -Arguments @($WebPanelPackage)
+    if (-not (Test-WebPanelDependency)) {
+        throw 'Windows 桌面窗口组件安装结束，但 pywebview 仍无法导入。'
+    }
+    Write-Step '[5/6] Windows 桌面窗口组件安装完成。'
+}
+
+function Get-ConfiguredWebPort {
+    $readerSource = @'
+import os
+import sys
+
+from core.foundation.config import cfg
+
+config_dir = os.path.join(sys.argv[1], 'config')
+cfg.init(config_dir)
+value = cfg.get('settings', 'server.port', 5201)
+try:
+    port = int(value)
+except (TypeError, ValueError):
+    raise SystemExit('配置项 server.port 必须是整数。')
+if not 1 <= port <= 65535:
+    raise SystemExit('配置项 server.port 必须在 1 到 65535 之间。')
+print(port)
+'@
+
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $portOutput = @(& $VenvPython -c $readerSource $RootDir 2>&1)
+        $portExitCode = $LASTEXITCODE
+    } catch {
+        $portOutput = @($_.Exception.Message)
+        $portExitCode = 1
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+
+    if ($portExitCode -ne 0) {
+        $details = ($portOutput | ForEach-Object { $_.ToString() }) -join ' '
+        throw "无法读取 Web 管理面板端口：$details"
+    }
+
+    [int]$port = 0
+    $portText = ($portOutput | Select-Object -Last 1).ToString().Trim()
+    if (-not [int]::TryParse($portText, [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
+        throw "读取到无效的 Web 管理面板端口：$portText"
+    }
+    return $port
+}
+
+function Test-LocalPortOpen {
+    param([Parameter(Mandatory = $true)][int]$Port)
+
+    foreach ($address in @('127.0.0.1', '::1')) {
+        $client = New-Object Net.Sockets.TcpClient
+        try {
+            $connection = $client.ConnectAsync($address, $Port)
+            if ($connection.Wait(800) -and $client.Connected) {
+                return $true
+            }
+        } catch {
+        } finally {
+            $client.Dispose()
+        }
+    }
+    return $false
+}
+
+function Test-WebPanelAvailable {
+    param([Parameter(Mandatory = $true)][string]$Url)
+
+    $response = $null
+    try {
+        $request = [Net.HttpWebRequest]::Create($Url)
+        $request.Proxy = $null
+        $request.Method = 'GET'
+        $request.AllowAutoRedirect = $true
+        $request.Timeout = 3000
+        $request.ReadWriteTimeout = 3000
+        $response = $request.GetResponse()
+        $statusCode = [int]$response.StatusCode
+        return $statusCode -ge 200 -and $statusCode -lt 400
+    } catch {
+        return $false
+    } finally {
+        if ($response) {
+            $response.Close()
+        }
+    }
+}
+
+function Start-WebPanelWindow {
+    param([Parameter(Mandatory = $true)][string]$Url)
+
+    $windowSource = if ($UseSystemBrowserPanel) {
+        @'
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+
+panel_url = sys.argv[1]
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+for _ in range(120):
+    try:
+        with opener.open(panel_url, timeout=2):
+            pass
+        break
+    except Exception:
+        time.sleep(1)
+else:
+    raise SystemExit(1)
+
+browser_candidates = (
+    'msedge.exe',
+    'chrome.exe',
+    'firefox.exe',
+    'iexplore.exe',
+)
+browser_paths = []
+for name in browser_candidates:
+    resolved = shutil.which(name)
+    if resolved:
+        browser_paths.append(resolved)
+
+for base_name in ('PROGRAMFILES', 'PROGRAMFILES(X86)', 'LOCALAPPDATA'):
+    base_path = os.environ.get(base_name)
+    if not base_path:
+        continue
+    browser_paths.extend((
+        os.path.join(base_path, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+        os.path.join(base_path, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        os.path.join(base_path, 'Mozilla Firefox', 'firefox.exe'),
+    ))
+
+for browser_path in browser_paths:
+    if os.path.isfile(browser_path):
+        subprocess.Popen([browser_path, panel_url])
+        raise SystemExit(0)
+
+raise SystemExit(2)
+'@
+    } else {
+        @'
+import sys
+import time
+import urllib.request
+
+import webview
+
+panel_url = sys.argv[1]
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+for _ in range(120):
+    try:
+        with opener.open(panel_url, timeout=2):
+            pass
+        break
+    except Exception:
+        time.sleep(1)
+else:
+    raise SystemExit(1)
+
+webview.create_window(
+    'ElainaQQ 管理面板',
+    panel_url,
+    width=1280,
+    height=820,
+    min_size=(960, 640),
+)
+webview.start()
+'@
+    }
+
+    $encodedSource = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($windowSource))
+    $launcherSource = "import base64;exec(base64.b64decode('$encodedSource'))"
+    $arguments = @('-c', "`"$launcherSource`"", "`"$Url`"")
+    $windowPython = Join-Path $VenvDir 'Scripts\pythonw.exe'
+    if (-not (Test-Path -LiteralPath $windowPython)) {
+        $windowPython = $VenvPython
+    }
+    return Start-Process -FilePath $windowPython -ArgumentList $arguments -PassThru
 }
 
 try {
     Write-Step '正在准备运行环境...'
     Ensure-VirtualEnvironment
+    Ensure-Framework
     Ensure-Dependencies
+    Ensure-WebPanelDependency
 
     if ($SetupOnly) {
-        Write-Step '[5/5] 已选择仅配置环境模式，跳过框架启动。'
+        Write-Step '[6/6] 已选择仅配置环境模式，跳过框架启动。'
         Write-Step '运行环境配置成功。'
         exit 0
     }
 
-    Write-Step '[5/5] 正在启动 ElainaBot 框架...'
-    Write-Step 'Web 管理面板：http://localhost:5201/web/'
-    & $VenvPython (Join-Path $RootDir 'main.py')
-    exit $LASTEXITCODE
+    $panelPort = Get-ConfiguredWebPort
+    $panelUrl = "http://localhost:${panelPort}/web/"
+    Write-Step "Web 管理面板：$panelUrl"
+    Write-Step "[6/6] 正在检查配置端口 $panelPort 是否已经开启..."
+    if (Test-LocalPortOpen -Port $panelPort) {
+        if (-not (Test-WebPanelAvailable -Url $panelUrl)) {
+            throw "配置端口 $panelPort 已被占用，但未检测到 ElainaQQ 管理面板。请检查端口占用情况。"
+        }
+        Write-Step "[6/6] 检测到框架已经运行，仅重新打开管理面板。"
+        $existingPanelWindow = Start-WebPanelWindow -Url $panelUrl
+        if ($existingPanelWindow) {
+            $existingPanelWindow.Dispose()
+        }
+        Write-Step '管理面板已打开，无需重新启动框架。'
+        exit 0
+    }
+
+    Write-Step "[6/6] 配置端口 $panelPort 尚未开启，正在启动 ElainaQQ 框架..."
+    Write-Step '面板就绪后将自动打开 ElainaQQ 管理面板。'
+    # Keep the framework in the foreground on every supported Windows version
+    # so this console remains available for runtime logs and diagnostics.
+    $panelWindow = Start-WebPanelWindow -Url $panelUrl
+    try {
+        & $VenvPython (Join-Path $RootDir 'main.py')
+        $frameworkExitCode = $LASTEXITCODE
+    } finally {
+        if ($panelWindow -and -not $panelWindow.HasExited) {
+            Stop-Process -Id $panelWindow.Id -Force -ErrorAction SilentlyContinue
+        }
+        if ($panelWindow) {
+            $panelWindow.Dispose()
+        }
+    }
+    exit $frameworkExitCode
 } catch {
-    Write-Host "[ElainaBot] 错误：$($_.Exception.Message)" -ForegroundColor Red
+    Write-ConsoleLine "[ElainaBot] 错误：$($_.Exception.Message)" Red
     exit 1
 }
-

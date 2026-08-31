@@ -34,7 +34,7 @@ def connected_ids() -> list:
     ad = adapter()
     if not ad:
         return []
-    ids = set(ad.websockets.keys()) | set(ad.bots.keys())
+    ids = set(ad.local_actions.keys()) | set(ad.websockets.keys()) | set(ad.bots.keys())
     ids = {i for i in ids if not str(i).startswith('forward:')}
     return sorted(ids)
 

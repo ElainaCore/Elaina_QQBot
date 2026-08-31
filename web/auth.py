@@ -487,6 +487,7 @@ def get_login_logs() -> list:
     raw = _read_json(_ip_file, {})
     logs = []
     for ip, d in raw.items():
+        raw_response = {'ip': ip, **d}
         logs.append(
             {
                 'ip': ip,
@@ -495,6 +496,7 @@ def get_login_logs() -> list:
                 'fail_count': d.get('fail_count', 0),
                 'is_banned': d.get('is_banned', False),
                 'ban_time': d.get('ban_time', ''),
+                'raw_response': raw_response,
             }
         )
     logs.sort(key=lambda x: x['last_access'] or '', reverse=True)

@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-BOOTSTRAP_VERSION='1'
+BOOTSTRAP_VERSION='2'
 PYTHON_VERSION='3.13'
+DEFAULT_PYTHON_INSTALL_MIRROR='https://registry.npmmirror.com/-/binary/python-build-standalone'
+PYTHON_INSTALL_MIRROR="${ELAINAQQ_PYTHON_MIRROR:-${ELAINABOT_PYTHON_MIRROR:-$DEFAULT_PYTHON_INSTALL_MIRROR}}"
+PYTHON_INSTALL_MIRROR="${PYTHON_INSTALL_MIRROR%/}"
 PIP_MIRROR='https://pypi.tuna.tsinghua.edu.cn/simple'
 OFFICIAL_PIP_SOURCE='https://pypi.org/simple'
+FRAMEWORK_DOWNLOAD_URL='https://github.com/ElainaCore/Elaina_QQBot/archive/main.zip'
+FRAMEWORK_MIRRORS=(
+    'https://github.chenc.dev'
+    'https://ghproxy.cfd'
+    'https://github.tbedu.top'
+    'https://ghproxy.cc'
+)
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$ROOT_DIR/.venv"
 VENV_PYTHON="$VENV_DIR/bin/python"
@@ -153,11 +163,168 @@ step "[1/5] 已找到 Python 3.13：$("$python_bin" -c 'import platform; print(p
 
     local uv_bin
     uv_bin="$(ensure_uv)"
-    step "[1/5] 正在下载项目专用的 Python $PYTHON_VERSION..."
+    step "[1/5] 正在通过镜像下载项目专用的 Python $PYTHON_VERSION..."
+    if ! (
+        unset UV_NO_PROGRESS
+        "$uv_bin" python install --no-bin --no-registry --mirror "$PYTHON_INSTALL_MIRROR" "$PYTHON_VERSION"
+    ); then
+        step 'Python 镜像下载失败，正在切换到官方源...'
+        ( unset UV_NO_PROGRESS; "$uv_bin" python install --no-bin --no-registry "$PYTHON_VERSION" ) || fail "Python $PYTHON_VERSION 下载失败，镜像源和官方源均不可用。"
+    fi
     step '[2/5] 正在创建项目虚拟环境：.venv...'
-    "$uv_bin" venv --python "$PYTHON_VERSION" "$VENV_DIR"
+    "$uv_bin" venv --python "$PYTHON_VERSION" --managed-python --no-python-downloads "$VENV_DIR"
     [[ -x "$VENV_PYTHON" ]] || fail '虚拟环境创建结束，但未找到可用的 Python。'
     step '[2/5] 虚拟环境创建成功。'
+}
+
+framework_is_complete() {
+    local path
+    for path in \
+        main.py \
+        requirements.txt \
+        pyproject.toml \
+        config/settings.example.yaml \
+        config/connections.example.yaml \
+        core/runtime/application.py \
+        core/foundation/config.py \
+        core/runtime/embedded/manager.py \
+        core/runtime/embedded/bridge/qq_runtime.mjs \
+        web/setup.py \
+        web/dist/index.html; do
+        [[ -f "$ROOT_DIR/$path" ]] || return 1
+    done
+    return 0
+}
+
+framework_download_urls() {
+    local custom_mirror="${ELAINAQQ_FRAMEWORK_MIRROR:-${ELAINABOT_FRAMEWORK_MIRROR:-}}" mirror
+    if [[ -n "$custom_mirror" ]]; then
+        printf '%s\n' "${custom_mirror%/}/$FRAMEWORK_DOWNLOAD_URL"
+    fi
+    for mirror in "${FRAMEWORK_MIRRORS[@]}"; do
+        printf '%s\n' "${mirror%/}/$FRAMEWORK_DOWNLOAD_URL"
+    done
+    printf '%s\n' "$FRAMEWORK_DOWNLOAD_URL"
+}
+
+restore_framework_from_archive() {
+    local archive="$1" staging="$2"
+    "$VENV_PYTHON" - "$archive" "$staging" "$ROOT_DIR" <<'PY'
+import os
+import shutil
+import stat
+import sys
+import zipfile
+from pathlib import Path
+
+archive, staging, root = map(Path, sys.argv[1:])
+staging = staging.resolve()
+root = root.resolve()
+with zipfile.ZipFile(archive) as zf:
+    for info in zf.infolist():
+        name = info.filename.replace('\\', '/')
+        relative = Path(name)
+        if relative.is_absolute() or '..' in relative.parts:
+            raise RuntimeError('压缩包包含不安全路径: ' + name)
+        mode = (info.external_attr >> 16) & 0o170000
+        if mode == stat.S_IFLNK:
+            raise RuntimeError('压缩包包含不安全符号链接: ' + name)
+        target = (staging / relative).resolve()
+        if target != staging and staging not in target.parents:
+            raise RuntimeError('压缩包包含不安全路径: ' + name)
+        if info.is_dir() or name.endswith('/'):
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(info) as source, target.open('wb') as destination:
+            shutil.copyfileobj(source, destination)
+
+entries = list(staging.iterdir())
+source = entries[0] if len(entries) == 1 and entries[0].is_dir() else staging
+required = (
+    'main.py',
+    'requirements.txt',
+    'pyproject.toml',
+    'config/settings.example.yaml',
+    'config/connections.example.yaml',
+    'core/runtime/application.py',
+    'core/foundation/config.py',
+    'core/runtime/embedded/manager.py',
+    'core/runtime/embedded/bridge/qq_runtime.mjs',
+    'web/setup.py',
+    'web/dist/index.html',
+)
+missing = [relative for relative in required if not (source / relative).is_file()]
+if missing:
+    raise RuntimeError('压缩包缺少框架基本文件: ' + ', '.join(missing))
+
+for item in source.rglob('*'):
+    relative = item.relative_to(source)
+    destination = root / relative
+    resolved_destination = destination.resolve()
+    if resolved_destination != root and root not in resolved_destination.parents:
+        raise RuntimeError('目标路径超出项目目录: ' + str(relative))
+    if item.is_dir():
+        if destination.exists() and not destination.is_dir():
+            continue
+        destination.mkdir(parents=True, exist_ok=True)
+    elif item.is_file() and not os.path.lexists(destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(item, destination)
+PY
+}
+
+ensure_framework() {
+    local path url archive staging
+    local -a required download
+    required=()
+    for path in \
+        main.py \
+        requirements.txt \
+        pyproject.toml \
+        config/settings.example.yaml \
+        config/connections.example.yaml \
+        core/runtime/application.py \
+        core/foundation/config.py \
+        core/runtime/embedded/manager.py \
+        core/runtime/embedded/bridge/qq_runtime.mjs \
+        web/setup.py \
+        web/dist/index.html; do
+        [[ -f "$ROOT_DIR/$path" ]] || required+=("$path")
+    done
+    if (( ${#required[@]} == 0 )); then
+        step '[3/6] 框架基本文件完整，无需下载。'
+        return
+    fi
+
+    step "[3/6] 缺少框架基本文件: ${required[*]}，正在通过镜像下载并解压..."
+    ensure_downloader
+    staging="$(mktemp -d "${TMPDIR:-/tmp}/elainaqq-framework.XXXXXX")"
+    archive="$staging/framework.zip"
+    mkdir -p "$staging/extracted"
+    while IFS= read -r url; do
+        step "正在尝试框架镜像: $url"
+        rm -f -- "$archive"
+        if command -v curl >/dev/null 2>&1; then
+            download=(curl --fail --location --silent --show-error --retry 2 --connect-timeout 10 --max-time 180 "$url" --output "$archive")
+        else
+            download=(wget --quiet --timeout=20 --tries=2 --output-document="$archive" "$url")
+        fi
+        if "${download[@]}" && "$VENV_PYTHON" -c 'import zipfile,sys; raise SystemExit(0 if zipfile.is_zipfile(sys.argv[1]) else 1)' "$archive"; then
+            rm -rf -- "$staging/extracted"
+            mkdir -p "$staging/extracted"
+            if restore_framework_from_archive "$archive" "$staging/extracted" && framework_is_complete; then
+                step '框架基本文件已从镜像恢复。'
+                rm -rf -- "$staging"
+                return
+            fi
+            step '镜像压缩包解压后仍缺少框架文件，尝试下一个来源。'
+        else
+            step '镜像下载失败或返回的文件不是有效 ZIP，尝试下一个来源。'
+        fi
+    done < <(framework_download_urls)
+    rm -rf -- "$staging"
+    fail '框架基本文件缺失，镜像源和官方源均无法下载或解压。'
 }
 
 collect_requirement_files() {
@@ -240,6 +407,7 @@ ensure_dependencies() {
 
 step '正在准备运行环境...'
 ensure_virtual_environment
+ensure_framework
 ensure_dependencies
 
 if (( SETUP_ONLY == 1 )); then

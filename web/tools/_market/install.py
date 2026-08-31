@@ -75,20 +75,46 @@ def _get_installed_alone_names():
 
 
 def _get_installed_names():
-    """获取已安装的插件名列表 (独立目录 + plugins/alone/ 下的单文件插件)"""
+    """获取仍含插件代码的目录名，忽略卸载后保留的配置与数据目录。"""
     plugins_dir = _plugins_dir()
     if not os.path.isdir(plugins_dir):
         return set()
-    names = {d for d in os.listdir(plugins_dir) if os.path.isdir(os.path.join(plugins_dir, d)) and not d.startswith(('.', '__'))}
+    names = {
+        name
+        for name in os.listdir(plugins_dir)
+        if not name.startswith(('.', '__'))
+        and _directory_has_python_source(os.path.join(plugins_dir, name))
+    }
     return names | _get_installed_alone_names()
 
 
 def _get_installed_module_names():
-    """获取已安装的模块目录名列表"""
+    """获取仍含入口文件的模块目录名，忽略仅剩配置与数据的目录。"""
     modules_dir = _modules_dir()
     if not os.path.isdir(modules_dir):
         return set()
-    return {d for d in os.listdir(modules_dir) if os.path.isdir(os.path.join(modules_dir, d)) and not d.startswith(('.', '__'))}
+    return {
+        name
+        for name in os.listdir(modules_dir)
+        if not name.startswith(('.', '__'))
+        and os.path.isfile(os.path.join(modules_dir, name, 'main.py'))
+    }
+
+
+def _directory_has_python_source(directory: str) -> bool:
+    """判断插件目录中是否还有可执行源码，不扫描持久化配置目录。"""
+    if not os.path.isdir(directory):
+        return False
+    for current, directories, files in os.walk(directory):
+        directories[:] = [
+            name
+            for name in directories
+            if name not in _PERSISTENT_DIRS
+            and not name.startswith(('.', '__'))
+        ]
+        if any(name.endswith('.py') and not name.startswith(('.', '__')) for name in files):
+            return True
+    return False
 
 
 _PLUGIN_ENTRY_NAMES = ('main.py',)
@@ -152,66 +178,80 @@ def _version_lt(local, remote):
 # ==================== 预览 ====================
 
 
-def _preview_zip(content):
+def _preview_markdown_zip(content: bytes, plugin_path: str = ''):
+    """读取插件目标目录下的 Markdown 文档，不向市场预览暴露源码。"""
     try:
         with zipfile.ZipFile(io.BytesIO(content), 'r') as zf:
             validate_archive(zf, max_size=512 * 1024 * 1024)
-            py_files = [f for f in zf.namelist() if f.endswith('.py') and not f.startswith('__') and '/__pycache__/' not in f]
+            names = zf.namelist()
+            roots = {name.split('/')[0] for name in names if '/' in name and name.split('/')[0]}
+            root_prefix = (next(iter(roots)) + '/') if len(roots) == 1 else ''
+
+            directory_prefix = _resolve_subdir(names, root_prefix, plugin_path)
+            if directory_prefix is None:
+                normalized = str(plugin_path or '').replace('\\', '/').strip('/')
+                if normalized and '/' not in normalized:
+                    directory_prefix = root_prefix
+                else:
+                    return web.json_response(
+                        {'success': False, 'message': f'仓库内未找到: {plugin_path}'}
+                    )
+
+            markdown_paths = [
+                name
+                for name in names
+                if name.lower().endswith('.md')
+                and name.startswith(directory_prefix)
+                and '/' not in name[len(directory_prefix):]
+            ]
             files = []
-            for pf in py_files[:10]:
+            for markdown_path in sorted(
+                markdown_paths,
+                key=lambda path: (os.path.basename(path).lower() != 'readme.md', path.lower()),
+            ):
                 try:
-                    fc = zf.read(pf).decode('utf-8', errors='replace')
-                    files.append({'name': pf, 'content': fc[:5000], 'size': len(fc)})
-                except Exception:
-                    pass
+                    text = zf.read(markdown_path).decode('utf-8', errors='replace')
+                    files.append(
+                        {
+                            'name': os.path.basename(markdown_path),
+                            'path': markdown_path[len(root_prefix):],
+                            'content': text[:200000],
+                            'size': len(text.encode('utf-8')),
+                        }
+                    )
+                except Exception as error:
+                    log.debug('读取 Markdown 预览文件 %s 失败: %s', markdown_path, error)
             return web.json_response(
                 {
                     'success': True,
-                    'type': 'zip',
+                    'type': 'markdown',
                     'files': files,
-                    'total_files': len(py_files),
+                    'total_files': len(markdown_paths),
+                    'directory': directory_prefix[len(root_prefix):].rstrip('/'),
                 }
             )
-    except Exception as e:
-        return web.json_response({'success': False, 'message': str(e)})
+    except Exception as error:
+        return web.json_response({'success': False, 'message': str(error)})
 
 
 async def handle_market_preview(request: web.Request):
     body = await json_body(request)
-    url = body.get('url', '')
-    if not url:
-        return web.json_response({'success': False, 'message': '缺少 URL'}, status=400)
+    github = str(body.get('github') or '').strip()
+    branch = str(body.get('branch') or 'main').strip() or 'main'
+    plugin_path = str(body.get('path') or '')
+    mirror = str(body.get('mirror') or '') or _load_market_mirror()
+    if not github:
+        return web.json_response({'success': False, 'message': '缺少 GitHub 仓库地址'}, status=400)
 
-    url = _convert_github_url(url)
     try:
-        content = await _download_file(url)
+        content = await _download_file(_github_to_archive(github, branch), mirror=mirror)
         if content is None:
             return web.json_response({'success': False, 'message': '下载失败'})
-
-        if b'<!doctype html' in content[:100].lower() or b'<html' in content[:100].lower():
-            return web.json_response({'success': False, 'message': '下载链接无效'})
-
-        if content[:4] == b'PK\x03\x04':
-            return await asyncio.to_thread(_preview_zip, content)
-
-        is_py = url.endswith('.py') or any(k in content[:500] for k in [b'import ', b'def ', b'class '])
-        if is_py:
-            code = content.decode('utf-8', errors='replace')
-            fname = url.split('/')[-1].split('?')[0]
-            if not fname.endswith('.py'):
-                fname = 'plugin.py'
-            return web.json_response(
-                {
-                    'success': True,
-                    'type': 'py',
-                    'filename': fname,
-                    'content': code,
-                    'size': len(code),
-                }
-            )
-        return web.json_response({'success': False, 'message': '不支持的文件类型'})
-    except Exception as e:
-        return web.json_response({'success': False, 'message': str(e)})
+        if content[:4] != b'PK\x03\x04':
+            return web.json_response({'success': False, 'message': '仓库下载内容无效'})
+        return await asyncio.to_thread(_preview_markdown_zip, content, plugin_path)
+    except Exception as error:
+        return web.json_response({'success': False, 'message': str(error)})
 
 
 # ==================== 安装 ====================
@@ -543,7 +583,8 @@ async def handle_market_uninstall(request: web.Request):
     body = await json_body(request)
     item_name = body.get('name', '')
     item_type = _canonical_type(body.get('type', ''))
-    keep_data = body.get('keep_data', False)
+    # 卸载默认保留用户配置与数据；只有显式传入 false 才完整删除目录。
+    keep_data = body.get('keep_data', True) is not False
     if not item_name:
         return web.json_response({'success': False, 'message': '缺少名称'}, status=400)
 

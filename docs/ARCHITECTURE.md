@@ -33,6 +33,7 @@ core.foundation                         不依赖上层模块
 | `core/services` | 日志存储、事件记录、文件与配置监视 | 应用装配、QQ 进程控制 |
 | `core/transport` | HTTP 与 WebSocket 传输 | Web 页面装配、插件逻辑 |
 | `core/runtime` | 应用生命周期、扩展和内置 QQ | 插件公开 API 实现 |
+| `core/native` | 随核心发布的进程注入原生资源 | Python 业务逻辑、Web 页面 |
 | `core/plugins` | 插件上下文、装载、分发和稳定公开接口 | QQ 安装与底层传输实现 |
 | `web` | 面板路由、认证和管理工具 | 核心事件模型实现 |
 

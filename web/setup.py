@@ -203,28 +203,23 @@ def _make_spa_handler(dist_dir: str):
     transformed_locks: dict[str, asyncio.Lock] = {}
 
     def _versioned_index(file_path: str) -> tuple[bytes, tuple[tuple[str, int], ...]]:
-        """为固定资源名追加文件修改时间，避免浏览器使用旧构建。"""
+        """为固定资源名追加各文件的修改时间，避免浏览器使用旧构建。"""
         with open(file_path, encoding='utf-8') as file:
             text = file.read()
-        asset_pattern = re.compile(r'((?:/web/)?assets/[^"\'\s?]+)')
+        resource_pattern = re.compile(r'((?:/web/)?(?:assets/[^"\'\s?]+|logo\.png))')
         dependencies: list[tuple[str, int]] = []
-        assets_root = os.path.join(dist_root, 'assets')
-        for root, _, files in os.walk(assets_root):
-            for filename in files:
-                asset_path = os.path.realpath(os.path.join(root, filename))
-                with contextlib.suppress(OSError):
-                    dependencies.append((asset_path, os.stat(asset_path).st_mtime_ns))
-        build_version = max((mtime_ns for _, mtime_ns in dependencies), default=os.stat(file_path).st_mtime_ns)
 
         def replace(match):
             url = match.group(1)
-            relative = url.split('/assets/', 1)[-1] if '/assets/' in url else url.removeprefix('assets/')
-            asset_path = os.path.realpath(os.path.join(dist_root, 'assets', relative))
-            if not (asset_path == dist_root or asset_path.startswith(dist_root + os.sep)) or not os.path.isfile(asset_path):
+            relative = url.removeprefix('/web/').removeprefix('web/')
+            resource_path = os.path.realpath(os.path.join(dist_root, relative.replace('/', os.sep)))
+            if not resource_path.startswith(dist_root + os.sep) or not os.path.isfile(resource_path):
                 return url
-            return f'{url}?v={build_version}'
+            mtime_ns = os.stat(resource_path).st_mtime_ns
+            dependencies.append((resource_path, mtime_ns))
+            return f'{url}?v={mtime_ns}'
 
-        return asset_pattern.sub(replace, text).encode('utf-8'), tuple(dependencies)
+        return resource_pattern.sub(replace, text).encode('utf-8'), tuple(dependencies)
 
     def _versioned_script(file_path: str) -> tuple[bytes, tuple[tuple[str, int], ...]]:
         """给懒加载脚本的相对 import 也追加对应文件的修改时间。"""

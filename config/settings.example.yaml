@@ -41,6 +41,7 @@ embedded_qq:
   single_process: false                         # Windows 可选：合并 Chromium 子进程
   rss_target_mb: 400                            # Linux 单账号 RSS 目标；0 表示仅回收文件页
   swap_reclaim: true                            # QQ 在线且 Swap 充足时换出匿名闲置页
+  self_message_enabled: true                    # 是否接收自身消息回显（message_sent 事件）
   cgroup_helper: "/usr/local/sbin/elainaqq-cgroup"  # Linux 可选：受限 cgroup 辅助程序
   accounts: []                                  # 可选：启动时自动恢复的账号配置
 
@@ -57,15 +58,3 @@ logging:
 pip:
   auto_install: true                       # 自动安装模块/插件依赖
   mirror: ""                               # pip 镜像源
-
-# 智能开发助手插件（plugins/ai_dev）
-# 接入 OpenAI 兼容接口, 让 AI 自主编写/修改框架插件并提供 Web 面板 (/ai/)
-ai:
-  enabled: true
-  base_url: "https://api.openai.com/v1"    # OpenAI 兼容接口地址 (NewAPI 中转填中转站 /v1)
-  api_key: ""                              # 密钥; 留空则读取环境变量 AI_DEV_API_KEY / OPENAI_API_KEY
-  model: "gpt-4.1-nano"                    # 默认模型
-  temperature: 0.3
-  max_iterations: 12                       # 单轮对话最大工具调用迭代步数
-  request_timeout: 120                     # 单次请求超时(秒)
-  system_prompt: ""                        # 可选: 覆盖默认系统提示词

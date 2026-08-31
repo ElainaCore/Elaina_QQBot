@@ -113,6 +113,7 @@ def _get_hw_info() -> dict:
         bots_count = len(_common.connected_ids())
 
     return {
+        'platform': 'windows' if _IS_WINDOWS else 'linux',
         'cpu_percent': round(sys_cpu, 1),
         'framework_cpu_percent': round(cpu_pct, 1),
         'cpu_cores': cpu_cores,
@@ -220,8 +221,8 @@ def _dependency_info() -> dict:
     return {
         'python': {
             'version': platform.python_version(),
-            'required': '>= 3.10',
-            'status': 'ok' if sys.version_info >= (3, 10) else 'low',
+            'required': '>= 3.11',
+            'status': 'ok' if sys.version_info >= (3, 11) else 'low',
         },
         'dependencies': dependencies,
     }

@@ -44,6 +44,8 @@ def _avatar(qq: str) -> str:
 
 def _conn_type(ad, self_id: str) -> str:
     """依据适配器记录判断连接方式 (WebSocket 优先于 HTTP)"""
+    if self_id in ad.local_actions:
+        return '注入 QQ'
     if self_id in ad.websockets:
         return 'WebSocket'
     rec = ad.bots.get(self_id) or {}
@@ -75,9 +77,17 @@ async def handle_get_bots(request: web.Request):
             if self_id in embedded_ids:
                 continue
             conn_type = _conn_type(ad, self_id)
-            connected = self_id in ad.websockets or conn_type == 'WebSocket'
+            connected = self_id in ad.local_actions or self_id in ad.websockets or conn_type == 'WebSocket'
             info = await _login_info(self_id) if connected else {}
             name = info.get('nickname', '') or self_id
+            hook_status = next(
+                (
+                    status
+                    for status in getattr(_app, 'hook_bridges', lambda: [])()
+                    if str(status.get('uin') or '') == self_id
+                ),
+                {},
+            )
             bots.append(
                 {
                     'bot_qq': self_id,
@@ -86,6 +96,8 @@ async def handle_get_bots(request: web.Request):
                     'avatar': _avatar(self_id),
                     'connected': connected,
                     'connection_type': conn_type,
+                    'runtime_mode': conn_type,
+                    'pid': hook_status.get('pid'),
                     'enabled': True,
                 }
             )

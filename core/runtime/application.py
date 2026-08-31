@@ -17,6 +17,8 @@ from core.plugins.manager import PluginManager
 from core.protocols.onebot.adapter import OneBotAdapter
 from core.protocols.onebot.api import set_adapter, set_main_loop
 from core.protocols.onebot.connection import ConnectionManager
+from core.runtime.embedded.hook_bridge import HookBridge
+from core.runtime.embedded.injector import NativeQQInjector
 from core.runtime.embedded.manager import EmbeddedQQManager
 from core.runtime.event_dispatcher import EventDispatcher
 from core.runtime.extensions.hook import HookManager, bind_hook_manager
@@ -63,6 +65,9 @@ class Application:
         self._web_log_cb = None
         self._embedded_qq = None
         self._embedded_qq_start_task = None
+        self._process_injector = NativeQQInjector(self._base_dir)
+        self._hook_bridges: dict[int, HookBridge] = {}
+        self._hook_bot_ids: set[str] = set()
         self._event_dispatcher = None
         self._event_log_recorder = None
         self._last_queue_warning = 0.0
@@ -79,6 +84,101 @@ class Application:
     @property
     def embedded_qq(self):
         return self._embedded_qq
+
+    @property
+    def process_injector(self):
+        return self._process_injector
+
+    # -- Hook 接管桥 -------------------------------------------------------
+
+    async def attach_hook_bridge(self, pid: int) -> dict:
+        """接管一个已注入 DLL 的 QQ 主进程：连接管道并开始事件转发。"""
+        existing = self._hook_bridges.get(pid)
+        if existing and existing.status.control_open:
+            self._register_hook_local_bot(existing)
+            return {'pid': pid, 'attached': True, 'already': True, **existing.as_status()}
+        if existing:
+            await self._unregister_hook_local_bot(existing)
+            await existing.close()
+            self._hook_bridges.pop(pid, None)
+        bridge: HookBridge
+
+        async def ingest_hook_event(payload: dict) -> bool:
+            # Hook 事件的载荷不一定包含 self_id；使用握手得到的 QQ 号兜底，
+            # 确保事件分发与消息/事件日志都进入正确的账号分库。
+            return await self.ingest_event(payload, str(bridge.status.uin or ''))
+
+        bridge = HookBridge(pid, on_event=ingest_hook_event)
+        bridge.forward_self_messages = self._self_messages_enabled()
+        if not await bridge.connect():
+            await bridge.close()
+            return {'pid': pid, 'attached': False,
+                    'error': '控制/接收管道连接失败或 HELLO 超时'}
+        self._hook_bridges[pid] = bridge
+        self._register_hook_local_bot(bridge)
+        log.info('QQ(pid=%s) 接管桥已连接 (uin=%s logged_in=%s)',
+                 pid, bridge.status.uin or '?', bridge.status.logged_in)
+        return {'pid': pid, 'attached': True, **bridge.as_status()}
+
+    async def detach_hook_bridge(self, pid: int) -> dict:
+        bridge = self._hook_bridges.pop(pid, None)
+        if bridge is None:
+            return {'pid': pid, 'attached': False, 'error': '未接管该进程'}
+        await self._unregister_hook_local_bot(bridge)
+        await bridge.close()
+        log.info('QQ(pid=%s) 接管桥已断开', pid)
+        return {'pid': pid, 'attached': False}
+
+    def _self_messages_enabled(self) -> bool:
+        from core.foundation.config import cfg
+        return bool(cfg.get('settings', 'embedded_qq.self_message_enabled', True))
+
+    def _apply_hook_bridge_settings(self) -> None:
+        """把 self_message_enabled 热应用到所有存活接管桥（无需重启）。"""
+        enabled = self._self_messages_enabled()
+        for bridge in self._hook_bridges.values():
+            bridge.forward_self_messages = enabled
+
+    def _register_hook_local_bot(self, bridge: HookBridge) -> None:
+        """接管成功后把该 QQ 注册为本地动作账号（send_msg 等直接走接管桥）。"""
+        uin = str(bridge.status.uin or '').strip()
+        if not uin or not bridge.status.logged_in:
+            return
+        adapter = self._adapter
+        if adapter is None:
+            return
+        if uin in adapter.local_actions:
+            log.info('账号 %s 已有本地动作处理器，保留原有绑定', uin)
+            return
+
+        async def _handler(action: str, params: dict, _bridge=bridge):
+            result = await _bridge.handle_action(action, params)
+            if result is not None and result.get('error'):
+                from core.protocols.onebot.protocol import action_failed
+                return action_failed(result['error'])
+            if result is not None:
+                from core.protocols.onebot.protocol import action_ok
+                return action_ok(result)
+            return None
+
+        adapter.register_local_bot(uin, _handler)
+        self._hook_bot_ids.add(uin)
+        log.info('本地动作已绑定到接管桥: uin=%s (pid=%s)', uin, bridge.pid)
+
+    async def _unregister_hook_local_bot(self, bridge: HookBridge) -> None:
+        uin = str(bridge.status.uin or '').strip()
+        adapter = self._adapter
+        if adapter is None or not uin:
+            return
+        if uin in self._hook_bot_ids:
+            adapter.unregister_local_bot(uin)
+            self._hook_bot_ids.discard(uin)
+
+    def hook_bridge(self, pid: int) -> HookBridge | None:
+        return self._hook_bridges.get(pid)
+
+    def hook_bridges(self) -> list[dict]:
+        return [bridge.as_status() for bridge in self._hook_bridges.values()]
 
     async def reload_connections(self):
         """重新应用 OneBot 连接配置 (网络配置页面保存后调用)"""
@@ -257,6 +357,12 @@ class Application:
                 await self._embedded_qq_start_task
         if self._embedded_qq:
             await self._shutdown_step('内置 QQ 进程', self._embedded_qq.stop_all(), timeout=20)
+        if self._process_injector:
+            # 先断开全部接管桥，再回收注入器
+            for pid in list(self._hook_bridges):
+                with contextlib.suppress(Exception):
+                    await self.detach_hook_bridge(pid)
+            await self._shutdown_step('QQ 进程注入器', self._process_injector.close(), timeout=15)
         if self._event_dispatcher:
             await self._shutdown_step('事件调度器', self._event_dispatcher.shutdown(), timeout=15)
         if self._config_watcher:
@@ -411,6 +517,7 @@ class Application:
                 )
         current = self._static_setting_values()
         restart_required = [key for key, initial in self._static_settings.items() if current.get(key) != initial]
+        self._apply_hook_bridge_settings()
         if self._config_watcher:
             self._config_watcher.mark_current(name)
         return {'restart_required': restart_required}

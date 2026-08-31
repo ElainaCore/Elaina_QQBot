@@ -76,6 +76,7 @@ class EmbeddedBot:
     bot_id: str
     bridge_port: int = 0
     qq_version_key: str = ''
+    qq_path: str = ''
     uin: str = ''
     nickname: str = ''
     force_quick_login: bool = False
@@ -96,6 +97,7 @@ class EmbeddedBot:
             'bot_id': self.bot_id,
             'bridge_port': self.bridge_port,
             'qq_version_key': self.qq_version_key,
+            'qq_path': self.qq_path,
             'uin': self.uin,
             'nickname': self.nickname,
             'force_quick_login': self.force_quick_login,
@@ -216,6 +218,7 @@ class EmbeddedQQManager:
                 bot_id=bot_id,
                 bridge_port=self._parse_bridge_port(item.get('bridge_port')),
                 qq_version_key=str(item.get('qq_version_key') or item.get('version_key') or self._qq_manager.detect_platform() or ''),
+                qq_path=str(item.get('qq_path') or ''),
                 uin=str(item.get('uin') or ''),
                 nickname=str(item.get('nickname') or ''),
                 force_quick_login=bool(item.get('force_quick_login', False)),
@@ -297,6 +300,7 @@ class EmbeddedQQManager:
         uin: str = '',
         qq_version_key: str = '',
         force_quick_login: bool = False,
+        qq_path: str = '',
     ) -> EmbeddedBot:
         bot_id = str(bot_id or uin).strip()
         if not self._valid_id(bot_id):
@@ -310,6 +314,7 @@ class EmbeddedQQManager:
                 bot_id=bot_id,
                 bridge_port=0,
                 qq_version_key=self._normalize_version_key(qq_version_key),
+                qq_path=str(qq_path or ''),
                 uin=str(uin or ''),
                 nickname=str(nickname or ''),
                 force_quick_login=bool(force_quick_login),
@@ -324,6 +329,8 @@ class EmbeddedQQManager:
                     raise ValueError('请先停止机器人再切换 QQ 版本')
                 bot.qq_version_key = self._normalize_version_key(qq_version_key)
             bot.force_quick_login = bool(force_quick_login)
+            if qq_path:
+                bot.qq_path = str(qq_path)
         if not bot.qq_version_key:
             bot.qq_version_key = self._normalize_version_key()
         await self._save_accounts()
@@ -366,6 +373,13 @@ class EmbeddedQQManager:
         return candidate
 
     def _find_qq_path(self, bot: EmbeddedBot | None = None) -> Path | None:
+        if bot and bot.qq_path:
+            candidate = Path(bot.qq_path)
+            if candidate.is_dir():
+                names = ('QQ.exe', 'qq', 'QQ') if os.name == 'nt' else ('qq', 'QQ', 'QQ.exe')
+                candidate = next((candidate / name for name in names if (candidate / name).is_file()), candidate)
+            if candidate.is_file() and candidate.name.lower() in {'qq', 'qq.exe', 'linuxqq'}:
+                return candidate.resolve()
         if bot and bot.qq_version_key:
             candidate = self._qq_manager.get_qq_executable(bot.qq_version_key)
             return candidate.resolve() if candidate and candidate.is_file() else None
@@ -1623,6 +1637,7 @@ class EmbeddedQQManager:
                     'qq_version_key': bot.qq_version_key,
                     'qq_version': version_info.get('version', ''),
                     'qq_version_label': version_info.get('label', ''),
+                    'qq_path': str(self._find_qq_path(bot) or ''),
                     'force_quick_login': bot.force_quick_login,
                     'qq_installed': bool(self._find_qq_path(bot)),
                     'connection_type': 'Embedded QQ',

@@ -10,6 +10,7 @@ from web.tools._updater.handlers import (
     handle_set_custom_mirror,
     handle_start_update,
     handle_test_mirrors,
+    handle_upload_update,
     set_context,
 )
 
@@ -22,6 +23,7 @@ __all__ = [
     'handle_get_update_progress',
     'handle_get_mirrors',
     'handle_test_mirrors',
+    'handle_upload_update',
     'handle_set_custom_mirror',
     'handle_detect_environment',
 ]

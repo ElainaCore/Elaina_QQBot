@@ -17,6 +17,7 @@ from web.tools import (
     messages,
     onebot_conn,
     plugin_mgr,
+    processes,
     qq_versions,
     system,
     update,
@@ -48,6 +49,14 @@ def get_routes() -> list:
         web.post('/api/embedded/delete', _(bots.handle_delete_embedded_bot)),
         web.post('/api/embedded/qr/refresh', _(bots.handle_refresh_embedded_qr)),
         web.get('/api/embedded/status', _(bots.handle_get_embedded_status)),
+        web.get('/api/processes', _(processes.handle_get_processes)),
+        web.post('/api/processes/{pid}/load', _(processes.handle_load_process)),
+        web.post('/api/processes/{pid}/unload', _(processes.handle_unload_process)),
+        web.post('/api/processes/{pid}/refresh', _(processes.handle_refresh_process)),
+        # 兼容旧版 WebUI；attach 现在等价于直接注入，不会关闭或重启 QQ。
+        web.post('/api/processes/{pid}/attach', _(processes.handle_attach_process)),
+        web.post('/api/processes/{pid}/detach', _(processes.handle_detach_process)),
+        web.get('/api/processes/hook-status', _(processes.handle_hook_status)),
         web.post('/api/embedded/events', handle_embedded_event),
         web.get('/api/embedded/control/poll', handle_embedded_control_poll),
         web.post('/api/embedded/control/result', handle_embedded_control_result),
@@ -93,6 +102,7 @@ def get_routes() -> list:
         # ── 配置 ──
         web.get('/api/config', _(config_handler.handle_get_config)),
         web.post('/api/config/save', _(config_handler.handle_save_config)),
+        web.post('/api/config/visual', _(config_handler.handle_save_visual_config)),
         # ── OneBot 网络连接 ──
         web.get('/api/onebot/connections', _(onebot_conn.handle_get_connections)),
         web.post('/api/onebot/connections', _(onebot_conn.handle_save_connections)),
@@ -116,6 +126,7 @@ def get_routes() -> list:
         web.get('/api/update/mirrors', _(update.handle_get_mirrors)),
         web.get('/api/update/test-mirrors', _(update.handle_test_mirrors)),
         web.post('/api/update/mirror', _(update.handle_set_custom_mirror)),
+        web.post('/api/update/upload', _(update.handle_upload_update)),
         web.get('/api/update/environment', _(update.handle_detect_environment)),
         # ── 重启 ──
         web.post('/api/bot/restart', _(system.handle_restart)),
@@ -163,6 +174,7 @@ def set_context(app_instance, base_dir: str):
     database.set_context(app_instance, base_dir)
     messages.set_context(app_instance, base_dir)
     onebot_conn.set_context(app_instance)
+    processes.set_context(app_instance)
     qq_versions.set_context(app_instance)
     market.set_context(app_instance, base_dir)
     update.set_context(app_instance, base_dir)

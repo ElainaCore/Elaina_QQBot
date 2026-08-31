@@ -1,1 +1,0 @@
-import{N as e}from"./vue-core.js";import{n as t}from"./create-injection-key.js";import{u as n}from"./index.js";function r(){let r=e(n,null);return r===null&&t(`use-dialog`,`No outer <n-dialog-provider /> founded.`),r}export{r as t};

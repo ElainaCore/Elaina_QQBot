@@ -1,6 +1,7 @@
 """QQ 版本管理 Web API"""
 
 import asyncio
+import os
 import time
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from web.protocol import json_body
 
 _app = None
 _jobs: dict[str, dict] = {}
+_QQ_OFFICIAL_DOWNLOAD_URL = 'https://im.qq.com/index/#/'
 
 
 def _qq_error_response(exc: Exception):
@@ -48,6 +50,31 @@ def _sync_embedded_path(manager, version_key=None):
     return executable
 
 
+def _install_status(manager) -> dict:
+    status = manager.get_install_status()
+    if os.name == 'nt':
+        status = {
+            **status,
+            'install_strategy': 'official_website',
+            'official_download_url': _QQ_OFFICIAL_DOWNLOAD_URL,
+        }
+    return status
+
+
+def _windows_official_response(manager) -> web.Response | None:
+    if os.name != 'nt':
+        return None
+    return web.json_response(
+        {
+            'success': True,
+            'external': True,
+            'url': _QQ_OFFICIAL_DOWNLOAD_URL,
+            'message': '请前往 QQ 官网下载安装并登录，再从“添加接入”中选择要注入的 QQ 进程',
+            'status': _install_status(manager),
+        }
+    )
+
+
 async def _stop_embedded_qq(version_key=None):
     manager = getattr(_app, 'embedded_qq', None) or getattr(_app, 'embedded_manager', None)
     if manager and version_key and hasattr(manager, 'stop_version'):
@@ -67,7 +94,7 @@ async def handle_get_status(request: web.Request):
     """获取 QQ 安装状态"""
     manager = _manager()
     _sync_embedded_path(manager)
-    status = manager.get_install_status()
+    status = _install_status(manager)
     return web.json_response(
         {
             'success': True,
@@ -200,6 +227,8 @@ async def handle_get_progress(request: web.Request):
 async def handle_download_qq(request: web.Request):
     """下载 QQ 客户端"""
     try:
+        if response := _windows_official_response(_manager()):
+            return response
         body = await json_body(request)
         version_key = body.get('version_key')
 
@@ -225,6 +254,8 @@ async def handle_download_qq(request: web.Request):
 async def handle_install_qq(request: web.Request):
     """安装 QQ 客户端"""
     try:
+        if response := _windows_official_response(_manager()):
+            return response
         body = await json_body(request)
         version_key = body.get('version_key')
         auto_download = body.get('auto_download', True)
@@ -243,6 +274,16 @@ async def handle_install_qq(request: web.Request):
 async def handle_uninstall_qq(request: web.Request):
     """卸载框架管理的 QQ，不删除外部检测到的系统 QQ。"""
     try:
+        if os.name == 'nt':
+            return web.json_response(
+                {
+                    'success': False,
+                    'error': 'Windows QQ 由用户自行安装和卸载，框架不会删除系统程序',
+                    'url': _QQ_OFFICIAL_DOWNLOAD_URL,
+                    'status': _install_status(_manager()),
+                },
+                status=422,
+            )
         body = await json_body(request)
         version_key = body.get('version_key')
         await _stop_embedded_qq(version_key)
