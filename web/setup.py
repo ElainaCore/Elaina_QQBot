@@ -206,7 +206,7 @@ def _make_spa_handler(dist_dir: str):
         """为固定资源名追加各文件的修改时间，避免浏览器使用旧构建。"""
         with open(file_path, encoding='utf-8') as file:
             text = file.read()
-        resource_pattern = re.compile(r'((?:/web/)?(?:assets/[^"\'\s?]+|logo\.png))')
+        resource_pattern = re.compile(r'((?:/web/)?(?:assets/[^"\'\s?]+|logo\.png|favicon\.svg))')
         dependencies: list[tuple[str, int]] = []
 
         def replace(match):
