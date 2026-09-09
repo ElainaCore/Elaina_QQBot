@@ -23,7 +23,12 @@ async def handle_qlinux_accounts(request: web.Request) -> web.Response:
     mgr = _manager(request)
     if mgr is None:
         return error('QLinux 渠道未启用 (settings.qlinux.enabled)', status=404)
-    return ok({'accounts': mgr.list_accounts(), 'version': mgr_version(mgr)})
+    accounts = mgr.list_accounts()
+    if mgr._rpc is None or not mgr._rpc.alive:
+        # runner 未启动时异步拉起 (首启自动下载, 不阻塞响应)
+        import asyncio
+        asyncio.get_running_loop().create_task(mgr.ensure_started())
+    return ok(accounts=accounts, version=mgr_version(mgr))
 
 
 def mgr_version(mgr) -> str:
@@ -43,7 +48,7 @@ async def handle_qlinux_create(request: web.Request) -> web.Response:
     if bot_id in {a['bot_id'] for a in mgr.list_accounts()}:
         return error('账号 ID 已存在')
     acc = await mgr.create_account(bot_id)
-    return ok(acc, message='QLinux 账号已创建')
+    return ok(bot_id=acc.get('bot_id', bot_id), message='QLinux 账号已创建')
 
 
 async def handle_qlinux_login_qr(request: web.Request) -> web.Response:
@@ -86,7 +91,8 @@ async def handle_qlinux_qr(request: web.Request) -> web.Response:
     if not cache:
         return error('暂无二维码 (尚未发起扫码登录或已过期)')
     acc = next((a for a in mgr.list_accounts() if a['bot_id'] == bot_id), {})
-    return ok({**cache, 'status': acc.get('status', '')})
+    return ok(png_base64=cache.get('png_base64', ''), url=cache.get('url', ''),
+              status=acc.get('status', ''))
 
 
 async def handle_qlinux_submit(request: web.Request) -> web.Response:
@@ -107,7 +113,7 @@ async def handle_qlinux_submit(request: web.Request) -> web.Response:
             return error('type 必须是 captcha 或 sms')
     except Exception as e:  # noqa: BLE001
         return error(str(e))
-    return ok(result)
+    return ok(**(result or {}), message='验证码已提交')
 
 
 async def handle_qlinux_stop(request: web.Request) -> web.Response:
@@ -120,7 +126,7 @@ async def handle_qlinux_stop(request: web.Request) -> web.Response:
     if bot_id not in {a['bot_id'] for a in mgr.list_accounts()}:
         return error('账号不存在')
     result = await mgr.stop_account(bot_id)
-    return ok(result, message='账号已下线')
+    return ok(**(result or {}), message='账号已下线')
 
 
 async def handle_qlinux_delete(request: web.Request) -> web.Response:
@@ -133,4 +139,4 @@ async def handle_qlinux_delete(request: web.Request) -> web.Response:
     if bot_id not in {a['bot_id'] for a in mgr.list_accounts()}:
         return error('账号不存在')
     result = await mgr.delete_account(bot_id)
-    return ok(result, message='账号已删除')
+    return ok(**(result or {}), message='账号已删除')

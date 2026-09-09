@@ -149,9 +149,9 @@ async def handle_start_update(request: web.Request):
 
     updater = _get_updater()
 
-    # 设置自定义镜像
-    if body.get('mirror'):
-        await asyncio.to_thread(updater.set_custom_mirror, body['mirror'])
+    # 设置自定义镜像；空字符串用于清除固定线路并恢复自动选择。
+    if 'mirror' in body:
+        await asyncio.to_thread(updater.set_custom_mirror, body.get('mirror') or '')
 
     skip_backup = body.get('skip_backup', False)
     auto_restart = body.get('auto_restart', False)
@@ -177,7 +177,11 @@ async def handle_start_update(request: web.Request):
 async def handle_get_mirrors(request: web.Request):
     """获取镜像列表 (含缓存的测速结果)"""
     try:
-        from web.tools._updater.shared import GITHUB_FILE_MIRRORS, _load_mirror_cache
+        from web.tools._updater.shared import (
+            GITHUB_DIRECT_MIRROR,
+            GITHUB_FILE_MIRRORS,
+            _load_mirror_cache,
+        )
 
         updater = _get_updater()
         cached = await asyncio.to_thread(_load_mirror_cache)
@@ -186,6 +190,7 @@ async def handle_get_mirrors(request: web.Request):
                 'success': True,
                 'data': {
                     'mirrors': list(GITHUB_FILE_MIRRORS),
+                    'github_direct_mirror': GITHUB_DIRECT_MIRROR,
                     'fast_mirrors': cached,
                     'custom_mirror': updater.custom_mirror,
                 },
@@ -199,6 +204,8 @@ async def handle_test_mirrors(request: web.Request):
     """SSE 流式测速所有镜像, 每完成一个立即推送"""
     import json as _json
 
+    import aiohttp
+
     from web.tools._updater.mirror import _test_one_mirror, clear_mirror_cache
     from web.tools._updater.shared import GITHUB_FILE_MIRRORS
 
@@ -210,19 +217,36 @@ async def handle_test_mirrors(request: web.Request):
     await resp.prepare(request)
 
     all_results = []
-    tasks = {asyncio.ensure_future(_test_one_mirror(m, 3)): m for m in GITHUB_FILE_MIRRORS}
-    tasks[asyncio.ensure_future(_test_one_mirror('', 3))] = ''
-
-    pending = set(tasks.keys())
-    while pending:
-        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            result = task.result()
-            all_results.append(result)
-            try:
-                await resp.write(f'data: {_json.dumps(result, ensure_ascii=False)}\n\n'.encode())
-            except ConnectionResetError:
-                return resp
+    connector = aiohttp.TCPConnector(limit=16, limit_per_host=4, ttl_dns_cache=300)
+    tasks = set()
+    try:
+        async with aiohttp.ClientSession(
+            connector=connector,
+            headers={'User-Agent': 'ElainaQQ-Mirror-Test'},
+        ) as session:
+            tasks = {
+                asyncio.ensure_future(_test_one_mirror(session, mirror, 3))
+                for mirror in [*GITHUB_FILE_MIRRORS, '']
+            }
+            pending = set(tasks)
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    try:
+                        result = task.result()
+                    except Exception as error:  # noqa: BLE001 - 单个镜像失败不影响其他结果
+                        result = {'mirror': '', 'latency': 3, 'success': False, 'error': str(error)}
+                    all_results.append(result)
+                    try:
+                        await resp.write(f'data: {_json.dumps(result, ensure_ascii=False)}\n\n'.encode())
+                    except (ConnectionResetError, aiohttp.ClientConnectionError):
+                        return resp
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     # 保存测速结果到磁盘
     from web.tools._updater.shared import _save_mirror_cache

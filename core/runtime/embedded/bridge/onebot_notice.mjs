@@ -164,6 +164,14 @@ export function decodeSystemNotice(payload) {
   const msgContent = bytes(body, 2);
   const peerId = integer(response, 1);
 
+  if (type === 85 && msgContent.length) {
+    const joined = decodeProtoFields(msgContent);
+    return {
+      post_type: "notice", notice_type: "group_increase", sub_type: "invite",
+      group_id: integer(joined, 1), operator_uid: string(joined, 3),
+      self_joined: true,
+    };
+  }
   if (type === 33 && msgContent.length) {
     const change = decodeProtoFields(msgContent);
     return {

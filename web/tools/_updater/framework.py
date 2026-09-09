@@ -1,6 +1,7 @@
 """框架更新流程。"""
 
 import asyncio
+import contextlib
 import fnmatch
 import json
 import os
@@ -15,11 +16,12 @@ from pathlib import Path
 import aiohttp as _aiohttp
 
 from core.foundation.archives import safe_extractall
-from web.tools._updater.mirror import detect_environment
+from web.tools._updater.mirror import detect_environment, get_fast_mirrors
 from web.tools._updater.shared import (
     DEFAULT_SKIP,
     DEFAULT_WHITELIST,
     GITHUB_API_MIRRORS,
+    GITHUB_DIRECT_MIRROR,
     GITHUB_SHA_URL,
     _build_mirror_url,
     _load_mirror_cache,
@@ -195,6 +197,29 @@ class FrameworkUpdater:
             return _build_mirror_url(original_url, cached[0]['mirror'])
         return original_url
 
+    def _download_candidates(self, original_url):
+        """按用户选择、测速排名和直连顺序生成去重后的下载地址。"""
+        mirrors = []
+        if self.custom_mirror:
+            mirrors.append(self.custom_mirror)
+        else:
+            cached = _load_mirror_cache()
+            mirrors.extend(
+                item.get('mirror', '') if isinstance(item, dict) else item
+                for item in cached[:5]
+            )
+        urls = []
+        for mirror in mirrors:
+            if mirror == GITHUB_DIRECT_MIRROR:
+                continue
+            url = _build_mirror_url(original_url, mirror)
+            if url not in urls:
+                urls.append(url)
+        # 直连始终作为最后回退；移除缓存中的空镜像项，避免直连提前出现。
+        urls = [url for url in urls if url != original_url]
+        urls.append(original_url)
+        return urls
+
     # ==================== 检查更新 ====================
 
     async def _fetch_api(self, path=''):
@@ -261,51 +286,68 @@ class FrameworkUpdater:
     # ==================== 下载 ====================
 
     async def download_update(self, version):
+        zip_file = None
         try:
             if not re.fullmatch(r'[0-9a-fA-F]{7,40}', str(version or '')):
                 self._report('failed', '无效的更新版本', 0)
                 return None
             self._report('downloading', '正在选择最快镜像...', 5)
             original = GITHUB_SHA_URL.format(version=version)
-            url = await self._pick_download_url(original)
-            self._report('downloading', '下载中...', 8)
-
-            zip_file = self.base_dir / 'data' / 'temp_update' / f'{version}.zip'
-            await asyncio.to_thread(_prepare_download, zip_file)
-
+            if not self.custom_mirror:
+                try:
+                    await get_fast_mirrors()
+                except Exception as error:  # noqa: BLE001 - 测速失败不应阻断直连下载
+                    log.warning('镜像测速失败，将直接尝试下载地址: %s', error)
+            candidates = self._download_candidates(original)
             timeout = _aiohttp.ClientTimeout(total=180)
             headers = {'User-Agent': 'ElainaQQ/1.0'}
-            async with (
-                _aiohttp.ClientSession() as session,
-                session.get(
-                    url,
-                    headers=headers,
-                    timeout=timeout,
-                    allow_redirects=True,
-                ) as resp,
-            ):
-                resp.raise_for_status()
-                total = int(resp.headers.get('content-length', 0) or 0)
-                max_size = 512 * 1024 * 1024
-                if total > max_size:
-                    raise ValueError('更新包超过 512 MB 限制')
-                downloaded = 0
-                async for chunk in resp.content.iter_chunked(1024 * 1024):
-                    downloaded += len(chunk)
-                    if downloaded > max_size:
-                        raise ValueError('更新包超过 512 MB 限制')
-                    await asyncio.to_thread(_append_download, zip_file, chunk)
-                    if total > 0:
-                        pct = 10 + downloaded * 30 // total
-                        self._report(
-                            'downloading',
-                            f'下载中... {downloaded * 100 // total}%',
-                            pct,
-                        )
+            max_size = 512 * 1024 * 1024
+            last_error = None
+            zip_file = self.base_dir / 'data' / 'temp_update' / f'{version}.zip'
 
-            self._report('downloading', '下载完成', 40)
-            return str(zip_file)
+            async with _aiohttp.ClientSession() as session:
+                for index, url in enumerate(candidates):
+                    try:
+                        await asyncio.to_thread(_prepare_download, zip_file)
+                        label = 'GitHub 直连' if url == original else '镜像'
+                        self._report('downloading', f'正在通过{label}下载...', 8)
+                        async with session.get(
+                            url,
+                            headers=headers,
+                            timeout=timeout,
+                            allow_redirects=True,
+                        ) as resp:
+                            resp.raise_for_status()
+                            total = int(resp.headers.get('content-length', 0) or 0)
+                            if total > max_size:
+                                raise ValueError('更新包超过 512 MB 限制')
+                            downloaded = 0
+                            async for chunk in resp.content.iter_chunked(1024 * 1024):
+                                downloaded += len(chunk)
+                                if downloaded > max_size:
+                                    raise ValueError('更新包超过 512 MB 限制')
+                                await asyncio.to_thread(_append_download, zip_file, chunk)
+                                if total > 0:
+                                    pct = 10 + downloaded * 30 // total
+                                    self._report(
+                                        'downloading',
+                                        f'下载中... {downloaded * 100 // total}%',
+                                        pct,
+                                    )
+                        self._report('downloading', '下载完成', 40)
+                        return str(zip_file)
+                    except Exception as error:  # noqa: BLE001 - 逐地址回退
+                        last_error = error
+                        with contextlib.suppress(OSError):
+                            zip_file.unlink()
+                        if index + 1 < len(candidates):
+                            log.warning('更新下载失败，切换下一个地址: %s -> %s', url, error)
+
+            raise last_error or RuntimeError('没有可用的下载地址')
         except Exception as e:
+            if zip_file:
+                with contextlib.suppress(OSError):
+                    zip_file.unlink()
             self._report('failed', f'下载失败: {e}', 0)
             return None
 

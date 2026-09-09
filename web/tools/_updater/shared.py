@@ -10,6 +10,8 @@ GITHUB_REPO = 'ElainaCore/Elaina_QQBot'
 GITHUB_API_URL = f'https://api.github.com/repos/{GITHUB_REPO}'
 GITHUB_DOWNLOAD_URL = f'https://github.com/{GITHUB_REPO}/archive/main.zip'
 GITHUB_SHA_URL = f'https://codeload.github.com/{GITHUB_REPO}/zip/{{version}}'
+# 面板用的显式直连选项。空字符串仍保留给“自动选择”语义。
+GITHUB_DIRECT_MIRROR = '__github_direct__'
 
 # 代码托管接口代理（可代理接口请求）
 GITHUB_API_MIRRORS = [
@@ -114,7 +116,7 @@ def clear_mirror_cache():
 
 def _build_mirror_url(original_url, mirror):
     """拼接镜像 URL"""
-    if not mirror:
+    if not mirror or mirror == GITHUB_DIRECT_MIRROR:
         return original_url
     return mirror.rstrip('/') + '/' + original_url
 

@@ -5624,6 +5624,7 @@ class QQInstance {
       let memberUid = String(event.member_uid || "");
       const groupId = String(event.group_id || "");
       let operatorUid = String(event.operator_uid || "");
+      const selfJoined = event.self_joined === true;
       if (event.post_type === "request" && event.request_type === "group" && event.sub_type === "invite") {
         const inviterUid = String(event.inviter_uid || "");
         const invite = await this.takeGroupInviteArk(groupId, inviterUid);
@@ -5659,7 +5660,9 @@ class QQInstance {
           this.oneBotGroupInviteRequests.delete(this.oneBotGroupInviteRequests.keys().next().value);
         }
       }
-      if (event.notice_type === "group_increase" && !memberUid && groupId) {
+      if (selfJoined) {
+        event.user_id = Number(this.getSelfUin()) || this.getSelfUin() || 0;
+      } else if (event.notice_type === "group_increase" && !memberUid && groupId) {
         const candidate = await this.takeGroupIncreaseCandidate(groupId, operatorUid);
         if (candidate) {
           memberUid = String(candidate.memberUid || "");
@@ -5688,6 +5691,7 @@ class QQInstance {
       }
       delete event.member_uid;
       delete event.operator_uid;
+      delete event.self_joined;
       const rawPayload = Buffer.isBuffer(payload) || payload instanceof Uint8Array || Array.isArray(payload)
         ? Buffer.from(payload)
         : Buffer.from(stringifyJson(payload) || "");

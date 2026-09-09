@@ -31,34 +31,43 @@ log = logging.getLogger('ElainaQQ.qlinux')
 
 # ==================== 默认配置 ====================
 
-RUNNER_VERSION = 'v1.0.0'
-# 发布仓库: 用户可在配置中改 (先 fork 或自传 Releases 后改这里)
+RUNNER_VERSION = 'v1.0.1'
+# 发布仓库 (与框架更新同一镜像体系拉取)
 RUNNER_REPO = 'ElainaCore/lagrange-runner'
-# 下载镜像回退链 (与插件市场同一套)
-_MIRROR_PREFIXES = [
-    '',  # 官方直连优先
+
+# 镜像缓存为空时的兑底链 (与插件市场同源)
+_FALLBACK_MIRRORS = [
+    '',
     'https://ghproxy.cc/',
     'https://gh-proxy.com/',
     'https://gh.llkk.cc/',
+    'https://gh.idayer.com/',
 ]
 
 _DEFAULT_SIGN_SERVER = 'https://esign.linsur.cn/'
 
 
-def _default_runner_url() -> str:
-    """根据当前平台返回 runner 压缩包下载地址。"""
+def _runner_asset() -> str:
+    """根据当前系统返回 Releases 产物文件名。"""
     system = platform.system().lower()  # windows / linux / darwin
     if system == 'windows':
-        asset = f'lagrange-runner-{RUNNER_VERSION}-win-x64.zip'
-    elif system == 'linux':
-        asset = f'lagrange-runner-{RUNNER_VERSION}-linux-x64.tar.gz'
-    else:
-        raise RuntimeError(f'QLinux 渠道不支持当前平台: {system}')
-    return f'https://github.com/{RUNNER_REPO}/releases/download/{RUNNER_VERSION}/{asset}'
+        return f'lagrange-runner-{RUNNER_VERSION}-win-x64.zip'
+    if system == 'linux':
+        return f'lagrange-runner-{RUNNER_VERSION}-linux-x64.tar.gz'
+    raise RuntimeError(f'QLinux 渠道不支持当前平台: {system}')
+
+
+def _runner_base_url() -> str:
+    return f'https://github.com/{RUNNER_REPO}/releases/download/{RUNNER_VERSION}/{_runner_asset()}'
+
+
+# 兼容旧引用
+_default_runner_url = _runner_base_url
 
 
 def _runner_exe_name() -> str:
-    return 'runner-win.exe' if platform.system().lower() == 'windows' else 'runner-win'
+    """压缩包内统一叫 lagrange-runner (无扩展名 = Linux ELF; .exe = Windows)。"""
+    return 'lagrange-runner.exe' if platform.system().lower() == 'windows' else 'lagrange-runner'
 
 
 # ==================== Runner 下载器 ====================
@@ -89,15 +98,39 @@ class RunnerDownloader:
             await self._download_and_extract()
         return self.exe_path
 
+    async def _ranked_urls(self) -> list[str]:
+        """镜像 URL 列表: 复用框架更新器的测速缓存 (30 分钟磁盘缓存), 空则用兑底链。"""
+        base = _runner_base_url()
+        try:
+            from web.tools._updater.mirror import get_fast_mirrors
+            from web.tools._updater.shared import _build_mirror_url
+
+            cached = await get_fast_mirrors()  # [('mirror': prefix, ...)] 按延迟排序
+            urls = [
+                _build_mirror_url(base, m['mirror'] if isinstance(m, dict) else m)
+                for m in cached
+            ]
+        except Exception as e:  # noqa: BLE001 — 框架更新器不可用时兑底
+            log.warning('镜像测速不可用 (%s), 使用兑底镜像链', e)
+            urls = []
+        for prefix in _FALLBACK_MIRRORS:
+            u = (prefix + base) if prefix else base
+            if u not in urls:
+                urls.append(u)
+        # 官方直连永远在末尾兜底 (测速链可能已含直连选项)
+        if base not in urls:
+            urls.append(base)
+        return urls
+
     async def _download_and_extract(self) -> None:
-        url = _default_runner_url()
-        log.info('QLinux runner 不存在, 开始下载: %s', url)
-        archive_path = self._bin_dir / ('runner-pkg.zip' if url.endswith('.zip') else 'runner-pkg.tar.gz')
+        base_url = _runner_base_url()
+        urls = await self._ranked_urls()
+        log.info('QLinux runner 不存在, 开始下载: %s (共 %d 个候选源)', base_url, len(urls))
+        archive_path = self._bin_dir / ('runner-pkg.zip' if base_url.endswith('.zip') else 'runner-pkg.tar.gz')
         self._bin_dir.mkdir(parents=True, exist_ok=True)
 
         last_err: Exception | None = None
-        for prefix in _MIRROR_PREFIXES:
-            final_url = prefix + url if prefix else url
+        for final_url in urls:
             try:
                 await self._download(final_url, archive_path)
                 self._extract(archive_path)
@@ -105,7 +138,7 @@ class RunnerDownloader:
                 log.info('QLinux runner 下载完成: %s', self.exe_path)
                 return
             except Exception as e:  # noqa: BLE001 — 逐镜像尝试
-                log.warning('下载失败 (%s): %s', final_url or '官方', e)
+                log.warning('下载失败 (%s): %s', final_url, e)
                 last_err = e
 
         raise RuntimeError(f'QLinux runner 下载失败 (所有镜像均不可用): {last_err}')

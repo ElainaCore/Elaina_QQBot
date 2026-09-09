@@ -65,6 +65,7 @@ PKG_PRIVATE_RECORD = 208
 PKG_PRIVATE_FILE = 529
 
 MESSAGE_EVENTS = frozenset({82, 166, 141, 208, 529})
+SYSTEM_EVENTS = frozenset({PKG_GROUP_SELF_JOINED, PKG_GROUP_INVITE})
 
 EVENT_DISPATCHER = Callable[[dict], Awaitable[None]]
 
@@ -228,7 +229,8 @@ class HookBridge:
             payload = self._build_event(ctx)
             if payload is None:
                 continue
-            self._remember(ctx, payload)
+            if payload.get('post_type') in ('message', 'message_sent'):
+                self._remember(ctx, payload)
             if self.on_event:
                 task = asyncio.get_running_loop().create_task(self._dispatch(payload))
                 self._dispatch_tasks.add(task)
@@ -282,6 +284,8 @@ class HookBridge:
             log.exception('QQ 事件分发失败')
 
     def _build_event(self, ctx: msgpush.MsgContext) -> dict[str, Any] | None:
+        if ctx.msg_type in SYSTEM_EVENTS:
+            return self._event_system(ctx)
         if ctx.msg_type not in MESSAGE_EVENTS:
             return None
         if ctx.msg_type in (PKG_GROUP_MESSAGE,):
@@ -378,6 +382,51 @@ class HookBridge:
         if is_self and peer and peer != ctx.self_uin:
             payload['target_id'] = peer
         return payload
+
+    def _event_system(self, ctx: msgpush.MsgContext) -> dict[str, Any] | None:
+        """Convert QQNT group system packets into standard OneBot events.
+
+        The system event payload is stored in MessageBody.msgContent.  In
+        particular, PkgType 85 is emitted when the current robot is invited
+        into a group and must become group_increase for group-management
+        plugins to see it.
+        """
+        content = msgpush.pb_bytes(ctx.body, 2)
+        group_id = msgpush.pb_int(content, 1, ctx.group_uin)
+        if not group_id:
+            log.warning('忽略缺少群号的系统包 type=%s seq=%s', ctx.msg_type, ctx.sequence)
+            return None
+
+        if ctx.msg_type == PKG_GROUP_SELF_JOINED:
+            operator_uid = msgpush.pb_str(content, 3)
+            return {
+                'post_type': 'notice',
+                'notice_type': 'group_increase',
+                'sub_type': 'invite',
+                'self_id': str(ctx.self_uin),
+                'time': self._common_time(ctx),
+                'group_id': group_id,
+                'user_id': ctx.self_uin,
+                'operator_id': ctx.from_uin if not operator_uid else 0,
+                'operator_uid': operator_uid,
+                'raw_pb': self._raw_pb(ctx),
+            }
+
+        if ctx.msg_type == PKG_GROUP_INVITE:
+            return {
+                'post_type': 'request',
+                'request_type': 'group',
+                'sub_type': 'invite',
+                'self_id': str(ctx.self_uin),
+                'time': self._common_time(ctx),
+                'group_id': group_id,
+                'user_id': ctx.from_uin,
+                'comment': '',
+                'flag': str(ctx.sequence or ctx.msg_id),
+                'raw_pb': self._raw_pb(ctx),
+            }
+
+        return None
 
     _SEGMENT_MAP = {
         'text': ('text', lambda d: {'text': d.get('text', '')}),
