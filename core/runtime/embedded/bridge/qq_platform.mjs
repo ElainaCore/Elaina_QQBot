@@ -141,13 +141,7 @@ export function getQQInfo(execPath) {
 }
 export function buildQQInfo(execPath, version) {
   if (os.platform() === "win32" && !WINDOWS_QQ_APPID_TABLE[version]) {
-    // Hook 启动模式（windows_hook_launch）允许未知版本：从 major.node 读 AppID，
-    // QUA 用通用格式拼。QQNT.dll 侧的签名校验已在副本中被跳过。
-    const hookLaunch = String(process.env.ELAINAQQ_WINDOWS_HOOK_LAUNCH || "") === "1";
-    if (!hookLaunch) {
-      throw new Error(`当前 Windows QQ 版本 ${version} 暂不兼容，无法加载`);
-    }
-    console.log(`[QQ信息] 版本 ${version} 不在兼容表内，Hook 启动模式回退到通用 AppID/QUA`);
+    throw new Error(`当前 Windows QQ 版本 ${version} 暂不兼容，无法启动 HookQQ`);
   }
   const buildVersion = version.split("-")[1] || "";
   let appid;

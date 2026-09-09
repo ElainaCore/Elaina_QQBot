@@ -52,9 +52,10 @@ def get_routes() -> list:
         web.get('/api/embedded/status', _(bots.handle_get_embedded_status)),
         web.get('/api/processes', _(processes.handle_get_processes)),
         web.post('/api/processes/{pid}/load', _(processes.handle_load_process)),
+        web.post('/api/processes/{pid}/inject', _(processes.handle_inject_process)),
         web.post('/api/processes/{pid}/unload', _(processes.handle_unload_process)),
         web.post('/api/processes/{pid}/refresh', _(processes.handle_refresh_process)),
-        # 兼容旧版 WebUI；attach 现在等价于直接注入，不会关闭或重启 QQ。
+        # 兼容旧版 WebUI；attach 是用户触发的“QQ 注入”，不会启动或重启 QQ。
         web.post('/api/processes/{pid}/attach', _(processes.handle_attach_process)),
         web.post('/api/processes/{pid}/detach', _(processes.handle_detach_process)),
         web.get('/api/processes/hook-status', _(processes.handle_hook_status)),

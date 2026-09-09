@@ -81,14 +81,7 @@ class QQLauncher:
     def validate_windows_version(self) -> str:
         version = self.windows_version()
         if version not in self.windows_supported_versions():
-            # Windows Hook 启动模式下，未知版本仍允许启动：loader 会在 wrapper.node
-            # 加载时拉起内置运行时，不依赖 appid 表；真正不兼容的部分会在运行时暴露。
-            from core.foundation.config import cfg
-
-            if bool(cfg.get('settings', 'embedded_qq.windows_hook_launch', False)):
-                log.warning('当前 Windows QQ 版本 %s 不在兼容表内，已按 Hook 启动模式继续', version)
-            else:
-                raise RuntimeError(f'当前 Windows QQ 版本 {version} 暂不兼容，无法启动')
+            raise RuntimeError(f'当前 Windows QQ 版本 {version} 暂不兼容，无法启动 HookQQ')
         return version
 
     def app_dir(self) -> Path:

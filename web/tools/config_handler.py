@@ -43,7 +43,6 @@ def _public_settings(parsed: dict) -> dict:
     if not isinstance(embedded, dict):
         result['embedded_qq'] = embedded = {}
     embedded.setdefault('self_message_enabled', True)
-    embedded.setdefault('inject_enhanced', False)
     embedded.setdefault('windows_hook_launch', False)
     return result
 
@@ -60,7 +59,7 @@ def _set_path(target: dict, path: str, value):
         'server': {'host', 'port'},
         'web': {'trust_forwarded_headers', 'framework_name', 'favicon_url'},
         'owner': {'ids'},
-        'embedded_qq': {'enabled', 'bridge_port_start', 'command', 'qq_path', 'windows_hook_launch', 'packet_backend', 'packet_verbose', 'packet_o3_hook', 'data_dir', 'headless', 'single_process', 'rss_target_mb', 'swap_reclaim', 'self_message_enabled', 'inject_enhanced'},
+        'embedded_qq': {'enabled', 'bridge_port_start', 'command', 'qq_path', 'windows_hook_launch', 'packet_backend', 'packet_verbose', 'packet_o3_hook', 'data_dir', 'headless', 'single_process', 'rss_target_mb', 'swap_reclaim', 'self_message_enabled'},
         'logging': {'dir', 'insert_interval', 'max_batch_size', 'max_queue_entries', 'retention_days', 'wal_mode'},
         'pip': {'auto_install', 'mirror'},
     }
@@ -76,7 +75,6 @@ def _set_path(target: dict, path: str, value):
         ('embedded_qq', 'single_process'),
         ('embedded_qq', 'swap_reclaim'),
         ('embedded_qq', 'self_message_enabled'),
-        ('embedded_qq', 'inject_enhanced'),
         ('embedded_qq', 'windows_hook_launch'),
         ('logging', 'wal_mode'),
         ('pip', 'auto_install'),

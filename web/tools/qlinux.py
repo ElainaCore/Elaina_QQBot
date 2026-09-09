@@ -92,7 +92,8 @@ async def handle_qlinux_qr(request: web.Request) -> web.Response:
         return error('暂无二维码 (尚未发起扫码登录或已过期)')
     acc = next((a for a in mgr.list_accounts() if a['bot_id'] == bot_id), {})
     return ok(png_base64=cache.get('png_base64', ''), url=cache.get('url', ''),
-              status=acc.get('status', ''))
+              status=acc.get('status', ''), state=acc.get('last_state'),
+              error=acc.get('last_error'))
 
 
 async def handle_qlinux_submit(request: web.Request) -> web.Response:

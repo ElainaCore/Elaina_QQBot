@@ -26,7 +26,7 @@ embedded_qq:
   bridge_port_start: 30010                     # 账号服务端口起点，后续账号依次递增
   command: ""                                  # 可选兼容启动命令；留空使用内置启动器
   qq_path: ""                                  # QQ.exe/qq 路径，留空自动探测
-  windows_hook_launch: false                   # Windows 下允许 Hook 启动未知版本 QQ（loader 劫持）
+  windows_hook_launch: false                   # Windows 内置 HookQQ；开启后才在框架启动时校验版本并恢复账号
   packet_backend: "auto"                       # PB 原始发包后端；auto 自动匹配 QQ 精确版本
   packet_verbose: false                         # 输出原始包原生 Hook 详细日志
   packet_o3_hook: false                         # 原始包事件同时启用 O3 Hook 模式

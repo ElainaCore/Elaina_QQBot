@@ -361,6 +361,7 @@ class FrameworkUpdater:
             backup_file = backup_dir / f'backup_{self.current_version}_{ts}.zip'
 
             # 读取日志目录名 (默认 'log')
+            _s = {}
             try:
                 import yaml
 
@@ -372,19 +373,87 @@ class FrameworkUpdater:
             log_prefix = f'data/{log_dir_name}'
             log_prefix_win = f'data\\{log_dir_name}'
 
-            skip_prefixes = (
+            # 内置 QQ 的客户端/账号运行数据体积较大且可由 QQ 自身重新生成，
+            # 更新备份不应把它们打进压缩包。data_dir 支持相对项目目录和绝对路径；
+            # 只有位于项目目录内的路径才需要加入本次遍历的排除项。
+            embedded_data_prefix = ''
+            try:
+                embedded_raw = str((_s.get('embedded_qq') or {}).get('data_dir', 'data/qq') or '').strip()
+                if embedded_raw:
+                    embedded_path = Path(embedded_raw).expanduser()
+                    if not embedded_path.is_absolute():
+                        embedded_path = self.base_dir / embedded_path
+                    embedded_path = embedded_path.resolve()
+                    base_path = self.base_dir.resolve()
+                    try:
+                        embedded_data_prefix = embedded_path.relative_to(base_path).as_posix().strip('/')
+                    except ValueError:
+                        # 绝对路径位于项目目录外，当前备份遍历不到它。
+                        embedded_data_prefix = ''
+            except Exception:
+                embedded_data_prefix = 'data/qq'
+
+            skip_prefixes = [
                 'plugins',
                 'modules',
+                # 本地环境、调试归档和可重新生成的构建目录不属于框架备份内容。
+                '.venv',
+                'venv',
+                '.opensquilla',
+                '.fetch',
+                '.bootstrap',
+                'archive_pc_grab',
+                'memory',
+                'build',
+                'dist',
+                'htmlcov',
+                '.mypy_cache',
+                '.ruff_cache',
+                '.pytest_cache',
+                '.coverage',
                 'data/backup',
                 'data/temp_update',
                 'data/media',
+                'data/qlinux/bin',
+                'data/qlinux/e2e-qr.png',
                 'data\\backup',
                 'data\\temp_update',
                 'data\\media',
+                'data\\qlinux\\bin',
+                'data\\qlinux\\e2e-qr.png',
                 log_prefix,
                 log_prefix_win,
-            )
+            ]
+            if embedded_data_prefix:
+                skip_prefixes.append(embedded_data_prefix)
+            skip_prefixes = tuple(item.replace('\\', '/').strip('/') for item in skip_prefixes if item)
             skip_contains = ('.git', '__pycache__', 'node_modules')
+            skip_patterns = (
+                '*.log',
+                '*.tmp',
+                '*.temp',
+                '*.bak',
+                '*.pyc',
+                '*.pyo',
+                '*.dmp',
+                '*.pcap',
+                '*.db-shm',
+                '*.db-wal',
+                '.venv.backup-*',
+                '.venv.failed-*',
+                'tmp_*',
+            )
+
+            def is_skipped(path):
+                normalized = str(path).replace('\\', '/').strip('./')
+                basename = os.path.basename(normalized)
+                return any(
+                    normalized == prefix or normalized.startswith(prefix + '/')
+                    for prefix in skip_prefixes
+                ) or any(value in normalized for value in skip_contains) or any(
+                    fnmatch.fnmatch(normalized, pattern) or fnmatch.fnmatch(basename, pattern)
+                    for pattern in skip_patterns
+                )
 
             # 日志目录中仅备份的文件 (每个 bot_qq 子目录下的)
             log_keep_names = frozenset({'data.db', 'dau.db'})
@@ -392,13 +461,17 @@ class FrameworkUpdater:
             with zipfile.ZipFile(backup_file, 'w', zipfile.ZIP_DEFLATED) as zf:
                 for root, dirs, files in os.walk(self.base_dir):
                     rel = os.path.relpath(root, self.base_dir)
-                    if any(rel.startswith(p) for p in skip_prefixes) or any(s in rel for s in skip_contains):
+                    if is_skipped(rel):
                         dirs[:] = []
                         continue
-                    dirs[:] = [d for d in dirs if not any(os.path.relpath(os.path.join(root, d), self.base_dir).startswith(p) for p in skip_prefixes)]
+                    dirs[:] = [
+                        d
+                        for d in dirs
+                        if not is_skipped(os.path.relpath(os.path.join(root, d), self.base_dir))
+                    ]
                     for fname in files:
                         fp = os.path.join(root, fname)
-                        if not any(s in fp for s in skip_contains):
+                        if not is_skipped(os.path.relpath(fp, self.base_dir)):
                             zf.write(fp, os.path.relpath(fp, self.base_dir))
 
                 # 单独收集日志目录中的 data.db / dau.db

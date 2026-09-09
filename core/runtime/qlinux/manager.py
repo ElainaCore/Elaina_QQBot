@@ -37,6 +37,9 @@ class QLinuxManager:
         self._rpc: RunnerRPC | None = None
         self._downloader: RunnerDownloader | None = None
         self._starting = False
+        # 并发请求 (例如账号列表触发后台启动后立即点击扫码) 共享同一次启动，
+        # 避免后续请求在 runner 尚未创建时继续执行。
+        self._start_task: asyncio.Task | None = None
         self._login_waits: dict[str, asyncio.Future] = {}  # bot_id -> 登录结果等待
         self._registered_uins: set[str] = set()
         self._load_accounts()
@@ -79,8 +82,25 @@ class QLinuxManager:
         """启动 runner (如未运行); 二进制缺失自动走 Releases 下载。"""
         if self._rpc and self._rpc.alive:
             return
-        if self._starting:
+
+        # 不能在 _starting 时直接返回: Web 请求可能紧接着访问 _rpc，
+        # 造成断言失败并被包装成“服务器内部错误”。
+        existing_task = self._start_task
+        if existing_task and not existing_task.done():
+            await asyncio.shield(existing_task)
             return
+
+        loop = asyncio.get_running_loop()
+        start_task = loop.create_task(self._start_runner(), name='qlinux-runner-start')
+        self._start_task = start_task
+        try:
+            await asyncio.shield(start_task)
+        finally:
+            if self._start_task is start_task and start_task.done():
+                self._start_task = None
+
+    async def _start_runner(self) -> None:
+        """执行一次 runner 启动；由 ensure_started 统一复用和等待。"""
         self._starting = True
         try:
             self._downloader = RunnerDownloader(self._bin_dir)
@@ -116,13 +136,27 @@ class QLinuxManager:
 
         # 登录状态机
         if etype == 'login.result':
+            state = event.get('state')
+            error = event.get('error')
+            if not error:
+                error = {
+                    235: 'QQ 拒绝登录：Linux 协议版本过低',
+                    237: 'QQ 拒绝登录：设备环境风险（请先用官方 QQ 完成一次安全验证）',
+                }.get(state)
             acc = self._accounts.get(bot_id)
             if acc:
                 acc['status'] = 'online' if event.get('success') else 'login_failed'
+                acc['last_state'] = state
+                if event.get('success'):
+                    acc.pop('last_error', None)
+                else:
+                    acc['last_error'] = error or '未知登录错误'
                 self._save_accounts()
             fut = self._login_waits.pop(bot_id, None)
             if fut and not fut.done():
-                fut.set_result({'success': event.get('success'), 'error': event.get('error')})
+                fut.set_result({'success': event.get('success'),
+                                'state': state,
+                                'error': error})
             return
         if etype == 'bot.online':
             acc = self._accounts.get(bot_id)
@@ -194,9 +228,13 @@ class QLinuxManager:
         acc = self._accounts[bot_id]
         acc['status'] = 'waiting_scan'
         self._save_accounts()
-        result = await self._rpc.call('bot.login.qr', {'bot_id': bot_id}, timeout=10)
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._login_waits[bot_id] = fut
+        try:
+            result = await self._rpc.call('bot.login.qr', {'bot_id': bot_id}, timeout=10)
+        except Exception:
+            self._login_waits.pop(bot_id, None)
+            raise
         return result
 
     async def login_password(self, bot_id: str, uin: int, password: str) -> dict:
@@ -209,11 +247,15 @@ class QLinuxManager:
         acc['uin'] = str(uin)
         acc['status'] = 'password_login'
         self._save_accounts()
-        result = await self._rpc.call(
-            'bot.login.password', {'bot_id': bot_id, 'uin': uin, 'password': password},
-            timeout=15)
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._login_waits[bot_id] = fut
+        try:
+            result = await self._rpc.call(
+                'bot.login.password', {'bot_id': bot_id, 'uin': uin, 'password': password},
+                timeout=15)
+        except Exception:
+            self._login_waits.pop(bot_id, None)
+            raise
         return result
 
     async def submit_captcha(self, bot_id: str, ticket: str, randstr: str = '') -> dict:

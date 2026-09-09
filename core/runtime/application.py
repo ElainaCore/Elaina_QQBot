@@ -6,7 +6,6 @@ import copy
 import gc
 import os
 import signal
-import subprocess
 from pathlib import Path
 
 import psutil
@@ -72,6 +71,7 @@ class Application:
         self._process_injector = NativeQQInjector(self._base_dir)
         self._hook_bridges: dict[int, HookBridge] = {}
         self._hook_bot_ids: set[str] = set()
+        self._process_injector.register_before_unload(self.detach_hook_bridge)
         self._event_dispatcher = None
         self._event_log_recorder = None
         self._last_queue_warning = 0.0
@@ -100,101 +100,12 @@ class Application:
 
     # -- QQ 进程连接 -------------------------------------------------------
 
-    async def ensure_qq_enhanced_restart(self, pid: int) -> dict:
-        """在需要时重启 QQ 进程以完成连接准备。
-
-        仅当 embedded_qq.inject_enhanced 开启时生效。返回
-        {'pid': 最终 pid, 'restarted': bool, 'error': 可选错误}。
-        """
-        if os.name != 'nt':
-            return {'pid': pid, 'restarted': False}
-        if not bool(cfg.get('settings', 'embedded_qq.inject_enhanced', False)):
-            return {'pid': pid, 'restarted': False}
-        try:
-            process = psutil.Process(pid)
-            if '--remote-debugging-port' in ' '.join(process.cmdline() or []):
-                return {'pid': pid, 'restarted': False}
-            exe = str(process.exe() or '')
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as exc:
-            return {'pid': pid, 'restarted': False,
-                    'error': '无法读取 QQ 进程信息'}
-        if not exe or not exe.lower().endswith('.exe'):
-            return {'pid': pid, 'restarted': False,
-                    'error': '无法确定 QQ 可执行路径'}
-        # 记住路径，供冷启动复用
-        if not cfg.get('settings', 'embedded_qq.qq_path', ''):
-            cfg.set_value('settings', 'embedded_qq.qq_path', exe)
-        log.info('QQ 连接准备：重启进程 pid=%s', pid)
-        parent = process.parent()
-        try:
-            for child in (process.children(recursive=True) if parent is None
-                          else process.children(recursive=True)):
-                child.kill()
-            process.kill()
-        except psutil.NoSuchProcess:
-            pass
-        try:
-            process.wait(timeout=15)
-        except psutil.TimeoutExpired:
-            try:
-                process.kill()
-                process.wait(timeout=5)
-            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
-                pass
-        await asyncio.sleep(1.5)
-        args = [exe, '--remote-debugging-port=9222',
-                '--remote-allow-origins=*', '--inspect=9223', '/background']
-        try:
-            subprocess.Popen(
-                args, cwd=str(Path(exe).parent),
-                creationflags=getattr(subprocess, 'DETACHED_PROCESS', 0)
-                | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0),
-            )
-        except OSError as exc:
-            return {'pid': pid, 'restarted': False,
-                    'error': 'QQ 重启失败，请稍后重试'}
-        new_pid = await self._wait_new_qq_pid(exe, old_pid=pid, timeout=60)
-        if new_pid is None:
-            return {'pid': pid, 'restarted': True,
-                    'error': 'QQ 已重启但未检测到可用进程'}
-        await self._wait_qq_ready(new_pid, timeout=90)
-        log.info('QQ 连接准备完成 (pid=%s -> %s)', pid, new_pid)
-        return {'pid': new_pid, 'restarted': True}
-
-    async def _wait_new_qq_pid(self, exe: str, *, old_pid: int, timeout: float):
-        import time as _time
-        deadline = _time.monotonic() + timeout
-        exe_lower = exe.lower()
-        while _time.monotonic() < deadline:
-            await asyncio.sleep(1.0)
-            for proc in psutil.process_iter(['pid', 'name', 'exe']):
-                try:
-                    if int(proc.info['pid']) == old_pid:
-                        continue
-                    name = str(proc.info.get('name') or '')
-                    pexe = str(proc.info.get('exe') or '')
-                    if name.lower() in {'qq', 'qq.exe'} and pexe.lower() == exe_lower:
-                        p = psutil.Process(int(proc.info['pid']))
-                        if '--remote-debugging-port' in ' '.join(p.cmdline() or []):
-                            return int(proc.info['pid'])
-                except (psutil.NoSuchProcess, psutil.AccessDenied,
-                        psutil.ZombieProcess, ValueError):
-                    continue
-        return None
-
-    async def _wait_qq_ready(self, pid: int, *, timeout: float) -> None:
-        """等待 QQ 启动就绪：进程存活且带调试参数。登录由用户完成（自动登录无需操作）。"""
-        import time as _time
-        deadline = _time.monotonic() + timeout
-        while _time.monotonic() < deadline:
-            await asyncio.sleep(2.0)
-            try:
-                proc = psutil.Process(pid)
-                cmdline = ' '.join(proc.cmdline() or [])
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                return  # 进程没了，交给上层报错
-            if '--remote-debugging-port' not in cmdline:
-                return
+    async def prune_hook_bridges(self) -> None:
+        """清理 QQ 已退出但管道尚未来得及上报断开的临时接入。"""
+        for pid, bridge in list(self._hook_bridges.items()):
+            if not psutil.pid_exists(pid) or not bridge.status.control_open:
+                with contextlib.suppress(Exception):
+                    await self.detach_hook_bridge(pid)
 
     async def attach_hook_bridge(self, pid: int) -> dict:
         """连接一个已登录的 QQ 主进程并开始事件转发。"""
@@ -218,8 +129,18 @@ class Application:
             await self.embedded_qq.dispatch_hook_red_packet(
                 str(bridge.status.uin or ''), packet)
 
+        async def on_hook_disconnect() -> None:
+            # QQ 退出后，注入账号不再是有效接入；清理本地动作注册，
+            # 让 Web 面板中的账号列表同步消失。
+            current = self._hook_bridges.get(pid)
+            if current is bridge:
+                self._hook_bridges.pop(pid, None)
+                await self._unregister_hook_local_bot(bridge)
+                log.info('QQ(pid=%s) 已退出，注入账号接入已清理', pid)
+
         bridge = HookBridge(pid, on_event=ingest_hook_event,
-                            on_red_packet=ingest_hook_red_packet)
+                            on_red_packet=ingest_hook_red_packet,
+                            on_disconnect=on_hook_disconnect)
         bridge.forward_self_messages = self._self_messages_enabled()
         if not await bridge.connect():
             await bridge.close()
@@ -397,10 +318,12 @@ class Application:
         await self._connection_manager.start()
 
         # 8.6) 内置 QQ 运行时。关闭时由 shutdown 统一回收。
-        if self._embedded_qq.enabled:
+        if self._embedded_qq.enabled and self._embedded_qq.autostart:
             log.info('内置 QQ 运行时已启用')
             self._embedded_qq_start_task = asyncio.create_task(self._embedded_qq.start_enabled(), name='embedded-qq-autostart')
             self._embedded_qq_start_task.add_done_callback(self._report_embedded_start_failure)
+        elif self._embedded_qq.enabled:
+            log.info('Windows 普通注入 QQ 模式：跳过内置 QQ 自动启动与版本检查')
 
         # 8.7) QLinux (Lagrange) 渠道 — 拉起 runner 并恢复已有账号
         if self._qlinux_manager:
@@ -611,6 +534,7 @@ class Application:
             'embedded_qq.bridge_port_start': snapshot('embedded_qq.bridge_port_start', 30010),
             'embedded_qq.command': snapshot('embedded_qq.command', ''),
             'embedded_qq.qq_path': snapshot('embedded_qq.qq_path', ''),
+            'embedded_qq.windows_hook_launch': snapshot('embedded_qq.windows_hook_launch', False),
             'embedded_qq.packet_backend': snapshot('embedded_qq.packet_backend', 'auto'),
             'embedded_qq.packet_verbose': snapshot('embedded_qq.packet_verbose', False),
             'embedded_qq.packet_o3_hook': snapshot('embedded_qq.packet_o3_hook', False),

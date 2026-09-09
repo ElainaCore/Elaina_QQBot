@@ -68,6 +68,7 @@ MESSAGE_EVENTS = frozenset({82, 166, 141, 208, 529})
 SYSTEM_EVENTS = frozenset({PKG_GROUP_SELF_JOINED, PKG_GROUP_INVITE})
 
 EVENT_DISPATCHER = Callable[[dict], Awaitable[None]]
+DISCONNECT_HANDLER = Callable[[], Awaitable[None] | None]
 
 
 def hash_message_id(sequence: int, session_id: int, event_name: str) -> int:
@@ -105,10 +106,11 @@ class HookBridge:
     """接管一条已注入 DLL 的 QQ 主进程。"""
 
     def __init__(self, pid: int, on_event: EVENT_DISPATCHER | None = None,
-                 on_red_packet=None) -> None:
+                 on_red_packet=None, on_disconnect: DISCONNECT_HANDLER | None = None) -> None:
         self.pid = pid
         self.on_event = on_event
         self.on_red_packet = on_red_packet
+        self.on_disconnect = on_disconnect
         self.status = HookStatus(pid=pid)
         self._control = HookPipe(control_pipe_name(pid))
         self._recv = HookPipe(recv_pipe_name(pid))
@@ -118,6 +120,7 @@ class HookBridge:
         self._dispatch_tasks: set[asyncio.Task] = set()
         self.forward_self_messages = True  # 是否接收自身消息回显（embedded_qq.self_message_enabled）
         self._closed = False
+        self._disconnect_notified = False
         self._snapshot: dict[int, dict[str, Any]] = {}
 
     # -- 生命周期 -----------------------------------------------------------
@@ -175,6 +178,22 @@ class HookBridge:
             except ConnectionError:
                 self.status.control_open = self.status.recv_open = False
                 log.info('QQ(pid=%s) 管道断开', self.pid)
+                if not self._disconnect_notified and self.on_disconnect:
+                    self._disconnect_notified = True
+                    try:
+                        callback = self.on_disconnect()
+                        if asyncio.iscoroutine(callback):
+                            await callback
+                    except Exception:
+                        log.exception('QQ(pid=%s) 断开清理失败', self.pid)
+                if not self._closed:
+                    # 当前泵任务不能等待自身；等本轮任务返回后再释放另一条管道。
+                    loop = asyncio.get_running_loop()
+                    loop.call_soon(
+                        lambda: asyncio.create_task(
+                            self.close(), name=f'hook-close-{self.pid}'
+                        )
+                    )
                 break
             if frames:
                 for frame in frames:

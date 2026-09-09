@@ -152,7 +152,9 @@ class HookPipe:
 
         gen = ctypes.WinDLL('kernel32', use_last_error=True)
         avail = ctypes.c_uint32(0)
-        if not gen.PeekNamedPipe(self._handle, None, 0, None, ctypes.byref(avail), None) or not avail.value:
+        if not gen.PeekNamedPipe(self._handle, None, 0, None, ctypes.byref(avail), None):
+            raise ConnectionError(f'管道 {self.name} 已断开: error={ctypes.get_last_error()}')
+        if not avail.value:
             return b''
         out = ctypes.create_string_buffer(avail.value)
         got = ctypes.c_uint32(0)

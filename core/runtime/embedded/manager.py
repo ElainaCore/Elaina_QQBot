@@ -160,6 +160,20 @@ class EmbeddedQQManager:
         return bool(cfg.get('settings', 'embedded_qq.enabled', True))
 
     @property
+    def hookqq_mode(self) -> bool:
+        """Windows 下是否启用框架托管的内置 HookQQ 启动模式。"""
+        return os.name == 'nt' and bool(cfg.get('settings', 'embedded_qq.windows_hook_launch', False))
+
+    @property
+    def autostart(self) -> bool:
+        """是否在框架启动后恢复内置 QQ。
+
+        Windows 普通注入模式不拥有 QQ 生命周期，不能在框架启动时探测或拉起 QQ；
+        Windows 只有显式 HookQQ 模式才自动恢复。Linux/macOS 保留原有内置运行时行为。
+        """
+        return not (os.name == 'nt' and not self.hookqq_mode)
+
+    @property
     def headless(self) -> bool:
         if sys.platform.startswith('linux'):
             return True
@@ -239,7 +253,9 @@ class EmbeddedQQManager:
             self.bots[bot_id] = EmbeddedBot(
                 bot_id=bot_id,
                 bridge_port=self._parse_bridge_port(item.get('bridge_port')),
-                qq_version_key=str(item.get('qq_version_key') or item.get('version_key') or self._qq_manager.detect_platform() or ''),
+                # 不在框架启动时探测/校验 QQ 版本。只有真正启动 HookQQ
+                # 时才由启动器读取客户端版本；普通注入模式不会拖慢启动。
+                qq_version_key=str(item.get('qq_version_key') or item.get('version_key') or ''),
                 qq_path=str(item.get('qq_path') or ''),
                 uin=str(item.get('uin') or ''),
                 nickname=str(item.get('nickname') or ''),
@@ -852,7 +868,7 @@ class EmbeddedQQManager:
             return False
 
     async def start_enabled(self) -> None:
-        if not self.enabled:
+        if not self.enabled or not self.autostart:
             return
         for bot_id, bot in list(self.bots.items()):
             if bot.enabled:
@@ -863,6 +879,11 @@ class EmbeddedQQManager:
             bot = self.bots.get(bot_id)
             if bot is None:
                 bot = await self.create_bot(bot_id)
+            if os.name == 'nt' and not self.hookqq_mode:
+                bot.status = 'error'
+                bot.error = '当前为普通注入 QQ 模式；请使用“QQ 注入”，或开启内置 HookQQ 模式'
+                await self._save_accounts()
+                return bot
             if bot.process and bot.process.returncode is None:
                 return bot
             if not self.qq_ready(bot):
@@ -1940,8 +1961,6 @@ class EmbeddedQQManager:
     def list_bots(self) -> list[dict[str, Any]]:
         result = []
         for bot in self.bots.values():
-            if not bot.qq_version_key:
-                bot.qq_version_key = self._normalize_version_key()
             version_info = QQ_VERSIONS.get(bot.qq_version_key, {})
             self._sync_qr_code(bot)
             memory = self._memory_snapshot(bot)
@@ -1971,7 +1990,7 @@ class EmbeddedQQManager:
                     'qq_path': str(self._find_qq_path(bot) or ''),
                     'force_quick_login': bot.force_quick_login,
                     'qq_installed': bool(self._find_qq_path(bot)),
-                    'connection_type': 'Embedded QQ',
+                    'connection_type': '内置 HookQQ' if self.hookqq_mode else '内置 QQ',
                     'avatar': f'https://q1.qlogo.cn/g?b=qq&nk={bot.uin}&s=100' if bot.uin else '',
                     **memory,
                 }

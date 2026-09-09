@@ -51,9 +51,11 @@ def _managed_records(manager) -> tuple[list[dict[str, Any]], dict[int, dict[str,
             'path': bot.get('qq_path') or '',
             'managed': True,
             'injected': bool(pid),
-            'can_load': not bool(pid),
+            'can_load': False,
             'can_unload': bool(pid),
             'can_attach': False,
+            'hooked': False,
+            'can_inject': False,
             'attach_mode': 'managed',
             'bot_id': bot['bot_id'],
             'uin': bot.get('qq') or '',
@@ -121,8 +123,8 @@ def _external_qq_processes(managed_by_pid: dict[int, dict[str, Any]], injector) 
             bridge = hook(pid) if callable(hook) else None
             hooked = bool(bridge and bridge.status.control_open)
             process_error = ''
-            if injected and not owned and not hooked:
-                process_error = '运行组件已加载，尚未连接；点击连接即可继续'
+            if injected and not hooked:
+                process_error = 'QQ 运行组件已注入，尚未连接到框架'
             external.append(
                 {
                     'id': f'external:{pid}',
@@ -132,7 +134,9 @@ def _external_qq_processes(managed_by_pid: dict[int, dict[str, Any]], injector) 
                     'path': str(process.info.get('exe') or ''),
                     'managed': False,
                     'injected': injected,
-                    'can_load': not availability_error,
+                    'hooked': hooked,
+                    'can_load': not injected and not availability_error,
+                    'can_inject': not injected and not availability_error,
                     'can_unload': owned,
                     'can_attach': injected and not hooked,
                     'attach_mode': 'native',
@@ -155,6 +159,9 @@ def _external_qq_processes(managed_by_pid: dict[int, dict[str, Any]], injector) 
 
 
 async def handle_get_processes(request: web.Request) -> web.Response:
+    prune = getattr(_app, 'prune_hook_bridges', None)
+    if callable(prune):
+        await prune()
     manager = getattr(_app, 'embedded_qq', None)
     injector = getattr(_app, 'process_injector', None)
     managed, managed_by_pid = _managed_records(manager)
@@ -216,14 +223,15 @@ def _injection_error_response(exc: Exception) -> web.Response:
 
 
 async def handle_load_process(request: web.Request) -> web.Response:
-    """Load the native module only after an explicit authenticated request."""
+    """Inject the native runtime into QQ; this does not create a Hook bridge."""
     try:
         pid, _, executable = _requested_external_qq(request.match_info.get('pid', ''))
         injector = getattr(_app, 'process_injector', None)
         if injector is None:
             raise NativeInjectorUnavailable('QQ 连接不可用', 'UNAVAILABLE')
         result = await injector.load(pid)
-        return ok(message='运行组件已加载', pid=pid, executable=str(executable), result=result)
+        return ok(message='QQ 运行组件已注入', pid=pid,
+                  executable=str(executable), result=result)
     except Exception as exc:
         return _injection_error_response(exc)
 
@@ -252,31 +260,27 @@ async def handle_refresh_process(request: web.Request) -> web.Response:
         return _injection_error_response(exc)
 
 
-async def handle_attach_process(request: web.Request) -> web.Response:
-    """连接已登录的 QQ 进程并开始事件转发。"""
+async def handle_inject_process(request: web.Request) -> web.Response:
+    """Inject a running QQ process and establish its message bridge."""
     try:
         pid, _, executable = _requested_external_qq(request.match_info.get('pid', ''))
         injector = getattr(_app, 'process_injector', None)
         if injector is None:
             raise NativeInjectorUnavailable('QQ 连接不可用', 'UNAVAILABLE')
-        enhanced = await _app.ensure_qq_enhanced_restart(pid)
-        if enhanced.get('error'):
-            return error(enhanced['error'], status=502, pid=pid,
-                         executable=str(executable))
-        pid = int(enhanced.get('pid') or pid)
         result = await injector.load(pid)
         attach = await _app.attach_hook_bridge(pid)
         if not attach.get('attached'):
-            if enhanced.get('restarted'):
-                return error('QQ 已重启，请登录完成后重新点击连接',
-                             status=502, pid=pid, executable=str(executable))
             return error('QQ 连接失败，请稍后重试', status=502, pid=pid,
                          executable=str(executable), result=result)
-        message = 'QQ 已连接'
-        return ok(message=message, pid=pid, executable=str(executable),
-                  result={**result, 'hook': attach, 'enhanced': enhanced})
+        return ok(message='QQ 已注入并连接', pid=pid, executable=str(executable),
+                  result={**result, 'hook': attach})
     except Exception as exc:
         return _injection_error_response(exc)
+
+
+async def handle_attach_process(request: web.Request) -> web.Response:
+    """Legacy alias for :func:`handle_inject_process`."""
+    return await handle_inject_process(request)
 
 
 async def handle_detach_process(request: web.Request) -> web.Response:

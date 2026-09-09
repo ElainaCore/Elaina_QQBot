@@ -42,6 +42,8 @@ core.foundation                         不依赖上层模块
 `core/runtime/embedded/manager.py` 负责编排账号状态、桥接服务和 QQ 生命周期。平台级进程树终止、内存采样与页面回收位于 `process_control.py`；输出过滤与崩溃段识别位于 `output_filter.py`。
 JavaScript 账号实现只负责 QQ 会话与协议适配；`manager_channel.mjs` 独立维护本机控制长轮询、顺序事件上报和 HTTP 连接池。
 
+Windows 的 QQ 注入与内置 HookQQ 是两种独立生命周期：注入只响应 Web 面板的显式操作，不校验 QQ 版本、不启动或重启 QQ，也不持久化账号；内置 HookQQ 才由 `EmbeddedQQManager` 保存账号、校验兼容版本并在框架启动后异步恢复。
+
 底层包能力按职责分布：
 
 ```text

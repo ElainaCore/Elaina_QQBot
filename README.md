@@ -8,7 +8,7 @@ ElainaQQ 是一个基于 Python 的异步 QQ 机器人框架，内置 QQNT 启�
 [![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white)](https://python.org) [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE) [![QQ群](https://img.shields.io/badge/QQ交流群-164178653-blue)](https://qm.qq.com/q/nepv1UcwRE)
 
 - **纯异步架构** — 基于 aiohttp，事件分发、网络连接和插件接口均采用异步模型
-- **内置 QQ 运行时** — 支持 QQ 安装、扫码登录、版本选择和多账号数据隔离
+- **QQ 注入与内置 HookQQ** — Windows 可注入已运行的 QQ，或由框架校验版本并启动隔离 HookQQ
 - **QLinux 协议端** — 可选的 Linux 协议多账号渠道，扫码 / 账密登录，基于 [Lagrange.Core](https://github.com/LagrangeDev/Lagrange.Core)
 - **OneBot v11 接入** — 支持反向 / 正向 WebSocket、HTTP 上报和 HTTP API 客户端
 - **Web 管理面板** — 提供账号、网络、插件、配置、日志、消息记录和框架更新管理
@@ -31,7 +31,7 @@ python main.py
 
 首次启动会从 `config/*.example.yaml` 生成 `config/settings.yaml` 和 `config/connections.yaml`。启动后访问 [Web 面板](http://localhost:5201/web/) 完成配置，默认密码为 `admin`。
 
-内置 QQ 可直接在面板中创建账号并扫码登录；使用外部 OneBot 实现时，在“网络配置”中创建对应连接。
+Windows 可在面板中选择“QQ 注入”接入已运行的 QQ，或创建“内置 HookQQ”账号；使用外部 OneBot 实现时，在“网络配置”中创建对应连接。
 
 ## 📁 框架结构
 
@@ -57,7 +57,8 @@ ElainaQQ/
 
 ## 🔗 机器人接入
 
-- **内置 QQ** — 保持 `embedded_qq.enabled: true`，在 Web 面板创建机器人并扫码登录。每个账号使用独立数据目录。
+- **QQ 注入（Windows）** — 只在 Web 面板点击“QQ 注入”后检查目标进程并注入，不校验 QQ 版本，也不负责启动或重启 QQ。QQ 退出后该注入账号从列表移除。
+- **内置 HookQQ** — 保持 `embedded_qq.enabled: true`，在 Web 面板创建机器人并扫码登录。Windows 只有启用 HookQQ 后才会在框架启动时异步校验版本并恢复账号。
 - **QLinux 协议端** — 在 `settings.yaml` 中开启 `qlinux.enabled: true`，面板「QLinux 协议端」页添加账号，支持扫码与账密登录，多账号隔离；协议端首次启动时自动下载（支持镜像加速），签名服务默认 `qlinux.sign_server`，可自行更换。
 - **反向 WebSocket** — 框架作为服务端，默认主入口为 `ws://127.0.0.1:5201/OneBotv11`；必须先在面板启用对应连接。
 - **正向 WebSocket** — 框架主动连接外部 OneBot WebSocket 服务。
@@ -100,6 +101,7 @@ async def say_hello(event, match):
 | `owner.ids` | 空列表 | `owner_only=True` 处理器允许的 QQ 号 |
 | `embedded_qq.enabled` | `true` | 是否启用内置 QQ 管理 |
 | `embedded_qq.bridge_port_start` | `30010` | 内置账号服务端口起点 |
+| `embedded_qq.windows_hook_launch` | `false` | Windows 内置 HookQQ 模式；仅此模式启动时校验版本并恢复账号 |
 | `qlinux.enabled` | `false` | 是否启用 QLinux (Lagrange) 协议端渠道 |
 | `qlinux.sign_server` | `https://esign.linsur.cn/` | NTQQ 签名服务器地址 |
 | `logging.retention_days` | `30` | 日志保留天数 |

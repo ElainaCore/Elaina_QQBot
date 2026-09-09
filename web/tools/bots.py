@@ -1,10 +1,12 @@
 """机器人列表 / 详情 (OneBot 适配)"""
 
+import os
 import time
 from typing import Any
 
 from aiohttp import web
 
+from core.foundation.config import cfg
 from web.protocol import error, json_body, ok
 from web.tools import _common
 
@@ -45,7 +47,7 @@ def _avatar(qq: str) -> str:
 def _conn_type(ad, self_id: str) -> str:
     """依据适配器记录判断连接方式 (WebSocket 优先于 HTTP)"""
     if self_id in ad.local_actions:
-        return 'QQ 连接'
+        return 'QQ 注入'
     if self_id in ad.websockets:
         return 'WebSocket'
     rec = ad.bots.get(self_id) or {}
@@ -59,6 +61,9 @@ def _bot_identities(item) -> set[str]:
 
 
 async def handle_get_bots(request: web.Request):
+    prune = getattr(_app, 'prune_hook_bridges', None)
+    if callable(prune):
+        await prune()
     ad = _common.adapter()
     bots = []
     manager = getattr(_app, 'embedded_qq', None)
@@ -135,6 +140,9 @@ async def handle_create_embedded_bot(request: web.Request):
     bot_id = str(body.get('bot_id') or body.get('uin') or '').strip()
     if not bot_id:
         return error('缺少 bot_id')
+    if os.name == 'nt':
+        if str(body.get('runtime_mode') or '') != 'hookqq':
+            return error('Windows 内置账号必须使用 HookQQ 模式')
     try:
         bot = await manager.create_bot(
             bot_id,
@@ -145,6 +153,10 @@ async def handle_create_embedded_bot(request: web.Request):
         )
     except ValueError as exc:
         return error(str(exc))
+    if os.name == 'nt' and not bool(cfg.get('settings', 'embedded_qq.windows_hook_launch', False)):
+        # 这是用户显式选择内置 HookQQ 的时刻；普通注入流程不会修改此项，
+        # 也不会在下次框架启动时触发 QQ 探测或版本校验。
+        cfg.set_value('settings', 'embedded_qq.windows_hook_launch', True)
     return ok(bot=next(item for item in manager.list_bots() if item['bot_id'] == bot.bot_id))
 
 
