@@ -446,8 +446,7 @@ class QQLauncher:
                 self.launch_env['ELAINAQQ_GRAB_NICKNAME'] = os.environ.get(
                     'ELAINAQQ_GRAB_NICKNAME', '伊')
                 # QQ 可安装在任意盘符/深度（如 D:\QQNT\QQ.exe）；grab 日志与抢包任务
-                # 统一放框架 data/log/，与插件的下发路径（plugins/onebot_red_packet）
-                # 和 loader 的 grab_task.json 监听路径保持一致。
+                # 统一放框架 data/log/，与 loader 的 grab_task.json 监听路径保持一致。
                 grab_log = self._framework_root() / 'data' / 'log' / 'grab_result.jsonl'
                 grab_log.parent.mkdir(parents=True, exist_ok=True)
                 self.launch_env['ELAINAQQ_GRAB_LOG'] = str(grab_log)

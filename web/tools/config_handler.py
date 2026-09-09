@@ -37,8 +37,6 @@ def _public_settings(parsed: dict) -> dict:
     web_settings = result.get('web')
     if isinstance(web_settings, dict):
         web_settings.pop('admin_password', None)
-    # AI 是插件能力，不属于框架内置配置。旧配置存在时也不暴露到可视化面板。
-    result.pop('ai', None)
     # 可视化面板的布尔开关用 !!value 渲染；键缺失会显示为关，
     # 而运行时默认是开。这里显式回填默认值，避免 UI 与行为不一致。
     embedded = result.setdefault('embedded_qq', {})
@@ -52,7 +50,7 @@ def _public_settings(parsed: dict) -> dict:
 
 def _set_path(target: dict, path: str, value):
     parts = [part for part in str(path).split('.') if part]
-    if len(parts) != 2 or parts[0] not in {'server', 'web', 'owner', 'embedded_qq', 'logging', 'pip', 'ai'}:
+    if len(parts) != 2 or parts[0] not in {'server', 'web', 'owner', 'embedded_qq', 'logging', 'pip'}:
         raise ValueError(f'不允许修改配置项: {path}')
     section, key = parts
     target.setdefault(section, {})
@@ -65,8 +63,6 @@ def _set_path(target: dict, path: str, value):
         'embedded_qq': {'enabled', 'bridge_port_start', 'command', 'qq_path', 'windows_hook_launch', 'packet_backend', 'packet_verbose', 'packet_o3_hook', 'data_dir', 'headless', 'single_process', 'rss_target_mb', 'swap_reclaim', 'self_message_enabled', 'inject_enhanced'},
         'logging': {'dir', 'insert_interval', 'max_batch_size', 'max_queue_entries', 'retention_days', 'wal_mode'},
         'pip': {'auto_install', 'mirror'},
-        # 仅保留旧插件配置的读写兼容性；框架本身不加载 AI 服务。
-        'ai': {'enabled', 'base_url', 'model', 'temperature', 'max_iterations', 'request_timeout', 'system_prompt'},
     }
     if key not in allowed[section]:
         raise ValueError(f'不允许修改配置项: {path}')
@@ -84,7 +80,6 @@ def _set_path(target: dict, path: str, value):
         ('embedded_qq', 'windows_hook_launch'),
         ('logging', 'wal_mode'),
         ('pip', 'auto_install'),
-        ('ai', 'enabled'),
     }
     integer_fields = {
         ('server', 'port'),
@@ -93,12 +88,9 @@ def _set_path(target: dict, path: str, value):
         ('logging', 'max_batch_size'),
         ('logging', 'max_queue_entries'),
         ('logging', 'retention_days'),
-        ('ai', 'max_iterations'),
     }
     number_fields = {
         ('logging', 'insert_interval'),
-        ('ai', 'temperature'),
-        ('ai', 'request_timeout'),
     }
     string_fields = {
         ('server', 'host'),
@@ -110,9 +102,6 @@ def _set_path(target: dict, path: str, value):
         ('embedded_qq', 'data_dir'),
         ('logging', 'dir'),
         ('pip', 'mirror'),
-        ('ai', 'base_url'),
-        ('ai', 'model'),
-        ('ai', 'system_prompt'),
     }
     if (section, key) in boolean_fields:
         if not isinstance(value, bool):
@@ -138,7 +127,6 @@ def _set_path(target: dict, path: str, value):
         ('logging', 'max_batch_size'),
         ('logging', 'max_queue_entries'),
         ('logging', 'retention_days'),
-        ('ai', 'max_iterations'),
     }
     if (section, key) == ('embedded_qq', 'rss_target_mb') and value < 0:
         raise ValueError('embedded_qq.rss_target_mb 不能小于 0')
@@ -146,10 +134,6 @@ def _set_path(target: dict, path: str, value):
         raise ValueError(f'{path} 必须大于 0')
     if (section, key) in number_fields and value < 0:
         raise ValueError(f'{path} 不能小于 0')
-    if section == 'ai' and key == 'temperature' and value > 2:
-        raise ValueError('ai.temperature 必须在 0-2 之间')
-    if section == 'ai' and key == 'request_timeout' and value <= 0:
-        raise ValueError('ai.request_timeout 必须大于 0')
     if section == 'owner' and key == 'ids':
         if not isinstance(value, list):
             raise ValueError('主人 QQ 列表必须是数组')

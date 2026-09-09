@@ -52,9 +52,10 @@ class QLinuxManager:
 
     def enabled(self) -> bool:
         try:
-            return bool(self._app.cfg.get('settings', 'qlinux', {}).get('enabled', False))
+            # 默认开启 (与 Application 装配逻辑一致), 显式 enabled: false 才禁用
+            return bool((self._app.cfg.get('settings', 'qlinux', {}) or {}).get('enabled', True))
         except Exception:  # noqa: BLE001
-            return False
+            return True
 
     # ---------- 账号持久化 ----------
 

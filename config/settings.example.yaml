@@ -48,8 +48,8 @@ embedded_qq:
 
 # QLinux 渠道 (Lagrange 协议端, Linux 协议扫码/账密登录)
 qlinux:
-  enabled: false                                # 启用 QLinux 渠道
-  sign_server: "https://esign.linsur.cn/"       # NTQQ 签名服务器 (S+V 自建默认, 可换任意兼容端)
+  enabled: true                                 # 默认启用 (面板"接入中心"-> QLinux 协议端)
+  sign_server: "https://esign.linsur.cn/"       # NTQQ 签名服务器 (默认自建, 可换任意兼容端)
 
 # 日志配置
 logging:

@@ -339,11 +339,12 @@ class Application:
         # QQ 进程仍在 HTTP 和连接服务就绪后启动。
         self._embedded_qq = EmbeddedQQManager(self)
 
-        # QLinux (Lagrange 协议端) 渠道 — 配置启用时才初始化
+        # QLinux (Lagrange 协议端) 渠道 — 默认启用, 配置显式关闭才禁用
         from core.runtime.qlinux.manager import QLinuxManager
         from core.foundation.config import cfg as _cfg
         try:
-            if bool(_cfg.get('settings', 'qlinux', {}).get('enabled', False)):
+            _qlinux_cfg = _cfg.get('settings', 'qlinux', {}) or {}
+            if bool(_qlinux_cfg.get('enabled', True)):
                 self._qlinux_manager = QLinuxManager(self)
                 log.info('QLinux 渠道已启用')
         except Exception:
