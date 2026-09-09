@@ -335,11 +335,29 @@ def _ob_message_id(bot_id: str, sequence: int, group: bool) -> str:
 
 def runner_event_to_onebot(event: dict) -> dict | None:
     """runner 事件 → OneBot v11 事件 payload (进入 app.ingest_event 的形状)。"""
-    etype = event.get('event')
+    etype = str(event.get('event') or '').lower()
     bot_id = str(event.get('bot_id', ''))
+
+    # 新版 runner 可以直接转发已经规范化的 OneBot 事件；保留这条
+    # 兼容路径，避免新增通知类型时 Python 层再次丢弃。
+    if etype in {'onebot', 'onebot.event'}:
+        payload = event.get('payload') or event.get('data')
+        if not isinstance(payload, dict):
+            return None
+        payload = dict(payload)
+        payload.setdefault('self_id', str(event.get('uin') or bot_id))
+        return payload
 
     if etype == 'message':
         d = event.get('data', {})
+        if not isinstance(d, dict):
+            return None
+        # 允许 runner 直接携带 OneBot message 数组，避免消息实体扩展
+        # （视频、文件、Markdown 等）在协议桥接层被静默丢弃。
+        if isinstance(d.get('message'), list) and d.get('post_type'):
+            payload = dict(d)
+            payload.setdefault('self_id', str(event.get('uin') or bot_id))
+            return payload
         uin = str(event.get('uin') or d.get('self_uin') or bot_id)
         contact = d.get('contact', {})
         group_id = contact.get('group_uin')

@@ -109,10 +109,18 @@ class QLinuxManager:
                                   self._on_runner_event)
             await self._rpc.start()
             log.info('QLinux runner 就绪')
-            # 恢复已有账号 (keystore 仍在, 自动快速重登)
+            # 恢复已有账号。仅创建 runner 侧 Bot 不会开始收包，必须再调用
+            # Login() 让 Lagrange 用 keystore 执行快速重登并重新注册在线会话。
             for bot_id in list(self._accounts):
                 try:
                     await self._create_bot_on_runner(bot_id)
+                    acc = self._accounts[bot_id]
+                    if acc.get('status') == 'online' or acc.get('last_online'):
+                        acc['status'] = 'reconnecting'
+                        self._save_accounts()
+                        # 兼容 v1.0.1 runner：login.qr 的实现本身调用
+                        # Context.Login()，有 keystore 时同样会走快速重登。
+                        await self._rpc.call('bot.login.qr', {'bot_id': bot_id}, timeout=10)
                 except Exception:  # noqa: BLE001
                     log.exception('QLinux 账号恢复失败: %s', bot_id)
         finally:
@@ -127,8 +135,9 @@ class QLinuxManager:
 
     def _on_runner_event(self, event: dict) -> None:
         """runner 事件统一入口: 登录流程事件走状态机, 消息事件进 OneBot 管线。"""
-        etype = event.get('event')
+        etype = str(event.get('event') or '').lower()
         bot_id = str(event.get('bot_id', ''))
+        log.debug('QLinux runner 事件: bot=%s type=%s', bot_id, etype)
 
         # 二维码缓存 (面板拉取用)
         if etype == 'qr.code':
@@ -145,7 +154,9 @@ class QLinuxManager:
                 }.get(state)
             acc = self._accounts.get(bot_id)
             if acc:
-                acc['status'] = 'online' if event.get('success') else 'login_failed'
+                # BotLoginEvent 只表示鉴权阶段成功；真正可收发消息要等
+                # Lagrange 完成 InfoSync 后发出 bot.online。
+                acc['status'] = 'connecting' if event.get('success') else 'login_failed'
                 acc['last_state'] = state
                 if event.get('success'):
                     acc.pop('last_error', None)
@@ -158,6 +169,16 @@ class QLinuxManager:
                                 'state': state,
                                 'error': error})
             return
+        if etype == 'login.completed':
+            # runner 对 Login() 的最终返回值：当 InfoSync/注册在线失败时，
+            # 不能继续把账号显示为在线，否则面板状态与收包状态会分离。
+            if not event.get('success'):
+                acc = self._accounts.get(bot_id)
+                if acc:
+                    acc['status'] = 'login_failed'
+                    acc['last_error'] = event.get('error') or '登录后注册在线失败'
+                    self._save_accounts()
+            return
         if etype == 'bot.online':
             acc = self._accounts.get(bot_id)
             if acc:
@@ -165,12 +186,24 @@ class QLinuxManager:
                 acc['uin'] = str(event.get('uin') or acc.get('uin', ''))
                 acc['last_online'] = int(time.time())
                 self._save_accounts()
+            uin = str(event.get('uin') or (acc or {}).get('uin', '')) if acc else str(event.get('uin') or '')
+            adapter = getattr(self._app, 'adapter', None)
+            if adapter is not None and uin:
+                # bot_id 是面板配置编号，uin 是 OneBot 标准 self_id；两者
+                # 必须建立别名，否则按 bot_id 绑定的插件不会收到事件。
+                adapter.register_identity_alias(bot_id, uin)
             asyncio.get_running_loop().create_task(self._bind_account(bot_id))
         elif etype == 'bot.offline':
             acc = self._accounts.get(bot_id)
             if acc:
                 acc['status'] = 'offline'
                 self._save_accounts()
+                uin = str(acc.get('uin') or '')
+                adapter = getattr(self._app, 'adapter', None)
+                if adapter is not None and uin in self._registered_uins:
+                    adapter.unregister_local_bot(uin)
+                    self._registered_uins.discard(uin)
+                    adapter.unregister_identity_alias(bot_id)
         elif etype == 'qr.state':
             acc = self._accounts.get(bot_id)
             if acc and event.get('state') in ('Confirmed',):
@@ -185,7 +218,10 @@ class QLinuxManager:
 
     async def _ingest(self, payload: dict) -> None:
         try:
-            await self._app.ingest_event(payload, default_self_id=str(payload.get('self_id', '')))
+            accepted = await self._app.ingest_event(payload, default_self_id=str(payload.get('self_id', '')))
+            if not accepted:
+                log.warning('QLinux 事件未进入框架队列: post_type=%s self_id=%s',
+                            payload.get('post_type'), payload.get('self_id'))
         except Exception:  # noqa: BLE001
             log.exception('QLinux 事件注入失败')
 
@@ -203,6 +239,7 @@ class QLinuxManager:
             return await self.handle_action(_bot_id, action, params)
 
         adapter.register_local_bot(uin, _handler)
+        adapter.register_identity_alias(bot_id, uin)
         self._registered_uins.add(uin)
         log.info('QLinux 账号 %s (bot_id=%s) 已绑定本地动作', uin, bot_id)
 
@@ -279,6 +316,7 @@ class QLinuxManager:
             adapter = getattr(self._app, 'adapter', None)
             if adapter:
                 adapter.unregister_local_bot(uin)
+                adapter.unregister_identity_alias(bot_id)
             self._registered_uins.discard(uin)
         return result
 
