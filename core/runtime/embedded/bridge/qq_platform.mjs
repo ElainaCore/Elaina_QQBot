@@ -106,12 +106,12 @@ export function getQQInfo(execPath) {
     try {
       versionConfig = JSON.parse(fs.readFileSync(versionConfigPath, "utf-8"));
     } catch (e) {
-      console.log(`[QQ信息] 读取快更配置失败: ${e}`);
+      console.log('[QQ信息] 读取版本配置失败');
     }
     if (versionConfig) {
       const version = String(versionConfig.curVersion || "").trim();
-      if (!version) throw new Error(`QQ 快更配置缺少 curVersion: ${versionConfigPath}`);
-      console.log(`[QQ信息] 使用快更配置: ${version}`);
+      if (!version) throw new Error('QQ 版本配置缺少 curVersion');
+      console.log(`[QQ信息] 使用版本配置: ${version}`);
       return buildQQInfo(execPath, version);
     }
   }
@@ -141,7 +141,13 @@ export function getQQInfo(execPath) {
 }
 export function buildQQInfo(execPath, version) {
   if (os.platform() === "win32" && !WINDOWS_QQ_APPID_TABLE[version]) {
-    throw new Error(`Windows QQ ${version} 不在 NapCat 兼容版本列表中，已拒绝加载`);
+    // Hook 启动模式（windows_hook_launch）允许未知版本：从 major.node 读 AppID，
+    // QUA 用通用格式拼。QQNT.dll 侧的签名校验已在副本中被跳过。
+    const hookLaunch = String(process.env.ELAINAQQ_WINDOWS_HOOK_LAUNCH || "") === "1";
+    if (!hookLaunch) {
+      throw new Error(`当前 Windows QQ 版本 ${version} 暂不兼容，无法加载`);
+    }
+    console.log(`[QQ信息] 版本 ${version} 不在兼容表内，Hook 启动模式回退到通用 AppID/QUA`);
   }
   const buildVersion = version.split("-")[1] || "";
   let appid;

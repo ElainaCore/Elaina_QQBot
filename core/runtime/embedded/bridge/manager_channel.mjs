@@ -1,4 +1,5 @@
 import http from "node:http";
+import fs from "node:fs";
 
 function stringifyJson(value) {
   const seen = new WeakSet();
@@ -30,6 +31,20 @@ function controlFailure(error) {
 export class EmbeddedManagerChannel {
   constructor({ botId, managerUrl, logger = console.error }) {
     this.botId = String(botId || "");
+    this.debugFile = process.env["ELAINAQQ_DATA_DIR"]
+      ? process.env["ELAINAQQ_DATA_DIR"] + "/attach-debug.log"
+      : "";
+    this.debugLog = (line) => {
+      try {
+        if (this.debugFile) {
+          fs.appendFileSync(this.debugFile, new Date().toISOString() + " " + line + "\n");
+        }
+      } catch (error) {
+        try {
+          console.error("[MCHANNEL] debugLog error:", error?.message);
+        } catch {}
+      }
+    };
     this.managerUrl = String(managerUrl || "http://127.0.0.1:30010");
     this.logger = logger;
     this.instance = null;
@@ -135,8 +150,18 @@ export class EmbeddedManagerChannel {
     const key = `${apiPath}:${orderingKey}`;
     const previous = this.reportTails.get(key) || Promise.resolve();
     const current = Promise.allSettled([previous, prerequisite])
-      .then(() => this.request("POST", apiPath, body, 5_000))
-      .catch((error) => this.logger(label, error?.message || error));
+      .then(() => {
+        this.debugLog("[REPORT] POST " + apiPath + " key=" + orderingKey);
+        return this.request("POST", apiPath, body, 5_000);
+      })
+      .then((result) => {
+        this.debugLog("[REPORT] ok " + apiPath + " key=" + orderingKey);
+        return result;
+      })
+      .catch((error) => {
+        this.debugLog("[REPORT] FAILED " + apiPath + " key=" + orderingKey + " -> " + (error?.message || error));
+        this.logger(label, error?.message || error);
+      });
     this.reportTails.set(key, current);
     const cleanup = () => {
       if (this.reportTails.get(key) === current) this.reportTails.delete(key);
@@ -155,7 +180,7 @@ export class EmbeddedManagerChannel {
     this.statusTail = this.queueReport(
       "/api/embedded/events",
       { bot_id: this.botId, self_id: runtime.loginUin || this.botId, runtime },
-      "[桥接] 状态上报失败:",
+      "[连接] 状态同步失败:",
       "status",
     );
     if (runtime?.status === "online" && !this.onlineReported) {
@@ -169,7 +194,7 @@ export class EmbeddedManagerChannel {
     return this.queueReport(
       "/api/embedded/events",
       { bot_id: this.botId, self_id: event.self_id || this.botId, event },
-      "[桥接] 事件上报失败:",
+      "[连接] 事件同步失败:",
       this.eventReportKey(event),
       this.statusReady,
     );
@@ -183,7 +208,7 @@ export class EmbeddedManagerChannel {
       { bot_id: this.botId, self_id: selfId, red_packet: packet },
       5_000,
     ).catch((error) => {
-      this.logger("[桥接] 红包上报失败:", error?.message || error);
+      this.logger("[连接] 红包同步失败:", error?.message || error);
     });
   }
 
@@ -205,10 +230,17 @@ export class EmbeddedManagerChannel {
       } else if (command.type === "query_red_packet") {
         const data = await this.instance.getRedPacketDetails({ bill_no: command.bill_no });
         result = { status: "ok", retcode: 0, data, message: "", wording: "" };
+      } else if (command.type === "get_group_list") {
+        const data = await this.instance.queryGroupList({});
+        result = { status: "ok", retcode: 0, data, message: "", wording: "" };
+      } else if (command.type === "set_poll_groups") {
+        this.instance.setPollGroups(command.groups || []);
+        result = { status: "ok", retcode: 0, data: { count: (command.groups || []).length }, message: "", wording: "" };
       } else if (command.type === "grab_red_packet") {
         const data = await this.instance.grabRedPacket({
           bill_no: command.bill_no,
           send_password_after: command.send_password_after === true,
+          ...(command.context && typeof command.context === "object" ? command.context : {}),
         });
         result = { status: "ok", retcode: 0, data, message: "", wording: "" };
       } else if (command.type === "refresh_qr") {
@@ -244,7 +276,7 @@ export class EmbeddedManagerChannel {
           await Promise.race(this.priorityCommands);
         }
         const task = this.executeControlCommand(command)
-          .catch((error) => this.logger("[桥接] 红包优先命令失败:", error?.message || error));
+          .catch((error) => this.logger("[连接] 红包请求失败:", error?.message || error));
         this.priorityCommands.add(task);
         task.finally(() => this.priorityCommands.delete(task));
       } catch {

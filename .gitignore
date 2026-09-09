@@ -27,6 +27,13 @@ modules/modules_enabled.json
 *.log
 *.bak
 
+# 本地归档（PC 端抢包历史脚本与数据）
+archive_pc_grab/
+
+# 运行时辅助目录
+.fetch/
+.opensquilla/
+
 # 本地配置，仅提交示例文件
 config/settings.yaml
 config/connections.yaml

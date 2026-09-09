@@ -23,9 +23,10 @@ owner:
 # 启用后，可直接在 Web 面板创建机器人并扫码登录
 embedded_qq:
   enabled: true                                # 启用内置 QQ
-  bridge_port_start: 30010                     # 本机账号桥接端口起点，后续账号依次递增
+  bridge_port_start: 30010                     # 账号服务端口起点，后续账号依次递增
   command: ""                                  # 可选兼容启动命令；留空使用内置启动器
   qq_path: ""                                  # QQ.exe/qq 路径，留空自动探测
+  windows_hook_launch: false                   # Windows 下允许 Hook 启动未知版本 QQ（loader 劫持）
   packet_backend: "auto"                       # PB 原始发包后端；auto 自动匹配 QQ 精确版本
   packet_verbose: false                         # 输出原始包原生 Hook 详细日志
   packet_o3_hook: false                         # 原始包事件同时启用 O3 Hook 模式
@@ -44,6 +45,11 @@ embedded_qq:
   self_message_enabled: true                    # 是否接收自身消息回显（message_sent 事件）
   cgroup_helper: "/usr/local/sbin/elainaqq-cgroup"  # Linux 可选：受限 cgroup 辅助程序
   accounts: []                                  # 可选：启动时自动恢复的账号配置
+
+# QLinux 渠道 (Lagrange 协议端, Linux 协议扫码/账密登录)
+qlinux:
+  enabled: false                                # 启用 QLinux 渠道
+  sign_server: "https://esign.linsur.cn/"       # NTQQ 签名服务器 (S+V 自建默认, 可换任意兼容端)
 
 # 日志配置
 logging:

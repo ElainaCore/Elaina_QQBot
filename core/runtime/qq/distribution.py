@@ -28,12 +28,12 @@ log = logging.getLogger('ElainaQQ.qq_manager')
 
 
 class QQDownloadError(RuntimeError):
-    """所有已配置 QQ 下载地址均不可用时抛出。"""
+    """QQ 安装包获取失败时抛出。"""
 
     def __init__(self, version_key: str, failures: list[str]):
         self.version_key = version_key
         self.failures = failures
-        super().__init__('；'.join(failures) or 'QQ 下载地址不可用')
+        super().__init__('QQ 安装包下载失败，请稍后重试')
 
 
 def _is_root() -> bool:
@@ -41,12 +41,10 @@ def _is_root() -> bool:
 
 
 def _run_command(command: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
-    log.info('执行 QQ 安装命令: %s', ' '.join(command))
+    log.info('正在执行 QQ 安装操作')
     result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout)
     if result.returncode:
-        detail = (result.stderr or result.stdout or '').strip()
-        suffix = f': {detail}' if detail else ''
-        raise RuntimeError(f'命令退出码 {result.returncode}: {" ".join(command)}{suffix}')
+        raise RuntimeError(f'QQ 安装操作失败（退出码 {result.returncode}）')
     return result
 
 
@@ -288,7 +286,7 @@ class QQManager:
                                 break
                             await asyncio.sleep(min(0.5 * stalled, 3.0))
                     failures.append(f'{url}: {last_error or "连续重试无进展"}')
-                    log.warning('QQ 下载地址连续重试无进展: %s (%s)', url, last_error)
+                    log.warning('QQ 安装包下载重试无进展')
             raise QQDownloadError(version_key, failures)
 
     async def install_qq(

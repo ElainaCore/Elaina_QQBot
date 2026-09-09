@@ -45,7 +45,7 @@ def _avatar(qq: str) -> str:
 def _conn_type(ad, self_id: str) -> str:
     """依据适配器记录判断连接方式 (WebSocket 优先于 HTTP)"""
     if self_id in ad.local_actions:
-        return '注入 QQ'
+        return 'QQ 连接'
     if self_id in ad.websockets:
         return 'WebSocket'
     rec = ad.bots.get(self_id) or {}

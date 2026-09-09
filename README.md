@@ -9,6 +9,7 @@ ElainaQQ 是一个基于 Python 的异步 QQ 机器人框架，内置 QQNT 启�
 
 - **纯异步架构** — 基于 aiohttp，事件分发、网络连接和插件接口均采用异步模型
 - **内置 QQ 运行时** — 支持 QQ 安装、扫码登录、版本选择和多账号数据隔离
+- **QLinux 协议端** — 可选的 Linux 协议多账号渠道，扫码 / 账密登录，基于 [Lagrange.Core](https://github.com/LagrangeDev/Lagrange.Core)
 - **OneBot v11 接入** — 支持反向 / 正向 WebSocket、HTTP 上报和 HTTP API 客户端
 - **Web 管理面板** — 提供账号、网络、插件、配置、日志、消息记录和框架更新管理
 
@@ -56,12 +57,13 @@ ElainaQQ/
 
 ## 🔗 机器人接入
 
-- **内置 QQ** — 保持 `embedded_qq.enabled: true`，在 Web 面板创建机器人并扫码登录。每个账号使用独立数据目录和本机桥接端口。
+- **内置 QQ** — 保持 `embedded_qq.enabled: true`，在 Web 面板创建机器人并扫码登录。每个账号使用独立数据目录。
+- **QLinux 协议端** — 在 `settings.yaml` 中开启 `qlinux.enabled: true`，面板「QLinux 协议端」页添加账号，支持扫码与账密登录，多账号隔离；协议端首次启动时自动下载（支持镜像加速），签名服务默认 `qlinux.sign_server`，可自行更换。
 - **反向 WebSocket** — 框架作为服务端，默认主入口为 `ws://127.0.0.1:5201/OneBotv11`；必须先在面板启用对应连接。
 - **正向 WebSocket** — 框架主动连接外部 OneBot WebSocket 服务。
 - **HTTP 接入** — 支持接收 OneBot HTTP 事件上报，以及调用外部 OneBot HTTP API。
 
-内置 QQ 桥接端口默认从 `30010` 开始，只监听 `127.0.0.1`，属于框架内部通信端口，不应暴露到公网或由插件直接连接。生产环境应为网络连接配置 Token / Secret，并通过可信反向代理启用 TLS。
+生产环境应为网络连接配置 Token / Secret，并通过可信反向代理启用 TLS。
 
 ## 🔌 开发与扩展
 
@@ -97,7 +99,9 @@ async def say_hello(event, match):
 | `web.admin_password` | `admin` | 面板管理员密码，部署后必须修改 |
 | `owner.ids` | 空列表 | `owner_only=True` 处理器允许的 QQ 号 |
 | `embedded_qq.enabled` | `true` | 是否启用内置 QQ 管理 |
-| `embedded_qq.bridge_port_start` | `30010` | 内置账号桥接端口起点 |
+| `embedded_qq.bridge_port_start` | `30010` | 内置账号服务端口起点 |
+| `qlinux.enabled` | `false` | 是否启用 QLinux (Lagrange) 协议端渠道 |
+| `qlinux.sign_server` | `https://esign.linsur.cn/` | NTQQ 签名服务器地址 |
 | `logging.retention_days` | `30` | 日志保留天数 |
 
 `config/settings.yaml` 和 `config/connections.yaml` 支持运行时热加载。修改监听地址、端口或底层 QQ 启动参数后，应观察控制台与面板状态，确认相关服务是否需要重启。
@@ -111,3 +115,10 @@ async def say_hello(event, match):
 ## 📄 开源协议
 
 本项目采用 MIT 协议开源，详见 [LICENSE](LICENSE) 文件。
+
+## 🙏 致谢
+
+| 项目 | 用途 |
+| --- | --- |
+| [Lagrange.Core](https://github.com/LagrangeDev/Lagrange.Core) | QLinux 协议端，提供 Linux 协议登录与消息收发 |
+| [NapCatQQ](https://github.com/NapNeko/NapCatQQ) | 内置 QQ 运行时的 Hook / 消息链路实现参考 |

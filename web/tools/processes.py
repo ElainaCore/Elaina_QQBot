@@ -105,7 +105,7 @@ def _external_qq_processes(managed_by_pid: dict[int, dict[str, Any]], injector) 
     external: list[dict[str, Any]] = []
     owned_pids = injector.owned_pids if injector is not None else frozenset()
     loaded_pids = _loaded_pipe_pids() | owned_pids
-    availability_error = injector.availability_error() if injector is not None else '进程注入器未初始化'
+    availability_error = injector.availability_error() if injector is not None else 'QQ 连接不可用'
     for process in psutil.process_iter(['pid', 'name', 'exe']):
         try:
             name = str(process.info.get('name') or '')
@@ -122,7 +122,7 @@ def _external_qq_processes(managed_by_pid: dict[int, dict[str, Any]], injector) 
             hooked = bool(bridge and bridge.status.control_open)
             process_error = ''
             if injected and not owned and not hooked:
-                process_error = '运行时已加载，尚未接管；点击注入即可认领并接管'
+                process_error = '运行组件已加载，尚未连接；点击连接即可继续'
             external.append(
                 {
                     'id': f'external:{pid}',
@@ -195,10 +195,24 @@ def _injection_error_response(exc: Exception) -> web.Response:
         return error(str(exc), status=503, code=exc.code)
     if isinstance(exc, NativeInjectionError):
         status = 409 if exc.code in {'TARGET_NOT_QQ', 'HANDLE_NOT_OWNED'} else 502
-        return error(str(exc), status=status, code=exc.code)
+        messages = {
+            'TARGET_NOT_QQ': '目标不是受支持的 QQ 主进程',
+            'HANDLE_NOT_OWNED': '当前 QQ 连接不属于本框架',
+            'TARGET_NOT_X64': '当前 QQ 版本暂不支持',
+            'ELEVATION_REQUIRED': '请以管理员身份重启框架后再操作',
+            'QUERY_FAILED': '无法读取 QQ 进程信息',
+            'OPEN_FAILED': '无法连接 QQ 进程，请检查权限',
+            'ALLOC_FAILED': 'QQ 连接失败，请稍后重试',
+            'WRITE_FAILED': 'QQ 连接失败，请稍后重试',
+            'LOAD_FAILED': 'QQ 连接失败，请稍后重试',
+            'LOAD_TIMEOUT': 'QQ 连接超时，请稍后重试',
+            'UNLOAD_FAILED': 'QQ 连接移除失败，请稍后重试',
+        }
+        return error(messages.get(exc.code, 'QQ 连接失败，请稍后重试'),
+                     status=status, code=exc.code)
     if isinstance(exc, ValueError):
         return error(str(exc), status=400)
-    return error(str(exc), status=500)
+    return error('QQ 连接失败，请稍后重试', status=500)
 
 
 async def handle_load_process(request: web.Request) -> web.Response:
@@ -207,9 +221,9 @@ async def handle_load_process(request: web.Request) -> web.Response:
         pid, _, executable = _requested_external_qq(request.match_info.get('pid', ''))
         injector = getattr(_app, 'process_injector', None)
         if injector is None:
-            raise NativeInjectorUnavailable('进程注入器未初始化', 'UNAVAILABLE')
+            raise NativeInjectorUnavailable('QQ 连接不可用', 'UNAVAILABLE')
         result = await injector.load(pid)
-        return ok(message='运行时已注入 QQ', pid=pid, executable=str(executable), result=result)
+        return ok(message='运行组件已加载', pid=pid, executable=str(executable), result=result)
     except Exception as exc:
         return _injection_error_response(exc)
 
@@ -219,9 +233,9 @@ async def handle_unload_process(request: web.Request) -> web.Response:
         pid, _, executable = _requested_external_qq(request.match_info.get('pid', ''))
         injector = getattr(_app, 'process_injector', None)
         if injector is None:
-            raise NativeInjectorUnavailable('进程注入器未初始化', 'UNAVAILABLE')
+            raise NativeInjectorUnavailable('QQ 连接不可用', 'UNAVAILABLE')
         result = await injector.unload(pid)
-        return ok(message='运行时已从 QQ 卸载', pid=pid, executable=str(executable), result=result)
+        return ok(message='运行组件已移除', pid=pid, executable=str(executable), result=result)
     except Exception as exc:
         return _injection_error_response(exc)
 
@@ -231,7 +245,7 @@ async def handle_refresh_process(request: web.Request) -> web.Response:
         pid, _, executable = _requested_external_qq(request.match_info.get('pid', ''))
         injector = getattr(_app, 'process_injector', None)
         if injector is None:
-            raise NativeInjectorUnavailable('进程注入器未初始化', 'UNAVAILABLE')
+            raise NativeInjectorUnavailable('QQ 连接不可用', 'UNAVAILABLE')
         result = await injector.refresh(pid)
         return ok(message='QQ 运行时已重新加载', pid=pid, executable=str(executable), result=result)
     except Exception as exc:
@@ -239,31 +253,40 @@ async def handle_refresh_process(request: web.Request) -> web.Response:
 
 
 async def handle_attach_process(request: web.Request) -> web.Response:
-    """注入 + 接管：确保 DLL 已加载，然后连接接管桥开始事件转发。"""
+    """连接已登录的 QQ 进程并开始事件转发。"""
     try:
         pid, _, executable = _requested_external_qq(request.match_info.get('pid', ''))
         injector = getattr(_app, 'process_injector', None)
         if injector is None:
-            raise NativeInjectorUnavailable('进程注入器未初始化', 'UNAVAILABLE')
+            raise NativeInjectorUnavailable('QQ 连接不可用', 'UNAVAILABLE')
+        enhanced = await _app.ensure_qq_enhanced_restart(pid)
+        if enhanced.get('error'):
+            return error(enhanced['error'], status=502, pid=pid,
+                         executable=str(executable))
+        pid = int(enhanced.get('pid') or pid)
         result = await injector.load(pid)
         attach = await _app.attach_hook_bridge(pid)
         if not attach.get('attached'):
-            return error(attach.get('error') or '接管失败', status=502, pid=pid,
+            if enhanced.get('restarted'):
+                return error('QQ 已重启，请登录完成后重新点击连接',
+                             status=502, pid=pid, executable=str(executable))
+            return error('QQ 连接失败，请稍后重试', status=502, pid=pid,
                          executable=str(executable), result=result)
-        return ok(message='QQ 已接管', pid=pid, executable=str(executable),
-                  result={**result, 'hook': attach})
+        message = 'QQ 已连接'
+        return ok(message=message, pid=pid, executable=str(executable),
+                  result={**result, 'hook': attach, 'enhanced': enhanced})
     except Exception as exc:
         return _injection_error_response(exc)
 
 
 async def handle_detach_process(request: web.Request) -> web.Response:
-    """断开接管桥（DLL 保留在 QQ 内，事件不再转发）。"""
+    """断开 QQ 进程连接。"""
     try:
         pid, _, executable = _requested_external_qq(request.match_info.get('pid', ''))
         result = await _app.detach_hook_bridge(pid)
         if result.get('error'):
             return error(result['error'], status=404, pid=pid)
-        return ok(message='接管桥已断开', pid=pid, executable=str(executable), result=result)
+        return ok(message='QQ 连接已断开', pid=pid, executable=str(executable), result=result)
     except Exception as exc:
         return _injection_error_response(exc)
 

@@ -19,6 +19,7 @@ from web.tools import (
     plugin_mgr,
     processes,
     qq_versions,
+    qlinux,
     system,
     update,
 )
@@ -60,6 +61,15 @@ def get_routes() -> list:
         web.post('/api/embedded/events', handle_embedded_event),
         web.get('/api/embedded/control/poll', handle_embedded_control_poll),
         web.post('/api/embedded/control/result', handle_embedded_control_result),
+        # ── QLinux (Lagrange) 渠道 ──
+        web.get('/api/qlinux/accounts', _(qlinux.handle_qlinux_accounts)),
+        web.post('/api/qlinux/create', _(qlinux.handle_qlinux_create)),
+        web.post('/api/qlinux/login/qr', _(qlinux.handle_qlinux_login_qr)),
+        web.post('/api/qlinux/login/password', _(qlinux.handle_qlinux_login_password)),
+        web.get('/api/qlinux/qr', _(qlinux.handle_qlinux_qr)),
+        web.post('/api/qlinux/submit', _(qlinux.handle_qlinux_submit)),
+        web.post('/api/qlinux/stop', _(qlinux.handle_qlinux_stop)),
+        web.post('/api/qlinux/delete', _(qlinux.handle_qlinux_delete)),
         # ── QQ 版本管理 ──
         web.get('/api/qq/versions', _(qq_versions.handle_list_versions)),
         web.get('/api/qq/status', _(qq_versions.handle_get_status)),

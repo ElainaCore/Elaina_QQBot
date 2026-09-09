@@ -43,6 +43,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field as dc_field
 from typing import Any
 
@@ -281,7 +282,11 @@ def decode_elements(body: bytes) -> list[dict[str, Any]]:
         _decode_ptt(rich_text, elements)
         _decode_not_online_file(rich_text, elements)
     if msg_content:
-        _decode_msg_content(msg_content, elements)
+        try:
+            _decode_msg_content(msg_content, elements)
+        except (ValueError, IndexError) as exc:
+            # 脏消息/非常规元素（如闪照、二进制垃圾）不应中断整个红包派发
+            log.debug('msg_content 解码失败（已跳过）: %s', exc)
     return elements
 
 
@@ -395,6 +400,110 @@ def _decode_elem(elem: bytes, out: list[dict[str, Any]]) -> None:
             face_id = pb_int(pb_elem, 1)  # QSmallFaceExtra.faceId = field 1
             if face_id >= 0:
                 out.append({'type': 'face', 'id': face_id})
+    wallet = pb_bytes(elem, 24)  # WalletElem / 红包元素
+    if wallet:
+        packet = _decode_wallet(wallet)
+        if packet:
+            packet['raw_wallet'] = wallet.hex()
+            out.append(packet)
+
+
+def _wallet_fields(data: bytes, offset: int = 0, end: int | None = None):
+    """钱包元素的宽松字段迭代：上游截断时仍能提取前段字段。"""
+    if end is None:
+        end = len(data)
+    while offset < end:
+        try:
+            key, offset = read_varint(data, offset, end)
+        except Exception:  # noqa: BLE001
+            return
+        num, wire = key >> 3, key & 7
+        if wire == 0:
+            try:
+                value, offset = read_varint(data, offset, end)
+            except Exception:  # noqa: BLE001
+                return
+            yield num, value
+        elif wire == 2:
+            try:
+                length, offset = read_varint(data, offset, end)
+            except Exception:  # noqa: BLE001
+                return
+            if offset + length > end:
+                length = end - offset
+            yield num, data[offset:offset + length]
+            offset += length
+        elif wire == 1:
+            if offset + 8 > end:
+                return
+            yield num, data[offset:offset + 8]
+            offset += 8
+        elif wire == 5:
+            if offset + 4 > end:
+                return
+            yield num, data[offset:offset + 4]
+            offset += 4
+        else:
+            return
+
+
+def _wallet_get(data: bytes, number: int):
+    for num, value in _wallet_fields(data):
+        if num == number:
+            return value
+    return None
+
+
+def _wallet_str(data: bytes, number: int) -> str:
+    value = _wallet_get(data, number)
+    if isinstance(value, bytes):
+        return value.decode('utf-8', 'replace')
+    return str(value or '')
+
+
+def _wallet_int(data: bytes, number: int, default: int = 0) -> int:
+    value = _wallet_get(data, number)
+    if isinstance(value, bytes):
+        try:
+            return int.from_bytes(value, 'little')
+        except Exception:  # noqa: BLE001
+            return default
+    if isinstance(value, int):
+        return value
+    return default
+
+
+def _decode_wallet(wallet: bytes) -> dict[str, Any] | None:
+    """WalletElem（Elem.f24）：f1=WalletItem{f3=红包详情, f9=billNo, f10=key}。
+
+    字段号从真实样本核实：详情 f2=redtype f3=祝福语 f4=提示 f5=标题
+    f14=red?id=<billNo> 领取链接。
+    """
+    try:
+        item = _wallet_get(wallet, 1)
+        if not isinstance(item, bytes) or not item:
+            return None
+        bill_no = _wallet_str(item, 9).strip()
+        detail = _wallet_get(item, 3)
+        detail = detail if isinstance(detail, bytes) else b''
+        url = _wallet_str(detail, 14)
+        if not bill_no:
+            match = re.search(r'(?:^|[?&])id=(\d{16,40})', url)
+            if match:
+                bill_no = match.group(1)
+        if not bill_no or not bill_no.isdigit():
+            return None
+        return {
+            'type': 'red_packet',
+            'bill_no': bill_no,
+            'red_packet_type': _wallet_int(detail, 2, -1),
+            'wishing': _wallet_str(detail, 3) or _wallet_str(detail, 5),
+            'tip': _wallet_str(detail, 4),
+            'url': url,
+            'key': _wallet_str(item, 10),
+        }
+    except Exception:  # noqa: BLE001 - 红包元素解析失败不影响消息本身
+        return None
 
 
 def _decode_mention(pb_reserve: bytes) -> dict[str, Any] | None:

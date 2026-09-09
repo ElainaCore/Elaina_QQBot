@@ -44,7 +44,7 @@ from core.runtime.embedded.hook_pipe import (
 log = logging.getLogger('ElainaQQ.embedded_qq.hook')
 
 DEFAULT_ACK_TIMEOUT = 5.0
-DEFAULT_REPLY_TIMEOUT = 60.0
+DEFAULT_REPLY_TIMEOUT = 40.0  # DLL 异常路径需等 QQ 内部网络超时后才回 REPLY（实测 ~20-30s）
 HELLO_TIMEOUT = 8.0
 
 OLPUSH_CMD = 'trpc.msg.olpush.OlPushService.MsgPush'
@@ -103,9 +103,11 @@ class HookStatus:
 class HookBridge:
     """接管一条已注入 DLL 的 QQ 主进程。"""
 
-    def __init__(self, pid: int, on_event: EVENT_DISPATCHER | None = None) -> None:
+    def __init__(self, pid: int, on_event: EVENT_DISPATCHER | None = None,
+                 on_red_packet=None) -> None:
         self.pid = pid
         self.on_event = on_event
+        self.on_red_packet = on_red_packet
         self.status = HookStatus(pid=pid)
         self._control = HookPipe(control_pipe_name(pid))
         self._recv = HookPipe(recv_pipe_name(pid))
@@ -150,7 +152,7 @@ class HookBridge:
         self._closed = True
         for fut in self._pending.values():
             if not fut.done():
-                fut.set_exception(ConnectionError('接管桥已关闭'))
+                fut.set_exception(ConnectionError('QQ 连接已关闭'))
         self._pending.clear()
         if self._pump_task:
             self._pump_task.cancel()
@@ -214,10 +216,15 @@ class HookBridge:
     def _handle_packet(self, frame: Frame) -> None:
         cmd = frame.cmd
         if cmd != OLPUSH_CMD:
-            log.debug('忽略服务包 cmd=%s seq=%s', cmd, frame.value0)
+            if 'qqhb' in cmd:
+                log.info('QQHB-PACKET cmd=%s seq=%s bodyHex=%s',
+                         cmd, frame.value0, frame.body.hex()[:600])
+            else:
+                log.debug('忽略服务包 cmd=%s seq=%s', cmd, frame.value0)
             return
         self_uin = int(self.status.uin) if self.status.uin.isdigit() else 0
         for ctx in msgpush.parse_push(frame.body, self_uin):
+            self._emit_red_packet(ctx)
             payload = self._build_event(ctx)
             if payload is None:
                 continue
@@ -227,13 +234,52 @@ class HookBridge:
                 self._dispatch_tasks.add(task)
                 task.add_done_callback(self._dispatch_tasks.discard)
 
+    def _emit_red_packet(self, ctx: msgpush.MsgContext) -> None:
+        """消息元素含红包时派发给红包监听器（Windows 注入模式的检测通道）。"""
+        handler = self.on_red_packet
+        if handler is None:
+            return
+        try:
+            for elem in msgpush.decode_elements(ctx.body):
+                if elem.get('type') != 'red_packet':
+                    continue
+                packet = {
+                    'bill_no': str(elem.get('bill_no') or ''),
+                    'red_packet_type': int(elem.get('red_packet_type') or -1),
+                    'wishing': str(elem.get('wishing') or ''),
+                    'group_id': str(ctx.group_uin or ''),
+                    'group_name': str(ctx.group_name or ''),
+                    'sender_id': str(ctx.from_uin or ''),
+                    'sender_name': str(ctx.member_card or ctx.member_name or ''),
+                    'time': ctx.timestamp or int(time.time()),
+                    'chat_type': 2 if ctx.group_uin else 1,
+                    'peer_uid': str(ctx.from_uid or ''),
+                    'self_nick': str(self.status.uin or ''),
+                    'url': str(elem.get('url') or ''),
+                    'key': str(elem.get('key') or ''),
+                    'msg_seq': ctx.sequence,
+                    'raw_wallet': str(elem.get('raw_wallet') or ''),
+                }
+                if packet['bill_no']:
+                    task = asyncio.get_running_loop().create_task(self._dispatch_red_packet(packet))
+                    self._dispatch_tasks.add(task)
+                    task.add_done_callback(self._dispatch_tasks.discard)
+        except Exception:  # noqa: BLE001
+            log.exception('红包元素派发失败')
+
+    async def _dispatch_red_packet(self, packet: dict) -> None:
+        try:
+            await self.on_red_packet(packet)  # type: ignore[misc]
+        except Exception:  # noqa: BLE001
+            log.exception('红包事件分发失败')
+
     async def _dispatch(self, payload: dict) -> None:
         if payload.get('post_type') == 'message_sent' and not self.forward_self_messages:
             return  # 已关闭「接收自身消息」：丢弃自发回显，不进事件管线
         try:
             await self.on_event(payload)  # type: ignore[misc]
         except Exception:  # noqa: BLE001
-            log.exception('接管事件分发失败')
+            log.exception('QQ 事件分发失败')
 
     def _build_event(self, ctx: msgpush.MsgContext) -> dict[str, Any] | None:
         if ctx.msg_type not in MESSAGE_EVENTS:
@@ -452,7 +498,7 @@ class HookBridge:
             elif seg_type == 'xml':
                 elems.append(sendpb.encode_xml_elem(str(data.get('data') or '')))
             else:
-                raise ValueError(f'接管通道暂不支持发送段类型: {seg_type}')
+                raise ValueError(f'当前连接暂不支持发送段类型: {seg_type}')
         if not elems:
             raise ValueError('消息为空或没有可发送的段')
         return elems
@@ -532,6 +578,19 @@ class HookBridge:
                 if not meta:
                     return None
                 return {'message_id': message_id, **meta}
+            if action == 'send_packet':
+                # 通用 packet 透传：cmd + hex body → op=2 → 返回 hex 响应。
+                cmd = str(params.get('cmd') or '')
+                if not cmd:
+                    return {'error': '缺少 cmd'}
+                body_hex = str(params.get('data') or params.get('body_hex') or params.get('body') or '')
+                try:
+                    body = bytes.fromhex(body_hex)
+                except ValueError:
+                    return {'error': 'data 不是合法 hex'}
+                timeout = float(params.get('timeout') or 40.0)
+                reply = await self.request(cmd, body, reply_timeout=timeout)
+                return {'cmd': cmd, 'body_hex': reply.hex()}
         except (ValueError, RuntimeError, ConnectionError, TimeoutError) as exc:
             return {'error': str(exc)}
         return None

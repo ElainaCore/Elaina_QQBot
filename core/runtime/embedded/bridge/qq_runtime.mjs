@@ -243,6 +243,12 @@ class QQInstance {
   setRedPacketCallback(cb) {
     this.redPacketCallback = cb;
   }
+  debugFileLog(line) {
+    try {
+      const file = process.env["ELAINAQQ_DATA_DIR"] + "/attach-debug.log";
+      fs.appendFileSync(file, new Date().toISOString() + " " + line + "\n");
+    } catch {}
+  }
   setStatus(status, extra) {
       this.runtime = { ...this.runtime, status, ...extra };
     log(this.botConfig.id, "状态变更:", status, extra ? safeJson(extra, 200) : "");
@@ -300,12 +306,13 @@ class QQInstance {
       log(id, "步骤4: 初始化登录服务...");
       this.loginService = this.wrapper.NodeIKernelLoginService.get();
       this.loginService.initConfig({
-        machineId: "",
+        // 每个账号注入独立设备标识，避免同机多实例被服务器识别为同一设备而互蹋。
+        machineId: process.env["ELAINAQQ_DEVICE_GUID"] || "",
         appid: this.qqInfo.appid,
         platVer: os.release(),
         commonPath: dataPathGlobal,
         clientVer: this.qqInfo.version,
-        hostName: os.hostname(),
+        hostName: process.env["ELAINAQQ_DEVICE_NAME"] || os.hostname(),
         externalVersion: false
       });
       log(id, "登录服务初始化成功");
@@ -318,43 +325,52 @@ class QQInstance {
           log(id, "amgom a1 跳过:", e.message);
         }
       }
-      log(id, "步骤4: 开始登录...");
-      this.selfInfo = await this.doLogin();
-      log(id, "登录完成:", JSON.stringify(this.selfInfo));
-      if (this.o3Service) {
-        try {
-          const amgomHex = "eb1fd6ac257461580dc7438eb099f23aae04ca679f4d88f53072dc56e3bb1129";
-          this.o3Service.setAmgomDataPiece(this.qqInfo.appid, new Uint8Array(Buffer.from(amgomHex, "hex")));
-          this.o3Service.reportAmgomWeather("login", "a6", [dataTimestamp, "184", "329"]);
-          log(id, "amgom a6 上报成功");
-        } catch (e) {
-          log(id, "amgom a6 跳过:", e.message);
+            if (String(process.env.ELAINAQQ_ATTACH_MODE || "") === "1") {
+        // Windows Hook 启动模式：QQ UI（app_launcher）已经初始化并登录了共享
+        // wrapper session（nt_1）。bridge 不再自己登录/初始化，只等待 UI 侧
+        // 完成后挂接监听器，避免二次 init 冲突。
+        log(id, "[ATTACH] Hook 模式：等待 QQ UI 完成登录与会话初始化...");
+        await this.attachExistingSession(dataPath);
+        log(id, "[ATTACH] 挂接完成，跳过独立登录/初始化");
+      } else {
+  log(id, "步骤4: 开始登录...");
+        this.selfInfo = await this.doLogin();
+        log(id, "登录完成:", JSON.stringify(this.selfInfo));
+        if (this.o3Service) {
+          try {
+            const amgomHex = "eb1fd6ac257461580dc7438eb099f23aae04ca679f4d88f53072dc56e3bb1129";
+            this.o3Service.setAmgomDataPiece(this.qqInfo.appid, new Uint8Array(Buffer.from(amgomHex, "hex")));
+            this.o3Service.reportAmgomWeather("login", "a6", [dataTimestamp, "184", "329"]);
+            log(id, "amgom a6 上报成功");
+          } catch (e) {
+            log(id, "amgom a6 跳过:", e.message);
+          }
         }
+        log(id, "步骤5: 初始化 session...");
+        await this.initSession(dataPath);
+        log(id, "session 初始化完成");
+        this.packetRuntime.initializeAfterSession();
+        log(id, "步骤6: 注册消息监听...");
+        this.registerMsgListener();
+        this.registerEventListeners();
+        this.initializeGroupMemberSnapshots().catch((error) => {
+          logErr(id, "[事件] 初始化群成员快照失败:", error?.message || error);
+        });
+        this.botConfig.uin = this.selfInfo.uin;
+        this.botConfig.nickname = this.selfInfo.nick || this.selfInfo.uin;
+        botUinMap.set(this.botConfig.id, this.selfInfo.uin);
+        this.setStatus("online", {
+          loginUin: this.selfInfo.uin,
+          nickname: this.botConfig.nickname,
+        });
+        this.oneBotEventCallback?.(createLifecycleEvent(this.getSelfUin()));
+        this.startOneBotHeartbeat();
       }
-      log(id, "步骤5: 初始化 session...");
-      await this.initSession(dataPath);
-      log(id, "session 初始化完成");
-      this.packetRuntime.initializeAfterSession();
-      log(id, "步骤6: 注册消息监听...");
-      this.registerMsgListener();
-      this.registerEventListeners();
-      this.initializeGroupMemberSnapshots().catch((error) => {
-        logErr(id, "[事件] 初始化群成员快照失败:", error?.message || error);
-      });
-      this.botConfig.uin = this.selfInfo.uin;
-      this.botConfig.nickname = this.selfInfo.nick || this.selfInfo.uin;
-      botUinMap.set(this.botConfig.id, this.selfInfo.uin);
-      this.setStatus("online", {
-        loginUin: this.selfInfo.uin,
-        nickname: this.botConfig.nickname,
-      });
-      this.oneBotEventCallback?.(createLifecycleEvent(this.getSelfUin()));
-      this.startOneBotHeartbeat();
       log(id, "=== 启动完成, 已上线 ===");
     } catch (e) {
       logErr(id, "=== 启动失败 ===", e.message, e.stack);
       this.setStatus("error", { error: e.message });
-      throw e;
+      logErr(id, "[ATTACH] 启动异常已捕获（不传播，避免拖垮 QQ 进程）");
     }
   }
   createSession() {
@@ -667,6 +683,8 @@ class QQInstance {
         return this.getOneBotHistory("group", String(params.group_id), params);
       case "get_friend_msg_history":
         return this.getOneBotHistory("private", String(params.user_id), params);
+      case "scan_red_packet_history":
+        return this.scanRedPacketHistory(params);
       case "mark_all_as_read":
       case "_mark_all_as_read":
         await this.markAllOneBotMessagesRead();
@@ -1010,6 +1028,85 @@ class QQInstance {
       next_cursor: String(oldest?.real_seq || oldest?.message_seq || ""),
     };
   }
+  /** 群号 → 群 uid（u_xxx）。NTQQ 历史消息接口需要 uid 而不是群号。 */
+  async resolveGroupUid(groupId) {
+    const service = this.session?.getGroupService?.();
+    if (!service?.getGroupList) return "";
+    const waited = await this.waitForNativeEvent(
+      "group_list",
+      () => service.getGroupList(false),
+      (_updateType, groups) => Array.isArray(groups) || groups instanceof Map || (groups && typeof groups === "object"),
+      (result) => extractNativeGroupList(result) !== undefined,
+    );
+    const rawGroups = waited.direct !== null ? extractNativeGroupList(waited.direct) : waited.args[1];
+    const wanted = String(groupId);
+    for (const group of collectionValues(rawGroups)) {
+      if (!group || typeof group !== "object") continue;
+      const code = String(group.groupCode ?? group.group_id ?? group.groupId ?? "");
+      if (code === wanted) return String(group.uid ?? group.peerUid ?? "");
+    }
+    return "";
+  }
+  /**
+   * 历史红包扫描：绕过实时门禁，把指定群近期消息里的 walletElement
+   * 注册进 redPackets 并逐个推送红包事件（走插件自动领取链路）。
+   * 用于重启后的历史红包重放（红包未被领完的场景）。
+   */
+  async scanRedPacketHistory(params = {}) {
+    const groupId = String(params.group_id || "");
+    if (!groupId) throw new OneBotActionError("缺少 group_id", 1400, "scan_red_packet_history");
+    // 9.9.35 的 service 对象方法 typeof 探测全部 undefined，但实际可调用（渲染层实测）。
+    // 因此不做 typeof 预检，直接盲调，让运行时结果说话。
+    const service = this.getMsgService();
+    if (!service) {
+      throw new OneBotActionError("msgService 为空（session 未初始化）", 1405, "scan_red_packet_history");
+    }
+    // 群号 → uid：历史接口的 chatInfo.peerUid 必须传 uid，传群号返回空列表
+    let peerUid = await this.resolveGroupUid(groupId);
+    this.debugFileLog?.(`[RED] scan group=${groupId} uid=${peerUid || "<unresolved>"}`);
+    if (!peerUid) {
+      // 群列表里没有时退回群号本身（部分版本兼容）
+      peerUid = groupId;
+    }
+    const hours = Math.min(168, Math.max(1, Number(params.hours || 48)));
+    const fromTime = String(Math.floor(Date.now() / 1e3) - hours * 3600);
+    const count = Math.min(300, Math.max(10, Number(params.count || 100)));
+    let result;
+    try {
+      result = await service.queryMsgsWithFilterEx("0", "0", "0", {
+        chatInfo: { chatType: 2, peerUid, guildId: "" },
+        filterMsgType: [],
+        filterSendersUid: [],
+        filterMsgToTime: "0",
+        filterMsgFromTime: fromTime,
+        isReverseOrder: true,
+        isIncludeCurrent: true,
+        pageLimit: count,
+      });
+    } catch (error) {
+      this.debugFileLog?.(`[RED] scan invoke failed: ${error?.message || error}`);
+      throw new OneBotActionError(
+        `历史消息接口调用失败: ${error?.message || error}`, 1405, "scan_red_packet_history",
+      );
+    }
+    checkNativeResult(result, "获取历史消息失败");
+    const msgList = Array.isArray(result?.msgList) ? result.msgList : [];
+    const found = [];
+    for (const msg of msgList) {
+      for (const element of msg?.elements || []) {
+        if (!element?.walletElement) continue;
+        const packet = this.rememberRedPacket(msg, element.walletElement);
+        if (packet) {
+          const payload = this.redPacketPayload(packet);
+          found.push(payload);
+          this.redPacketCallback?.(payload);
+        }
+      }
+    }
+    this.debugFileLog?.(`[RED] scan group=${groupId} msgs=${msgList.length} packets=${found.length}`);
+    return { scanned: msgList.length, red_packets: found };
+  }
+
   async markAllOneBotMessagesRead() {
     const method = requireNativeMethod(this.getMsgService(), "setAllC2CAndGroupMsgRead", "mark_all_as_read");
     checkNativeResult(await method(), "全部已读失败");
@@ -3290,6 +3387,7 @@ class QQInstance {
   emitRedPackets(msg, elements) {
     for (const element of elements) {
       if (!element?.walletElement) continue;
+      this.debugFileLog?.("[RED] walletElement detected billNo=" + (this.redPacketBillNo(element.walletElement) || "?"));
       const packet = this.rememberRedPacket(msg, element.walletElement);
       if (!packet) continue;
       this.redPacketCallback?.(this.redPacketPayload(packet));
@@ -3343,17 +3441,47 @@ class QQInstance {
   }
   async grabRedPacket(params = {}) {
     const billNo = String(params.bill_no || params.billNo || "");
-    const packet = this.redPackets.get(billNo);
+    let packet = this.redPackets.get(billNo);
+    if (!packet && (params.peer_uid || params.peerUid) && (params.pc_body || params.pcBody)) {
+      const peerUid = String(params.peer_uid || params.peerUid || "");
+      const groupId = String(params.group_id || "");
+      const chatType = Number(params.chat_type || (groupId ? 2 : 1));
+      const pcBody = String(params.pc_body || params.pcBody || "");
+      const index = String(params.string_index || params.stringIndex || params.index || billNo);
+      const wishing = String(params.wishing || "");
+      packet = {
+        createdAt: Date.now(),
+        eventReceivedAtMs: Date.now(),
+        billNo,
+        wallet: { pcBody, stringIndex: index, receiver: { title: wishing } },
+        peerUid,
+        peerUin: groupId,
+        groupId,
+        groupName: "",
+        senderId: "",
+        senderName: "",
+        chatType,
+        msgSeq: String(params.msg_seq || params.msgSeq || ""),
+        redBagType: 0,
+        senderRole: 4,
+        wishing,
+        password: wishing,
+        redChannel: Number(params.red_channel || 0),
+        exclusiveUin: "",
+        exclusiveUid: ""
+      };
+      this.redPackets.set(billNo, packet);
+    }
     if (!packet) {
       return { ok: false, amount: 0, err_code: -2, err_msg: "红包上下文不存在或已过期" };
     }
     const service = this.getMsgService();
-    if (!service || typeof service.grabRedBag !== "function") {
-      return { ok: false, amount: 0, err_code: -3, err_msg: "当前 QQ 协议不支持 grabRedBag" };
+    if (!service) {
+      return { ok: false, amount: 0, err_code: -3, err_msg: "service 不存在" };
     }
     const selfUin = String(this.getSelfUin() || "");
     const request = {
-      recvUin: packet.chatType === 1 ? selfUin : packet.groupId,
+      recvUin: packet.chatType === 1 ? selfUin : (packet.peerUid || packet.groupId),
       recvType: packet.chatType,
       peerUid: packet.peerUid,
       name: String(this.getSelfNick() || selfUin),
@@ -4273,6 +4401,20 @@ class QQInstance {
   }
   async queryGroupList(params = {}) {
     const service = this.session?.getGroupService?.();
+    try {
+      const sessionMethods = Object.getOwnPropertyNames(Object.getPrototypeOf(this.session) || {})
+        .filter((n) => /service/i.test(n)).join(",");
+      this.debugFileLog?.("[GLIST] session=" + (this.session ? "ok" : "null") + " serviceMethods=[" + sessionMethods + "]");
+    } catch {}
+    let svcErr = "";
+    let svc2 = null;
+    try {
+      svc2 = this.session?.getGroupService ? this.session.getGroupService() : undefined;
+    } catch (error) {
+      svcErr = String(error?.message || error);
+    }
+    this.debugFileLog?.("[GLIST] direct call service=" + (svc2 ? "ok" : "null") + " err=" + (svcErr || "none"));
+    this.debugFileLog?.("[GLIST] service=" + (service ? "ok" : "null") + " hasGetGroupList=" + (service?.getGroupList ? "yes" : "no"));
     if (!service?.getGroupList) return [];
     const forced = this.asBoolean(params.no_cache, false);
     const waited = await this.waitForNativeEvent(
@@ -4284,7 +4426,9 @@ class QQInstance {
     if (waited.direct !== null) {
       checkNativeResult(waited.direct, "获取群列表失败");
     }
+    this.debugFileLog?.("[GLIST] direct=" + (waited.direct !== null ? "yes" : "no") + " args=" + JSON.stringify(waited.args).slice(0, 200));
     const rawGroups = waited.direct !== null ? extractNativeGroupList(waited.direct) : waited.args[1];
+    this.debugFileLog?.("[GLIST] rawGroups=" + JSON.stringify(rawGroups).slice(0, 300));
     return collectionValues(rawGroups)
       .filter((group) => group && typeof group === "object")
       .map((group) => oneBotGroup(group))
@@ -4875,11 +5019,236 @@ class QQInstance {
       log(id, "[LOGIN] connect 完成，等待回调...");
     });
   }
+  async attachExistingSession(dataPath) {
+    const id = this.botConfig.id;
+    const fsDebug = await import("fs");
+    const debugLogPath = dataPath + "/attach-debug.log";
+    const debugLog = (line) => {
+      try {
+        fsDebug.appendFileSync(debugLogPath, new Date().toISOString() + " " + line + "\n");
+      } catch {}
+    };
+    debugLog("=== attach start pid=" + process.pid + " type=" + (process.env.ELAINAQQ_PROCESS_TYPE || "?") + " argv=" + process.argv.slice(1, 3).join(" "));
+    // 复用 QQ UI 已创建/正在初始化的共享 wrapper session（nt_1）。
+    this.createSession();
+
+    // QQ UI 可能使用 nt_1 之外的 session 名。枚举常见名字，
+    // 找到 isSessionInitd()=true 的活动 session 并切换过去。
+    try {
+      const sessionApiEnum = this.wrapper?.NodeIQQNTWrapperSession;
+      if (typeof sessionApiEnum?.getNTWrapperSession === "function") {
+        for (const name of ["nt_1", "nt_2", "nt_3", "nt_0", "nt_4", "nt_5"]) {
+          try {
+            const candidate = sessionApiEnum.getNTWrapperSession(name);
+            if (!candidate) {
+              debugLog("[ATTACH] session " + name + ": null");
+              continue;
+            }
+            const initd = typeof candidate.isSessionInitd === "function" ? candidate.isSessionInitd() : false;
+            debugLog("[ATTACH] session " + name + ": initd=" + initd);
+          } catch (error) {
+            debugLog("[ATTACH] session " + name + " probe error: " + (error?.message || error));
+          }
+        }
+      }
+    } catch (error) {
+      debugLog("[ATTACH] session enumeration failed: " + (error?.message || error));
+    }
+    if (!this.session) throw new Error("[ATTACH] 未获取到共享 wrapper session");
+    // 等待 QQ UI 完成 session.init（最多 180 秒，仅等待不失败）。
+    const deadline = Date.now() + 180000;
+    let ready = false;
+    const sessionApiEnum = this.wrapper?.NodeIQQNTWrapperSession;
+    while (Date.now() < deadline) {
+      try {
+        if (typeof this.session.isSessionInitd === "function" && this.session.isSessionInitd()) {
+          ready = true;
+          break;
+        }
+        // QQ UI 初始化完成后可能 init 了别的 session（nt_1/nt_2...）。
+        // 每轮重新枚举，一旦发现 initd 的 session 就切换过去。
+        if (typeof sessionApiEnum?.getNTWrapperSession === "function") {
+          for (const name of ["nt_1", "nt_2", "nt_3", "nt_0", "nt_4", "nt_5"]) {
+            try {
+              const candidate = sessionApiEnum.getNTWrapperSession(name);
+              if (!candidate || candidate === this.session) continue;
+              const initd = typeof candidate.isSessionInitd === "function" ? candidate.isSessionInitd() : false;
+              if (initd) {
+                debugLog("[ATTACH] found initialized session: " + name + " -> switching");
+                this.session = candidate;
+                this.sessionName = name;
+                ready = true;
+                break;
+              }
+            } catch {}
+          }
+          if (ready) break;
+        }
+      } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    log(id, `[ATTACH] isSessionInitd=${ready ? "true" : "unavailable/timeout"}，继续等待登录态`);
+    debugLog("[ATTACH] wait loop done, ready=" + ready + " sessionName=" + (this.sessionName || "nt_1"));
+    // 无限轮询登录态（不超时 —— 超时退出会杀死整个 QQ 进程）。
+    let selfUin = "";
+    let selfUid = "";
+    let nick = "";
+    let probeAt = 0;
+    while (true) {
+      try {
+        const service = this.session.getLoginService?.() || this.wrapper?.NodeIKernelLoginService?.get?.();
+        if (!service) {
+          debugLog("[ATTACH] LoginService not ready; loginService methods=" + (this.session.getLoginService ? "session.getLoginService exists" : "no session.getLoginService"));
+        } else {
+          debugLog("[ATTACH] probing login service...");
+          const attempts = [
+            // 登录完成后稳定的信号源（不依赖登录中的瞬时列表）。
+            async () => {
+              const uidDirect = this.session?.getSelfUid?.() || this.session?.getSelfUin?.();
+              if (uidDirect) {
+                return { uin: this.session?.getSelfUin?.() || "", uid: uidDirect, nick: "" };
+              }
+              return null;
+            },
+            async () => {
+              const profileService = this.wrapper?.NodeIKernelProfileService?.get?.();
+              const self = await profileService?.getSelfProfile?.(true);
+              const info = self?.result || self?.profile || self;
+              if (info?.uin || info?.uid) return info;
+              return null;
+            },
+            async () => {
+              const list = await service.getLoginList?.();
+              try {
+                const fsD = await import("fs");
+                fsD.appendFileSync(dataPath + "/attach-debug.log", new Date().toISOString() + " getLoginList raw=" + JSON.stringify(list).slice(0, 1200) + "\n");
+              } catch {}
+              const raw = list?.result && typeof list.result === "object" && !Array.isArray(list.result) ? list.result : list;
+              const arr = raw?.LocalLoginInfoList || raw?.loginList || [];
+              const first = Array.isArray(arr) ? arr.find((item) => Number(item?.isLogin ?? item?.isLoginStatus ?? 0) === 1) || arr[0] : null;
+              return first;
+            },
+            () => service.getLoginedAccount?.(),
+            () => service.getAccountData?.(),
+            () => service.getLoginInfo?.(),
+          ];
+          for (const attempt of attempts) {
+            if (typeof attempt !== "function") continue;
+            try {
+              const account = await attempt.call(service);
+              const info = account?.result || account?.data || account;
+              selfUin = String(info?.uin || info?.account || info?.mainAccount || "");
+              selfUid = String(info?.uid || info?.userUid || info?.accountUid || info?.uidInCore || "");
+              nick = String(info?.nick || info?.nickName || info?.nickname || "");
+              if (selfUin && /^\d+$/.test(selfUin)) break;
+            } catch {}
+          }
+          if (Date.now() - probeAt > 30000) {
+            probeAt = Date.now();
+            debugLog("[ATTACH] probe: uin=" + (selfUin || "(empty)") + " uid=" + (selfUid || "(empty)") + " methods=" + Object.getOwnPropertyNames(Object.getPrototypeOf(service) || {}).filter((n) => /login|account/i.test(n)).join(","));
+          }
+        }
+      } catch {}
+      if (selfUin && /^\d+$/.test(selfUin)) break;
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+    this.selfInfo = { uin: selfUin, uid: selfUid, nick };
+    log(id, "[ATTACH] selfInfo ready", selfUin);
+    debugLog("[ATTACH] step begin");
+    const step = async (name, fn) => {
+      try {
+        await fn();
+        debugLog("[ATTACH] step ok: " + name);
+      } catch (error) {
+        debugLog("[ATTACH] step FAILED: " + name + " -> " + (error?.stack || error?.message || String(error)));
+      }
+    };
+    await step("initializeAfterSession", async () => { this.packetRuntime.initializeAfterSession(); });
+    await step("initSession", async () => {
+      try {
+        await this.initSession(dataPath);
+        this.debugFileLog?.("[ATTACH] initSession done, session=" + (this.session ? "ok" : "null"));
+      } catch (error) {
+        this.debugFileLog?.("[ATTACH] initSession FAILED: " + (error?.message || error));
+        throw error;
+      }
+    });
+    await step("registerMsgListener", async () => { this.registerMsgListener(); });
+    await step("registerEventListeners", async () => { this.registerEventListeners(); });
+    this.initializeGroupMemberSnapshots().catch((error) => {
+      logErr(id, "[ATTACH] snapshot failed:", error?.message || error);
+    });
+    this.botConfig.uin = this.selfInfo.uin;
+    this.botConfig.nickname = this.selfInfo.nick || this.selfInfo.uin;
+    botUinMap.set(this.botConfig.id, this.selfInfo.uin);
+    await step("setStatusOnline", async () => {
+      this.setStatus("online", {
+        loginUin: this.selfInfo.uin,
+        nickname: this.botConfig.nickname,
+      });
+    });
+    this.oneBotEventCallback?.(createLifecycleEvent(this.getSelfUin()));
+    this.startOneBotHeartbeat();
+    debugLog("[ATTACH] all steps done");
+    this.startHistoryPolling();
+  }
+
+  /** 兜底：session 收不到推送时，轮询历史消息检测红包（9.9.35 UI 不 init wrapper session） */
+  startHistoryPolling() {
+    if (this.historyPollTimer) clearInterval(this.historyPollTimer);
+    let lastTs = Date.now() - 120_000;
+    this.historyPollTimer = setInterval(async () => {
+      try {
+        const service = this.getMsgService();
+        if (!service || typeof service.queryMsgsWithFilterEx !== "function") return;
+        const groups = this.pollGroups || [];
+        for (const group of groups) {
+          try {
+            const res = await service.queryMsgsWithFilterEx("0", "0", "0", {
+              chatInfo: { chatType: 2, peerUid: String(group.peerUid || ""), guildId: "" },
+              filterMsgType: [],
+              filterSendersUid: [],
+              filterMsgToTime: "0",
+              filterMsgFromTime: String(lastTs),
+              isReverseOrder: true,
+              isIncludeCurrent: true,
+              pageLimit: 40,
+            });
+            const msgList = Array.isArray(res?.msgList) ? res.msgList : [];
+            for (const msg of msgList) {
+              const ts = Number(msg?.msgTime || 0) * 1000;
+              if (ts > lastTs) lastTs = ts;
+            }
+            if (msgList.length) {
+              this.debugFileLog?.(`[POLL] group=${group.peerUid} msgs=${msgList.length}`);
+              await this.handleIncomingMessages(msgList, false);
+            }
+          } catch (error) {
+            this.debugFileLog?.("[POLL] query failed: " + (error?.message || error));
+            break;
+          }
+        }
+      } catch {}
+    }, 3000);
+    this.historyPollTimer.unref?.();
+    this.debugFileLog?.("[POLL] history polling started (3s interval)");
+  }
+
+  /** 供 manager 动态设置要轮询的群 */
+  setPollGroups(groups) {
+    this.pollGroups = Array.isArray(groups)
+      ? groups.map((g) => ({ peerUid: String(g.peerUid || g.group_uid || ""), groupId: String(g.group_id || "") }))
+      : [];
+    this.debugFileLog?.("[POLL] groups set: " + JSON.stringify(this.pollGroups));
+  }
   /** QQNT session 初始化 */
   async initSession(dataPath) {
     const id = this.botConfig.id;
     if (!this.selfInfo) throw new Error("未登录");
-    let guid = this.loginService.getMachineGuid();
+    let guid = process.env["ELAINAQQ_DEVICE_GUID"] || "";
+    if (!guid) {
+      guid = this.loginService.getMachineGuid();
+    }
     if (guid && guid.length >= 32 && !guid.includes("-")) {
       guid = guid.slice(0, 8) + "-" + guid.slice(8, 12) + "-" + guid.slice(12, 16) + "-" + guid.slice(16, 20) + "-" + guid.slice(20);
     }
@@ -4895,7 +5264,7 @@ class QQInstance {
       a2: "",
       d2: "",
       d2Key: "",
-      machineId: "",
+      machineId: process.env["ELAINAQQ_DEVICE_GUID"] || "",
       platform: platformType,
       platVer: os.release(),
       appid: this.qqInfo.appid,
@@ -4919,7 +5288,7 @@ class QQInstance {
         guid,
         buildVer: this.qqInfo.version,
         localId: 2052,
-        devName: os.hostname(),
+        devName: process.env["ELAINAQQ_DEVICE_NAME"] || os.hostname(),
         devType: os.type(),
         vendorName: "",
         osVer: os.release(),
@@ -4938,7 +5307,9 @@ class QQInstance {
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
-        reject(new Error("QQ Session 初始化超时（未收到 onOpentelemetryInit）"));
+        // 9.9.35+ 可能不回调 onOpentelemetryInit 但 session 已可用。
+        // 乐观成功：让后续 registerMsgListener 继续注册，由实际服务可用性判定。
+        resolve();
       }, 30000);
       const finish = (error) => {
         if (settled) return;
@@ -5093,6 +5464,7 @@ class QQInstance {
     const id = this.botConfig.id;
     const gate = this.incomingMessageGate;
     if (!gate) return;
+    this.debugFileLog?.(`[MSG] batch=${Array.from(msgs || []).length}`);
     const ignored = { history: 0, invalid_time: 0, duplicate: 0 };
     const jobs = [];
     for (const msg of Array.from(msgs || [])) {
@@ -6062,7 +6434,7 @@ class QQInstance {
     const event = await this.toOneBotEvent(raw);
     const nativeId = nativeMessageKey(raw) || reference.nativeId;
     if (!event) {
-      // 保留原生目标，后续 get_msg 仍可按 NapCat 链路重新转换图片等媒体。
+      // 保留原生目标，后续 get_msg 仍可重新转换图片等媒体。
       const alias = String(reference.messageId);
       this.oneBotRawMessages.set(alias, raw);
       if (nativeId) this.oneBotNativeMessageIds.set(alias, String(nativeId));
@@ -6238,7 +6610,7 @@ class QQInstance {
           const current = appid === "1406" ? values.private : values.group;
           if (current) { rkey = current; online = true; }
         } catch (error) {
-          logErr(this.botConfig.id, "[消息] 获取动态图片 rkey 失败，使用 NapCat fallback:", error?.message || error);
+          logErr(this.botConfig.id, "[消息] 获取动态图片 rkey 失败，使用备用处理:", error?.message || error);
         }
         const download = new URL("/download", online ? "https://multimedia.nt.qq.com.cn" : "https://gchat.qpic.cn");
         download.searchParams.set("appid", appid);
@@ -6673,10 +7045,10 @@ function embeddedBotConfig() {
   };
 }
 async function main() {
-  console.log(`[工作进程] 启动机器人编号=${BOT_ID}，使用账号独立桥接通道`);
-  console.log(`[工作进程] 桥接地址: ${MANAGER_URL}`);
+  console.log(`[工作进程] 启动机器人编号=${BOT_ID}`);
+  console.log('[工作进程] 账号连接已准备');
   if (!EMBEDDED) {
-    throw new Error("内置 QQ 桥接只能由框架启动");
+    throw new Error("内置 QQ 只能由框架启动");
   }
   if (!BOT_ID) {
     console.error("[工作进程] 缺少 ELAINAQQ_BOT_ID 环境变量");
@@ -6731,11 +7103,22 @@ process.on("beforeExit", (code) => {
   }
 });
 if (process.env["ELAINAQQ_WORKER_TEST"] !== "1") {
-  main().catch((e) => {
-    console.error("[工作进程] 启动失败:", e);
-    clearInterval(lifecycleKeepAlive);
-    process.exit(1);
-  });
+  // Hook 启动模式下 QQ 的多个 Electron 子进程都会加载 wrapper.node，
+  // 但只有主进程（utility 之上的 browser 主进程）应运行 bridge。
+  const processType = String(process.env["ELAINAQQ_PROCESS_TYPE"] || "");
+  const isMain = !processType || processType === "browser" || processType === "main";
+  if (!isMain) {
+    console.log(`[工作进程] 跳过非主进程 (type=${processType})`);
+  } else if (globalThis.__ELAINAQQ_BRIDGE_STARTED__) {
+    console.log("[工作进程] bridge 已在当前进程启动，跳过重复加载");
+  } else {
+    globalThis.__ELAINAQQ_BRIDGE_STARTED__ = true;
+    main().catch((e) => {
+      console.error("[工作进程] 启动失败:", e);
+      clearInterval(lifecycleKeepAlive);
+      process.exit(1);
+    });
+  }
 }
 
 export { QQInstance };

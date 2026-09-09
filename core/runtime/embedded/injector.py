@@ -135,11 +135,11 @@ class NativeQQInjector:
 
     def availability_error(self) -> str:
         if os.name != 'nt' or platform.machine().lower() not in {'amd64', 'x86_64'}:
-            return '进程注入当前仅支持 Windows x64'
+            return '当前环境不支持 QQ 连接'
         if ctypes.sizeof(ctypes.c_void_p) != 8:
-            return 'Python 必须是 64 位版本才能注入 64 位 QQ'
+            return '当前运行环境不支持 QQ 连接'
         if not self.dll_path.is_file():
-            return f'QQ 注入模块不存在: {self.dll_path}'
+            return 'QQ 连接组件不可用'
         return ''
 
     @property

@@ -42,7 +42,7 @@ class QQLauncher:
         return frozenset(str(version) for version in table)
 
     def windows_version(self) -> str:
-        """按 NapCat 的目录规则读取 Windows QQNT 的真实版本。"""
+        """按 QQ 目录规则读取 Windows QQNT 的真实版本。"""
         base = self.executable.parent
         config_candidates = (
             base / 'versions' / 'config.json',
@@ -54,7 +54,7 @@ class QQLauncher:
             config = self._read_json(config_path)
             version = str(config.get('curVersion') or '').strip()
             if not version:
-                raise RuntimeError(f'QQ 快更配置缺少 curVersion: {config_path}')
+                raise RuntimeError(f'QQ 版本配置缺少 curVersion: {config_path}')
             return version
 
         package_candidates = [base / 'resources' / 'app' / 'package.json']
@@ -81,7 +81,14 @@ class QQLauncher:
     def validate_windows_version(self) -> str:
         version = self.windows_version()
         if version not in self.windows_supported_versions():
-            raise RuntimeError(f'Windows QQ {version} 不在 NapCat 兼容版本列表中，已拒绝启动')
+            # Windows Hook 启动模式下，未知版本仍允许启动：loader 会在 wrapper.node
+            # 加载时拉起内置运行时，不依赖 appid 表；真正不兼容的部分会在运行时暴露。
+            from core.foundation.config import cfg
+
+            if bool(cfg.get('settings', 'embedded_qq.windows_hook_launch', False)):
+                log.warning('当前 Windows QQ 版本 %s 不在兼容表内，已按 Hook 启动模式继续', version)
+            else:
+                raise RuntimeError(f'当前 Windows QQ 版本 {version} 暂不兼容，无法启动')
         return version
 
     def app_dir(self) -> Path:
@@ -145,18 +152,59 @@ class QQLauncher:
             "const { pathToFileURL } = require('url');\n"
             'const entry = process.env.ELAINAQQ_BRIDGE_ENTRY;\n'
             f'const originalMain = {json.dumps(str(original_main), ensure_ascii=False)};\n'
-            "const skipOriginalMain = process.env.ELAINAQQ_EMBEDDED === '1';\n"
+            "const skipOriginalMain = process.env.ELAINAQQ_SKIP_QQ_UI === '1';\n"
             'const originalDlopen = process.dlopen;\n'
             'let bridgeStarted = false;\n'
             'function startBridge(filename) {\n'
             '  if (bridgeStarted || !entry) return;\n'
+            "  // 只有 QQ 主进程（无 --type= 参数）才启动 bridge\n"
+            "  if (process.argv.some((arg) => {\n"
+            "    const a = String(arg);\n"
+            "    return a.startsWith('--type=') || a.startsWith('--pcqq-platform-channel-handle') || a.startsWith('--loadapp');\n"
+            "  })) return;\n"
             '  bridgeStarted = true;\n'
             '  if (filename) process.env.ELAINAQQ_WRAPPER_PATH = filename;\n'
             '  process.dlopen = originalDlopen;\n'
             '  import(pathToFileURL(entry).href).catch((error) => {\n'
             "    console.error('[ElainaQQ] 运行时加载失败:', error);\n"
-            '    process.exitCode = 1;\n'
+            '    // bridge 失败不能拖垮 QQ UI（Windows Hook 模式共用进程）\n'
             '  });\n'
+            '}\n'
+            'const electronMod = require("electron");\n'
+            'const { app, session, ipcMain } = electronMod;\n'
+            'const grabPreloadPath = process.env.ELAINAQQ_GRAB_PRELOAD || "";\n'
+            'const grabNickName = process.env.ELAINAQQ_GRAB_NICKNAME || "";\n'
+            'if (grabPreloadPath && !process.argv.some((a) => String(a).startsWith("--type="))) {\n'
+            '  let grabConfigured = false;\n'
+            '  const applyPreload = (s) => {\n'
+            '    try {\n'
+            '      const list = (s.getPreloads && s.getPreloads()) || [];\n'
+            '      if (!list.includes(grabPreloadPath)) s.setPreloads(list.concat([grabPreloadPath]));\n'
+            '    } catch (e2) {}\n'
+            '  };\n'
+            '  const configureGrab = () => {\n'
+            '    if (grabConfigured) return;\n'
+            '    grabConfigured = true;\n'
+            '    try {\n'
+            '      if (session.defaultSession) applyPreload(session.defaultSession);\n'
+            '      app.on("session-created", (s) => applyPreload(s));\n'
+            '      app.on("web-contents-created", (_ev, wc) => { try { if (wc.session) applyPreload(wc.session); } catch (e3) {} });\n'
+            '      console.log("[ElainaQQ] grab preload installed:", grabPreloadPath);\n'
+            '    } catch (error) { console.error("[ElainaQQ] setPreload failed:", error); }\n'
+            '  };\n'
+            '  if (app.isReady()) configureGrab(); else app.whenReady().then(configureGrab);\n'
+            '  ipcMain.handle("elainaqq:whoami", (event) => ({ wcId: event.sender.id, nickName: grabNickName }));\n'
+            '  ipcMain.on("elainaqq:grab-log", (_event, text) => console.log("[ElainaQQ][grab]", text));\n'
+            '  const fs = require("fs");\n'
+            '  const grabLogPath = process.env.ELAINAQQ_GRAB_LOG || "";\n'
+            '  ipcMain.on("elainaqq:grab-file", (_event, text) => { try { if (grabLogPath) fs.appendFileSync(grabLogPath, String(text) + "\\n"); } catch (error) {} });\n'
+            '  ipcMain.on("elainaqq:grab-result", (_event, data) => { const line = JSON.stringify(data); console.log("[ElainaQQ][grab-result]", line); try { if (grabLogPath) fs.appendFileSync(grabLogPath, line + "\\n"); } catch (error) {} });\n'
+            '  const watchPath = grabLogPath.replace(/grab_result\\.jsonl$/, "grab_task.json");\n'
+            '  let lastTaskMtime = 0;\n'
+            '  const broadcastTask = (raw) => { try { const task = JSON.parse(raw); const ec = require("electron").webContents.getAllWebContents(); ec.forEach((wc) => { try { wc.send("elainaqq:grab-go", task); } catch (e4) {} }); } catch (e5) {} };\n'
+            '  let watching = false;\n'
+            '  const startWatch = () => { if (watching || !grabLogPath) return; watching = true; try { fs.watchFile(watchPath, { interval: 400 }, (curr, prev) => { try { if (curr.mtimeMs !== lastTaskMtime) { lastTaskMtime = curr.mtimeMs; broadcastTask(fs.readFileSync(watchPath, "utf-8")); } } catch (e6) {} }); console.log("[ElainaQQ] grab task watcher on:", watchPath); } catch (e7) {} };\n'
+            '  startWatch();\n'
             '}\n'
             'process.dlopen = function(module, filename, flags) {\n'
             '  const result = flags === undefined\n'
@@ -173,11 +221,16 @@ class QQLauncher:
             "  if (!bridgeStarted) startBridge('');\n"
             '} catch (error) {\n'
             "  console.error('[ElainaQQ] QQ 主入口加载失败:', error);\n"
-            '  process.exitCode = 1;\n'
+            '  // 失败不设 exitCode，避免 QQ 整体退出\n'
             '}\n'
         )
         if not loader_path.is_file() or loader_path.read_text(encoding='utf-8') != loader_text:
             loader_path.write_text(loader_text, encoding='utf-8')
+        grab_preload_src = Path(__file__).parents[1] / 'qq' / 'grab_preload.cjs'
+        if grab_preload_src.is_file():
+            grab_preload_dst = app_dir / 'elainaqq-grab-preload.cjs'
+            if not grab_preload_dst.is_file() or grab_preload_dst.read_text(encoding='utf-8') != grab_preload_src.read_text(encoding='utf-8'):
+                shutil.copyfile(grab_preload_src, grab_preload_dst)
         expected_main = f'./{loader_name}'
         if package.get('main') != expected_main:
             if not backup.exists():
@@ -193,6 +246,121 @@ class QQLauncher:
             os.replace(temporary, package_path)
             log.info('已安装 QQ 内置加载器: %s', package_path)
         return loader_path
+
+    def _framework_root(self) -> Path:
+        """框架仓库根目录（core/runtime/qq/launcher.py 向上三级）。"""
+        return Path(__file__).resolve().parents[3]
+
+    _SIGN_PATCH_OFFSET = 0x514317  # QQNT.dll 内 IsSignVerifySkipped 调用后的 test al,al 文件偏移
+    _SIGN_PATCH_CONTEXT = b'\x84\xc0\x0f\x85'  # test al,al; jne rel32（打补丁前的特征）
+    _SIGN_PATCH_NEW = b'\x0c\x01'  # or al,1（al=1 且 ZF=0 → jne 恒跳转，无条件跳过验签）
+
+    def _windows_qqnt_dll(self) -> Path | None:
+        """定位当前 QQ 布局下的 QQNT.dll（主流：versions/<ver>/QQNT.dll）。"""
+        candidates: list[Path] = []
+        try:
+            app_dir = self.app_dir()
+        except (RuntimeError, FileNotFoundError):
+            # 版本不在兼容表时 app_dir 会拋错；直接扫 versions 目录兼容新版本。
+            candidates.extend((self.executable.parent / 'versions').glob('*/QQNT.dll'))
+        else:
+            candidates.extend((
+                app_dir.parent / 'QQNT.dll',
+                app_dir.parent.parent / 'QQNT.dll',
+                self.executable.parent / 'QQNT.dll',
+            ))
+        candidates.extend((self.executable.parent / 'versions').glob('*/QQNT.dll'))
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def apply_windows_sign_patch(self) -> None:
+        """跳过 QQNT.dll 的 resources 清单验签（仅限 hook-runtime 副本调用）。
+
+        QQ 9.9.35+ 的 application.json 是 RSA 签名清单，装 loader 必改 package.json
+        → 验签失败 → 弹「QQ 损坏」。QQNT.dll 内 `test al,al; jne skip`（file offset
+        0x514317）改为 `or al,1` 可无条件走 skip 分支：与旧方案 mov al,1 相比，
+        or 会同时清 ZF，不依赖 call 后的残留标志位。
+        只在原版字节特征匹配时打补丁；首次补丁前备份原 DLL（.elainaqq-bak）。
+        幂等：已补丁（0C 01 0F 85）时直接返回；特征不匹配（QQ 更新）则告警跳过。
+        """
+        if sys.platform != 'win32':
+            return
+        dll_path = self._windows_qqnt_dll()
+        if dll_path is None:
+            return
+        offset = self._SIGN_PATCH_OFFSET
+        context = self._SIGN_PATCH_CONTEXT
+        new = self._SIGN_PATCH_NEW
+        try:
+            raw = bytearray(dll_path.read_bytes())
+        except OSError as exc:
+            log.warning('QQNT.dll 验签补丁读取失败: %s (%s)', dll_path, exc)
+            return
+        current = bytes(raw[offset:offset + len(context)])
+        if current == new + context[2:]:
+            return  # 已补丁
+        if current != context:
+            log.warning(
+                'QQNT.dll 验签补丁特征不匹配（QQ 可能已更新），跳过: %s offset=0x%X got=%s',
+                dll_path, offset, current.hex(),
+            )
+            return
+        backup = dll_path.with_name(dll_path.name + '.elainaqq-bak')
+        if not backup.is_file():
+            try:
+                shutil.copyfile(dll_path, backup)
+            except OSError as exc:
+                log.warning('QQNT.dll 备份失败，跳过验签补丁: %s', exc)
+                return
+        raw[offset:offset + len(new)] = new
+        temporary = dll_path.with_name(dll_path.name + '.elainaqq.tmp')
+        try:
+            temporary.write_bytes(bytes(raw))
+            os.replace(temporary, dll_path)
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                temporary.unlink(missing_ok=True)
+            log.warning('QQNT.dll 验签补丁写入失败: %s (%s)', dll_path, exc)
+            return
+        log.info('QQNT.dll 验签补丁已应用: %s', dll_path)
+
+    def hook_runtime(self) -> 'QQLauncher':
+        """Windows Hook 启动模式：复制 QQ 到框架隔离运行时并打验签补丁。
+
+        QQNT.dll 被运行中的 QQ 锁定，且不能改用户日常使用的 QQ 安装，
+        因此整个 QQ 目录复制到 data/qq/runtime/hook-runtime/<原名>/：
+        - 进程命令行含 hook-runtime，供 qq_takeover / manager 识别接管目标；
+        - loader 与验签补丁都只落在副本上；
+        - 源未变化时复用已有副本（marker 校验），仅首次/QQ 更新后全量复制。
+        """
+        package_path = self.app_dir() / 'package.json'
+        runtime_root = self._framework_root() / 'data' / 'qq' / 'runtime' / 'hook-runtime'
+        target_dir = runtime_root / self.executable.parent.name
+        target_executable = target_dir / self.executable.name
+        marker = target_dir / '.elainaqq-source.json'
+        source_state = {
+            'executable': str(self.executable),
+            'mtime_ns': self.executable.stat().st_mtime_ns,
+            'size': self.executable.stat().st_size,
+            'package_mtime_ns': package_path.stat().st_mtime_ns,
+            'package_size': package_path.stat().st_size,
+        }
+        current_state = None
+        if marker.is_file():
+            try:
+                current_state = json.loads(marker.read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                current_state = None
+        if not target_executable.is_file() or current_state != source_state:
+            runtime_root.mkdir(parents=True, exist_ok=True)
+            log.info('Hook 启动模式：复制 QQ 到隔离运行时 %s（首次或 QQ 更新后约需 1-3 分钟）', target_dir)
+            shutil.copytree(self.executable.parent, target_dir, dirs_exist_ok=True, symlinks=True)
+            marker.write_text(json.dumps(source_state, ensure_ascii=False, indent=2), encoding='utf-8')
+        launcher = QQLauncher(target_executable, self.bridge_entry)
+        launcher.apply_windows_sign_patch()
+        return launcher
 
     def _linux_command(
         self,
@@ -272,14 +440,31 @@ class QQLauncher:
             version = self.validate_windows_version()
             self.launch_env = {'QQ_VERSION': version}
             self.install_loader()
+            grab_preload = self.app_dir() / 'elainaqq-grab-preload.cjs'
+            if grab_preload.is_file() and os.environ.get('ELAINAQQ_GRAB_DISABLE') != '1':
+                self.launch_env['ELAINAQQ_GRAB_PRELOAD'] = str(grab_preload)
+                self.launch_env['ELAINAQQ_GRAB_NICKNAME'] = os.environ.get(
+                    'ELAINAQQ_GRAB_NICKNAME', '伊')
+                # QQ 可安装在任意盘符/深度（如 D:\QQNT\QQ.exe）；grab 日志与抢包任务
+                # 统一放框架 data/log/，与插件的下发路径（plugins/onebot_red_packet）
+                # 和 loader 的 grab_task.json 监听路径保持一致。
+                grab_log = self._framework_root() / 'data' / 'log' / 'grab_result.jsonl'
+                grab_log.parent.mkdir(parents=True, exist_ok=True)
+                self.launch_env['ELAINAQQ_GRAB_LOG'] = str(grab_log)
             args = [str(self.executable), '--user-data-dir', str(data_dir / 'chromium')]
-            if headless:
-                args.insert(1, '--headless')
-            if quick_login:
-                args.extend(('-q', quick_login))
-            return args
+        if os.environ.get('ELAINAQQ_CDP_PORT'):
+            args.append(f'--remote-debugging-port={os.environ["ELAINAQQ_CDP_PORT"]}')
+            args.append('--remote-allow-origins=*')
+        if headless:
+            args.insert(1, '--headless')
+        if quick_login:
+            args.extend(('-q', quick_login))
+        return args
         self.install_loader()
         args = [str(self.executable), '--user-data-dir', str(data_dir / 'chromium')]
+        if os.environ.get('ELAINAQQ_CDP_PORT'):
+            args.append(f'--remote-debugging-port={os.environ["ELAINAQQ_CDP_PORT"]}')
+            args.append('--remote-allow-origins=*')
         if quick_login:
             args.extend(('-q', quick_login))
         return args

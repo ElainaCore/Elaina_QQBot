@@ -11,12 +11,12 @@
 @set "ELAINABOT_EXIT_CODE=%ERRORLEVEL%"
 @if not "%ELAINABOT_EXIT_CODE%"=="0" (
     @echo(
-    @echo [ElainaBot] Startup failed with exit code %ELAINABOT_EXIT_CODE%.
-    @echo [ElainaBot] Review the error above, then press any key to close this window...
+    @echo [ElainaQQ] Startup failed with exit code %ELAINABOT_EXIT_CODE%.
+    @echo [ElainaQQ] Review the error above, then press any key to close this window...
     @pause >nul
 ) else (
     @echo(
-    @echo [ElainaBot] Startup completed. Press any key to close this window...
+    @echo [ElainaQQ] Startup completed. Press any key to close this window...
     @pause >nul
 )
 @exit /b %ELAINABOT_EXIT_CODE%
@@ -26,9 +26,74 @@ $Utf8Encoding = New-Object Text.UTF8Encoding($false)
 $WindowsVersion = [Environment]::OSVersion.Version
 $UseLegacyWindowsPath = $WindowsVersion.Major -lt 10
 $UseSystemBrowserPanel = $UseLegacyWindowsPath
-$ProgressPreference = 'SilentlyContinue'
+
+function Test-RichConsoleOutputAvailable {
+    if ($UseLegacyWindowsPath -or
+        [string]$env:ELAINAQQ_RICH_OUTPUT -eq '0' -or
+        [string]$env:ELAINABOT_RICH_OUTPUT -eq '0' -or
+        [Console]::IsOutputRedirected) {
+        return $false
+    }
+
+    try {
+        if (-not ('ElainaQQ.NativeConsole' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace ElainaQQ {
+    public static class NativeConsole {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr GetStdHandle(int standardHandle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetConsoleMode(IntPtr consoleHandle, out uint mode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool SetConsoleMode(IntPtr consoleHandle, uint mode);
+    }
+}
+'@ -ErrorAction Stop
+        }
+
+        $stdoutHandle = [ElainaQQ.NativeConsole]::GetStdHandle(-11)
+        if ($stdoutHandle -eq [IntPtr]::Zero -or $stdoutHandle -eq [IntPtr]::MinusOne) {
+            return $false
+        }
+
+        [uint32]$consoleMode = 0
+        if (-not [ElainaQQ.NativeConsole]::GetConsoleMode($stdoutHandle, [ref]$consoleMode)) {
+            return $false
+        }
+
+        $enableVirtualTerminalProcessing = [uint32]0x0004
+        if (($consoleMode -band $enableVirtualTerminalProcessing) -eq 0) {
+            if (-not [ElainaQQ.NativeConsole]::SetConsoleMode(
+                $stdoutHandle,
+                ($consoleMode -bor $enableVirtualTerminalProcessing)
+            )) {
+                return $false
+            }
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+$UseRichConsoleOutput = Test-RichConsoleOutputAvailable
+$ProgressPreference = if ($UseRichConsoleOutput) { 'Continue' } else { 'SilentlyContinue' }
+if (-not $UseLegacyWindowsPath) {
+    [Console]::InputEncoding = $Utf8Encoding
+    [Console]::OutputEncoding = $Utf8Encoding
+    $OutputEncoding = $Utf8Encoding
+}
 $env:PYTHONUTF8 = '1'
-$env:PYTHONIOENCODING = [Console]::OutputEncoding.WebName
+$env:PYTHONIOENCODING = if ($UseLegacyWindowsPath) {
+    [Console]::OutputEncoding.WebName
+} else {
+    'utf-8'
+}
 [Net.ServicePointManager]::SecurityProtocol =
     [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
@@ -52,7 +117,7 @@ $FirstArgument = [string]$env:ELAINABOT_FIRST_ARGUMENT
 $SecondArgument = [string]$env:ELAINABOT_SECOND_ARGUMENT
 
 if ($SecondArgument) {
-    Write-ConsoleLine '[ElainaBot] 错误：不支持多个启动参数。' Red
+    Write-ConsoleLine '[ElainaQQ] 错误：不支持多个启动参数。' Red
     exit 2
 }
 
@@ -69,7 +134,7 @@ switch ($FirstArgument.ToLowerInvariant()) {
         exit 0
     }
     default {
-        Write-ConsoleLine "[ElainaBot] 错误：未知参数：$FirstArgument" Red
+        Write-ConsoleLine "[ElainaQQ] 错误：未知参数：$FirstArgument" Red
         exit 2
     }
 }
@@ -109,12 +174,24 @@ $RootDir = [IO.Path]::GetFullPath($env:ELAINABOT_ROOT)
 $VenvDir = Join-Path $RootDir '.venv'
 $VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
 $ToolsDir = Join-Path $RootDir '.bootstrap\uv'
-$StampFile = Join-Path $VenvDir '.elainabot-requirements.sha256'
+$StampFile = Join-Path $VenvDir '.elainaqq-requirements.sha256'
 Set-Location $RootDir
 
 function Write-Step {
     param([string]$Message)
-    Write-ConsoleLine "[ElainaBot] $Message" Cyan
+    Write-ConsoleLine "[ElainaQQ] $Message" Cyan
+}
+
+function Write-DependencyProgress {
+    param(
+        [Parameter(Mandatory = $true)][ValidateRange(0, 100)][int]$Percent,
+        [Parameter(Mandatory = $true)][string]$Activity
+    )
+
+    $width = 30
+    $filled = [Math]::Min($width, [Math]::Floor($Percent * $width / 100))
+    $bar = ('#' * $filled) + ('-' * ($width - $filled))
+    Write-ConsoleLine ("[ElainaQQ] [5/6] [$bar] {0,3}%  $Activity" -f $Percent)
 }
 
 function Refresh-ProcessPath {
@@ -135,20 +212,107 @@ function Invoke-Checked {
     }
 }
 
+function Invoke-VisibleProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$HeartbeatMessage,
+        [bool]$ForwardOutput = $true
+    )
+
+    # Redirect child output to temporary files so it can be forwarded line by
+    # line while the process runs, including on Windows PowerShell 5.1.
+    $token = [Guid]::NewGuid().ToString('N')
+    $stdoutPath = Join-Path ([IO.Path]::GetTempPath()) ("elainaqq-$token.out")
+    $stderrPath = Join-Path ([IO.Path]::GetTempPath()) ("elainaqq-$token.err")
+    $quotedArguments = foreach ($argument in $Arguments) {
+        $text = [string]$argument
+        if ($text -match '[\s"]') {
+            '"' + $text.Replace('"', '\"') + '"'
+        } else {
+            $text
+        }
+    }
+    $process = $null
+    $stdoutIndex = 0
+    $stderrIndex = 0
+    $lastHeartbeat = Get-Date
+    try {
+        $process = Start-Process -FilePath $FilePath -ArgumentList ($quotedArguments -join ' ') -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru -WindowStyle Hidden
+        while (-not $process.HasExited) {
+            if ($ForwardOutput) {
+                foreach ($stream in @(@{ Path = $stdoutPath; Index = [ref]$stdoutIndex; Error = $false }, @{ Path = $stderrPath; Index = [ref]$stderrIndex; Error = $true })) {
+                    try {
+                        $lines = @(Get-Content -LiteralPath $stream.Path -Encoding UTF8 -ErrorAction SilentlyContinue)
+                        while ($stream.Index.Value -lt $lines.Count) {
+                            $line = [string]$lines[$stream.Index.Value]
+                            $stream.Index.Value++
+                            if ($stream.Error) {
+                                Write-ConsoleLine ("[pip] $line")
+                            } else {
+                                Write-ConsoleLine $line
+                            }
+                        }
+                    } catch { }
+                }
+            }
+            if (((Get-Date) - $lastHeartbeat).TotalSeconds -ge 3) {
+                Write-Step $HeartbeatMessage
+                $lastHeartbeat = Get-Date
+            }
+            Start-Sleep -Milliseconds 250
+        }
+        $process.WaitForExit()
+        if ($ForwardOutput) {
+            foreach ($stream in @(@{ Path = $stdoutPath; Index = [ref]$stdoutIndex; Error = $false }, @{ Path = $stderrPath; Index = [ref]$stderrIndex; Error = $true })) {
+                try {
+                    $lines = @(Get-Content -LiteralPath $stream.Path -Encoding UTF8 -ErrorAction SilentlyContinue)
+                    while ($stream.Index.Value -lt $lines.Count) {
+                        $line = [string]$lines[$stream.Index.Value]
+                        $stream.Index.Value++
+                        if ($stream.Error) { Write-ConsoleLine ("[pip] $line") } else { Write-ConsoleLine $line }
+                    }
+                } catch { }
+            }
+        }
+        return [int]$process.ExitCode
+    } finally {
+        if ($process) { $process.Dispose() }
+        Remove-Item -LiteralPath $stdoutPath,$stderrPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-PipInstall {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
 
+    $richDisplayArguments = @('--progress-bar', 'on')
+    $compatibleDisplayArguments = @('--progress-bar', 'off', '--no-color')
     Write-Step '正在优先使用清华 PyPI 镜像安装依赖...'
-    & $VenvPython -m pip install --disable-pip-version-check --index-url $PipMirror @Arguments
-    if ($LASTEXITCODE -eq 0) {
+    Write-Step 'pip 正在解析、下载并安装依赖，请稍候；过程中会持续显示包名。'
+
+    if ($UseRichConsoleOutput) {
+        $pipArguments = @('-u', '-m', 'pip', 'install', '--disable-pip-version-check') + $richDisplayArguments + @('--index-url', $PipMirror) + $Arguments
+        & $VenvPython @pipArguments
+        $pipExitCode = $LASTEXITCODE
+        if ($pipExitCode -ne 0) {
+            Write-Step '动态进度模式执行失败，正在使用纯文本兼容模式重试当前镜像...'
+            $pipArguments = @('-u', '-m', 'pip', 'install', '--disable-pip-version-check') + $compatibleDisplayArguments + @('--index-url', $PipMirror) + $Arguments
+            $pipExitCode = Invoke-VisibleProcess -FilePath $VenvPython -Arguments $pipArguments -HeartbeatMessage 'pip 仍在以兼容模式处理依赖，请耐心等待...'
+        }
+    } else {
+        $pipArguments = @('-u', '-m', 'pip', 'install', '--disable-pip-version-check') + $compatibleDisplayArguments + @('--index-url', $PipMirror) + $Arguments
+        $pipExitCode = Invoke-VisibleProcess -FilePath $VenvPython -Arguments $pipArguments -HeartbeatMessage 'pip 仍在处理依赖，请耐心等待...'
+    }
+    if ($pipExitCode -eq 0) {
         return
     }
 
     Write-Step '镜像源安装失败，正在切换到官方 PyPI...'
-    Invoke-Checked $VenvPython (@(
-        '-m', 'pip', 'install', '--disable-pip-version-check',
-        '--index-url', $OfficialPipSource
-    ) + $Arguments)
+    $fallbackArguments = @('-u', '-m', 'pip', 'install', '--disable-pip-version-check') + $compatibleDisplayArguments + @('--index-url', $OfficialPipSource) + $Arguments
+    $fallbackExitCode = Invoke-VisibleProcess -FilePath $VenvPython -Arguments $fallbackArguments -HeartbeatMessage '官方 PyPI 仍在以兼容模式处理依赖，请耐心等待...'
+    if ($fallbackExitCode -ne 0) {
+        throw "命令执行失败，退出代码 ${fallbackExitCode}：$VenvPython $($fallbackArguments -join ' ')"
+    }
 }
 
 function Get-CommandPath {
@@ -157,7 +321,16 @@ function Get-CommandPath {
     if ($null -eq $command) {
         return $null
     }
-    return $command.Source
+    foreach ($propertyName in @('Path', 'Source', 'Definition')) {
+        $property = $command.PSObject.Properties[$propertyName]
+        if ($property) {
+            $value = [string]$property.Value
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
+                return $value
+            }
+        }
+    }
+    return $null
 }
 
 function Test-PythonCandidate {
@@ -235,7 +408,11 @@ function Find-PreferredPython {
         'HKLM:\Software\WOW6432Node\Python\PythonCore'
     )) {
         foreach ($versionKey in @(Get-ChildItem -Path $registryPath -ErrorAction SilentlyContinue | Sort-Object PSChildName -Descending)) {
-            $installPath = (Get-ItemProperty -LiteralPath $versionKey.PSPath -Name InstallPath -ErrorAction SilentlyContinue).InstallPath
+            $installPath = $null
+            $installPathKey = Get-Item -LiteralPath (Join-Path $versionKey.PSPath 'InstallPath') -ErrorAction SilentlyContinue
+            if ($installPathKey) {
+                $installPath = [string]$installPathKey.GetValue('')
+            }
             if ($installPath) {
                 $candidate = Test-PythonCandidate -FilePath (Join-Path $installPath 'python.exe')
                 if ($candidate) { return $candidate }
@@ -245,20 +422,51 @@ function Find-PreferredPython {
     return $null
 }
 
+function Find-PreferredPythonWithRetry {
+    param(
+        [int]$Attempts = 12,
+        [int]$DelayMilliseconds = 500
+    )
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        Refresh-ProcessPath
+        $python = Find-PreferredPython
+        if ($python) {
+            return $python
+        }
+        if ($attempt -lt $Attempts) {
+            Start-Sleep -Milliseconds $DelayMilliseconds
+        }
+    }
+    return $null
+}
+
 function Get-LatestPythonInstaller {
     param([Parameter(Mandatory = $true)][string]$MirrorRoot)
 
     $listing = Invoke-WebRequest -UseBasicParsing -Uri "$MirrorRoot/" -TimeoutSec 60
-    $entries = @($listing.Content | ConvertFrom-Json)
-    $latestEntry = @($entries |
-        Where-Object { $_.name -like '3.13.*' -and $_.name.EndsWith('/') } |
-        Sort-Object { [version]$_.name.TrimEnd('/') } -Descending |
-        Select-Object -First 1)
+    $entryGroups = @($listing.Content | ConvertFrom-Json)
+    $candidates = @()
+    foreach ($entryGroup in $entryGroups) {
+        foreach ($entry in @($entryGroup)) {
+            if ($null -eq $entry) { continue }
+            $nameProperty = $entry.PSObject.Properties['name']
+            if (-not $nameProperty) { continue }
+            $name = [string]$nameProperty.Value
+            if ($name -match '^3\.13\.(\d+)/$') {
+                $candidates += [PSCustomObject]@{
+                    Name = $name
+                    Patch = [int]$Matches[1]
+                }
+            }
+        }
+    }
+    $latestEntry = @($candidates | Sort-Object Patch -Descending | Select-Object -First 1)
     if ($latestEntry.Count -eq 0) {
         throw '镜像目录中没有找到可用的 Python 3.13.x 版本。'
     }
 
-    $version = $latestEntry[0].name.TrimEnd('/')
+    $version = $latestEntry[0].Name.TrimEnd('/')
     $architecture = [Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITEW6432')
     if ([string]::IsNullOrWhiteSpace($architecture)) {
         $architecture = [Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITECTURE')
@@ -281,7 +489,22 @@ function Install-PythonFromMirror {
 
     Write-Step "winget 安装不可用，正在通过镜像下载 Python $($installer.Version)..."
     try {
-        Invoke-WebRequest -UseBasicParsing -Uri $installer.Url -OutFile $installerPath -TimeoutSec 300
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri $installer.Url -OutFile $installerPath -TimeoutSec 300
+        } catch {
+            if (-not $UseRichConsoleOutput) {
+                throw
+            }
+            Write-Step 'Python 下载未完成，正在关闭动态进度并以兼容模式重试...'
+            Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
+            $previousProgressPreference = $ProgressPreference
+            try {
+                $ProgressPreference = 'SilentlyContinue'
+                Invoke-WebRequest -UseBasicParsing -Uri $installer.Url -OutFile $installerPath -TimeoutSec 300
+            } finally {
+                $ProgressPreference = $previousProgressPreference
+            }
+        }
         Write-Step 'Python 安装包下载完成，正在以当前用户权限静默安装...'
         $installerArguments = @(
             '/quiet', 'InstallAllUsers=0', 'PrependPath=0', 'Include_launcher=1',
@@ -297,8 +520,7 @@ function Install-PythonFromMirror {
         Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
     }
 
-    Refresh-ProcessPath
-    $python = Find-PreferredPython
+    $python = Find-PreferredPythonWithRetry
     if (-not $python) {
         throw 'Python 安装程序已结束，但没有找到可用的 Python 3.11+。'
     }
@@ -331,15 +553,32 @@ function Ensure-VirtualEnvironment {
         $wingetPath = Get-CommandPath 'winget'
         if ($wingetPath) {
             Write-Step '未找到 Python 3.11+，正在以当前用户权限安装 Python 3.13...'
+            $wingetExitCode = 1
             $previousPreference = $ErrorActionPreference
             try {
                 $ErrorActionPreference = 'Continue'
-                & $wingetPath install --id Python.Python.3.13 --exact --source winget --scope user --accept-package-agreements --accept-source-agreements --silent | Out-Host
+                $wingetArguments = @(
+                    'install', '--id', 'Python.Python.3.13', '--exact', '--source', 'winget',
+                    '--scope', 'user', '--accept-package-agreements', '--accept-source-agreements',
+                    '--disable-interactivity', '--silent'
+                )
+                if ($UseRichConsoleOutput) {
+                    & $wingetPath @wingetArguments
+                    $wingetExitCode = $LASTEXITCODE
+                    if ($wingetExitCode -ne 0) {
+                        Write-Step "winget 动态输出未完成（退出代码 $wingetExitCode），正在以兼容模式重试..."
+                        $wingetExitCode = Invoke-VisibleProcess -FilePath $wingetPath -Arguments $wingetArguments -HeartbeatMessage 'winget 仍在以兼容模式下载或安装 Python，请耐心等待...' -ForwardOutput $false
+                    }
+                } else {
+                    $wingetExitCode = Invoke-VisibleProcess -FilePath $wingetPath -Arguments $wingetArguments -HeartbeatMessage 'winget 仍在下载或安装 Python，请耐心等待...' -ForwardOutput $false
+                }
             } finally {
                 $ErrorActionPreference = $previousPreference
             }
-            Refresh-ProcessPath
-            $python = Find-PreferredPython
+            if ($wingetExitCode -ne 0) {
+                Write-Step "winget 安装失败（退出代码 $wingetExitCode），正在切换到 Python 镜像。"
+            }
+            $python = Find-PreferredPythonWithRetry
         }
     }
     if (-not $python) {
@@ -407,58 +646,85 @@ function Get-AvailableFrameworkDownloadUrl {
         throw '没有可用的框架下载地址。'
     }
 
-    Write-Step "正在依次检测框架下载源，找到可用源后立即下载..."
-    foreach ($url in $urls) {
-        Write-Step "正在检测框架镜像: $url"
-        $response = $null
-        $stream = $null
+    Write-Step "正在并发检测 $($urls.Count) 个框架下载源..."
+    $probeSource = @'
+import concurrent.futures
+import os
+import socket
+import sys
+import urllib.request
+
+urls = [line for line in os.environ['ELAINAQQ_FRAMEWORK_PROBE_URLS'].splitlines() if line]
+zip_signatures = (b'PK\x03\x04', b'PK\x05\x06', b'PK\x07\x08')
+
+default_getaddrinfo = socket.getaddrinfo
+def ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    results = default_getaddrinfo(host, port, family, type, proto, flags)
+    ipv4_results = [item for item in results if item[0] == socket.AF_INET]
+    return ipv4_results or results
+socket.getaddrinfo = ipv4_getaddrinfo
+
+proxy_config = urllib.request.getproxies()
+
+def probe(item):
+    index, url = item
+    openers = [urllib.request.build_opener(urllib.request.ProxyHandler({}))]
+    if any(name in proxy_config for name in ('http', 'https', 'all')):
+        openers.append(urllib.request.build_opener(urllib.request.ProxyHandler(proxy_config)))
+    for opener in openers:
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={
+                    'User-Agent': 'ElainaQQ-Startup-Mirror-Test',
+                    'Accept': 'application/zip, application/octet-stream;q=0.9, */*;q=0.1',
+                    'Accept-Encoding': 'identity',
+                    'Range': 'bytes=0-3',
+                },
+            )
+            with opener.open(request, timeout=3) as response:
+                if response.read(4) in zip_signatures:
+                    return index
+        except Exception:
+            pass
+    return None
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(urls))) as executor:
+    available = [index for index in executor.map(probe, enumerate(urls)) if index is not None]
+
+if not available:
+    raise SystemExit(1)
+print(urls[min(available)])
+'@
+
+    $previousProbeUrls = $env:ELAINAQQ_FRAMEWORK_PROBE_URLS
+    try {
+        $env:ELAINAQQ_FRAMEWORK_PROBE_URLS = $urls -join "`n"
+        $previousPreference = $ErrorActionPreference
         try {
-            $request = [Net.HttpWebRequest]::Create($url)
-            $request.Method = 'GET'
-            $request.AllowAutoRedirect = $true
-            $request.Timeout = 6000
-            $request.ReadWriteTimeout = 6000
-            $request.UserAgent = 'ElainaQQ-Startup-Mirror-Test'
-            $request.Accept = 'application/zip, application/octet-stream;q=0.9, */*;q=0.1'
-            $request.Headers['Accept-Encoding'] = 'identity'
-            $request.AddRange(0, 3)
-
-            $response = $request.GetResponse()
-            $stream = $response.GetResponseStream()
-            $signature = New-Object byte[] 4
-            $bytesRead = 0
-            while ($bytesRead -lt $signature.Length) {
-                $count = $stream.Read($signature, $bytesRead, $signature.Length - $bytesRead)
-                if ($count -le 0) {
-                    break
-                }
-                $bytesRead += $count
-            }
-
-            $isZip = $bytesRead -eq 4 -and
-                $signature[0] -eq 0x50 -and
-                $signature[1] -eq 0x4B -and
-                (($signature[2] -eq 0x03 -and $signature[3] -eq 0x04) -or
-                 ($signature[2] -eq 0x05 -and $signature[3] -eq 0x06) -or
-                 ($signature[2] -eq 0x07 -and $signature[3] -eq 0x08))
-            if ($isZip) {
-                Write-Step "已找到可用框架镜像: $url"
-                return $url
-            }
-            Write-Step '当前镜像响应不是有效 ZIP，继续检测下一个来源。'
-        } catch {
-            Write-Step "当前镜像不可用，继续检测下一个来源：$($_.Exception.Message)"
+            $ErrorActionPreference = 'Continue'
+            $probeOutput = @($probeSource | & $VenvPython - 2>&1)
+            $probeExitCode = $LASTEXITCODE
         } finally {
-            if ($null -ne $stream) {
-                $stream.Dispose()
-            }
-            if ($null -ne $response) {
-                $response.Dispose()
-            }
+            $ErrorActionPreference = $previousPreference
+        }
+    } finally {
+        if ($null -eq $previousProbeUrls) {
+            Remove-Item Env:ELAINAQQ_FRAMEWORK_PROBE_URLS -ErrorAction SilentlyContinue
+        } else {
+            $env:ELAINAQQ_FRAMEWORK_PROBE_URLS = $previousProbeUrls
         }
     }
 
-    throw "下载框架失败，请手动下载：[https://github.com/ElainaCore/Elaina_QQBot]($FrameworkManualDownloadUrl)"
+    if ($probeExitCode -ne 0 -or $probeOutput.Count -eq 0) {
+        throw "下载框架失败，请手动下载：[https://github.com/ElainaCore/Elaina_QQBot]($FrameworkManualDownloadUrl)"
+    }
+    $availableUrl = $probeOutput[-1].ToString().Trim()
+    if ([string]::IsNullOrWhiteSpace($availableUrl)) {
+        throw "下载框架失败，请手动下载：[https://github.com/ElainaCore/Elaina_QQBot]($FrameworkManualDownloadUrl)"
+    }
+    Write-Step "已找到可用框架下载源: $availableUrl"
+    return $availableUrl
 }
 function Invoke-FrameworkArchiveDownload {
     param(
@@ -477,6 +743,7 @@ from pathlib import Path
 url = os.environ['ELAINAQQ_DOWNLOAD_URL']
 destination = Path(os.environ['ELAINAQQ_DOWNLOAD_DESTINATION'])
 partial = destination.with_name(destination.name + '.part')
+show_progress = os.environ.get('ELAINAQQ_SHOW_PROGRESS') == '1'
 
 default_getaddrinfo = socket.getaddrinfo
 def ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
@@ -502,7 +769,43 @@ for mode, opener in openers:
             },
         )
         with opener.open(request, timeout=30) as response, partial.open('wb') as output:
-            shutil.copyfileobj(response, output, length=1024 * 1024)
+            if not show_progress:
+                shutil.copyfileobj(response, output, length=1024 * 1024)
+            else:
+                total = int(response.headers.get('Content-Length') or 0)
+                downloaded = 0
+                last_percent = -1
+                try:
+                    progress_output = open('CONOUT$', 'w', encoding='ascii', errors='replace', buffering=1)
+                    close_progress_output = True
+                except OSError:
+                    progress_output = sys.stderr
+                    close_progress_output = False
+                try:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            percent = min(100, downloaded * 100 // total)
+                            if percent != last_percent:
+                                filled = percent * 30 // 100
+                                bar = '#' * filled + '-' * (30 - filled)
+                                progress_output.write(
+                                    f'\r[ElainaQQ] Download [{bar}] {percent:3d}% '
+                                    f'{downloaded / 1048576:.1f}/{total / 1048576:.1f} MiB'
+                                )
+                                last_percent = percent
+                        else:
+                            progress_output.write(
+                                f'\r[ElainaQQ] Downloaded {downloaded / 1048576:.1f} MiB'
+                            )
+                    progress_output.write('\n')
+                finally:
+                    if close_progress_output:
+                        progress_output.close()
         os.replace(partial, destination)
         print(mode)
         raise SystemExit(0)
@@ -515,20 +818,37 @@ raise SystemExit(1)
 '@
     $previousUrl = $env:ELAINAQQ_DOWNLOAD_URL
     $previousDestination = $env:ELAINAQQ_DOWNLOAD_DESTINATION
+    $previousShowProgress = $env:ELAINAQQ_SHOW_PROGRESS
     try {
         $env:ELAINAQQ_DOWNLOAD_URL = $Url
         $env:ELAINAQQ_DOWNLOAD_DESTINATION = $DestinationPath
-        $previousPreference = $ErrorActionPreference
-        try {
-            $ErrorActionPreference = 'Continue'
-            $downloadOutput = @($downloadSource | & $VenvPython - 2>&1)
-            $downloadExitCode = $LASTEXITCODE
-        } finally {
-            $ErrorActionPreference = $previousPreference
+        $progressModes = @('0')
+        if ($UseRichConsoleOutput) {
+            $progressModes = @('1', '0')
+        }
+        $downloadOutput = @()
+        $downloadExitCode = 1
+        foreach ($progressMode in $progressModes) {
+            $env:ELAINAQQ_SHOW_PROGRESS = $progressMode
+            $previousPreference = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'Continue'
+                $downloadOutput = @($downloadSource | & $VenvPython - 2>&1)
+                $downloadExitCode = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $previousPreference
+            }
+            if ($downloadExitCode -eq 0) {
+                break
+            }
+            if ($progressMode -eq '1') {
+                Write-Step '框架下载的动态进度未完成，正在关闭动态进度并以兼容模式重试...'
+            }
         }
     } finally {
         if ($null -eq $previousUrl) { Remove-Item Env:ELAINAQQ_DOWNLOAD_URL -ErrorAction SilentlyContinue } else { $env:ELAINAQQ_DOWNLOAD_URL = $previousUrl }
         if ($null -eq $previousDestination) { Remove-Item Env:ELAINAQQ_DOWNLOAD_DESTINATION -ErrorAction SilentlyContinue } else { $env:ELAINAQQ_DOWNLOAD_DESTINATION = $previousDestination }
+        if ($null -eq $previousShowProgress) { Remove-Item Env:ELAINAQQ_SHOW_PROGRESS -ErrorAction SilentlyContinue } else { $env:ELAINAQQ_SHOW_PROGRESS = $previousShowProgress }
     }
     if ($downloadExitCode -ne 0) {
         $details = ($downloadOutput | Select-Object -Last 5 | ForEach-Object { $_.ToString() }) -join ' '
@@ -602,8 +922,6 @@ for item in source.rglob('*'):
     if resolved_destination != root and root not in resolved_destination.parents:
         raise RuntimeError(f'目标路径超出项目目录: {relative}')
     if item.is_dir():
-        if destination.exists() and not destination.is_dir():
-            continue
         destination.mkdir(parents=True, exist_ok=True)
     elif item.is_file() and not os.path.lexists(destination):
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -752,25 +1070,36 @@ function Ensure-Dependencies {
     }
 
     if ($savedFingerprint -eq $fingerprint -and (Test-CoreDependencies)) {
-        Write-Step '[5/6] 依赖已经安装且为最新状态，无需重复安装。'
+        Write-DependencyProgress -Percent 100 -Activity '依赖已是最新状态'
+        Write-Step '[5/6] 框架依赖已经安装且为最新状态，无需重复安装。'
         return
     }
 
-    Write-Step "[5/6] 正在根据 $($requirements.Count) 个依赖文件安装依赖..."
+    Write-Step "[5/6] 正在根据 $($requirements.Count) 个依赖文件安装框架依赖..."
+    Write-DependencyProgress -Percent 5 -Activity '正在准备 pip'
+    Write-Step '[5/6] 正在准备 pip 安装工具...'
     & $VenvPython -m ensurepip --upgrade 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "pip 安装工具准备失败，退出代码 ${LASTEXITCODE}。"
+    }
+    Write-DependencyProgress -Percent 15 -Activity '正在更新基础安装工具'
     Invoke-PipInstall -Arguments @('--upgrade', 'pip', 'setuptools', 'wheel')
+    Write-DependencyProgress -Percent 30 -Activity '基础安装工具已就绪'
 
     $arguments = @()
     foreach ($requirement in $requirements) {
         $arguments += @('-r', $requirement.FullName)
     }
+    Write-DependencyProgress -Percent 35 -Activity "正在安装 $($requirements.Count) 个依赖清单"
     Invoke-PipInstall -Arguments $arguments
+    Write-DependencyProgress -Percent 90 -Activity '依赖安装完成，正在验证核心包'
 
     if (-not (Test-CoreDependencies)) {
         throw '依赖安装已经结束，但仍有一个或多个核心包无法导入。'
     }
     Set-Content -LiteralPath $StampFile -Value $fingerprint -Encoding ASCII
-    Write-Step '[5/6] 依赖安装完成并通过验证。'
+    Write-DependencyProgress -Percent 100 -Activity '框架依赖安装完成'
+    Write-Step '[5/6] 框架依赖安装完成并通过验证。'
 }
 
 function Test-WebPanelDependency {
@@ -800,11 +1129,17 @@ function Ensure-WebPanelDependency {
     }
 
     Write-Step '[5/6] 正在安装启动脚本专用的 Windows 桌面窗口组件...'
+    Write-DependencyProgress -Percent 92 -Activity '正在安装桌面窗口组件'
+    Write-Step '[5/6] 正在准备 pip 安装工具...'
     & $VenvPython -m ensurepip --upgrade 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "pip 安装工具准备失败，退出代码 ${LASTEXITCODE}。"
+    }
     Invoke-PipInstall -Arguments @($WebPanelPackage)
     if (-not (Test-WebPanelDependency)) {
         throw 'Windows 桌面窗口组件安装结束，但 pywebview 仍无法导入。'
     }
+    Write-DependencyProgress -Percent 100 -Activity '桌面窗口组件安装完成'
     Write-Step '[5/6] Windows 桌面窗口组件安装完成。'
 }
 
@@ -951,6 +1286,7 @@ raise SystemExit(2)
 import sys
 import time
 import urllib.request
+import webbrowser
 
 import webview
 
@@ -966,13 +1302,168 @@ for _ in range(120):
 else:
     raise SystemExit(1)
 
-webview.create_window(
+window = webview.create_window(
     'ElainaQQ 管理面板',
     panel_url,
     width=1280,
     height=820,
     min_size=(960, 640),
 )
+
+_native_toolbar_refs = []
+
+
+def add_native_refresh_toolbar():
+    import clr
+
+    clr.AddReference('System.Windows.Forms')
+    clr.AddReference('System.Drawing')
+
+    import System.Windows.Forms as WinForms
+    from System import Action
+    from System.Drawing import Color, Font
+
+    form = window.native
+
+    def install_toolbar():
+        browser = getattr(form, 'browser', None)
+        browser_control = getattr(browser, 'webview', None) if browser is not None else None
+        if browser_control is None:
+            return
+
+        layout = WinForms.TableLayoutPanel()
+        layout.Name = 'ElainaQQWindowLayout'
+        layout.Dock = WinForms.DockStyle.Fill
+        layout.Margin = WinForms.Padding(0)
+        layout.Padding = WinForms.Padding(0)
+        layout.ColumnCount = 1
+        layout.RowCount = 2
+        layout.ColumnStyles.Add(WinForms.ColumnStyle(WinForms.SizeType.Percent, 100.0))
+        layout.RowStyles.Add(WinForms.RowStyle(WinForms.SizeType.Absolute, 38.0))
+        layout.RowStyles.Add(WinForms.RowStyle(WinForms.SizeType.Percent, 100.0))
+
+        toolbar = WinForms.ToolStrip()
+        toolbar.Name = 'ElainaQQWindowToolbar'
+        toolbar.Dock = WinForms.DockStyle.Fill
+        toolbar.AutoSize = False
+        toolbar.Height = 38
+        toolbar.Margin = WinForms.Padding(0)
+        toolbar.GripStyle = WinForms.ToolStripGripStyle.Hidden
+        toolbar.RenderMode = WinForms.ToolStripRenderMode.System
+        toolbar.Padding = WinForms.Padding(8, 4, 8, 4)
+        toolbar.BackColor = Color.FromArgb(248, 249, 250)
+
+        refresh_button = WinForms.ToolStripButton()
+        refresh_button.Name = 'ElainaQQRefreshButton'
+        refresh_button.Text = '刷新'
+        refresh_button.ToolTipText = '刷新管理面板'
+        refresh_button.AccessibleName = '刷新管理面板'
+        refresh_button.DisplayStyle = WinForms.ToolStripItemDisplayStyle.Text
+        refresh_button.Font = Font('Microsoft YaHei UI', 9.0)
+        refresh_button.AutoSize = True
+        refresh_button.Padding = WinForms.Padding(6, 0, 6, 0)
+
+        copy_link_button = WinForms.ToolStripButton()
+        copy_link_button.Name = 'ElainaQQCopyLinkButton'
+        copy_link_button.Text = '复制链接'
+        copy_link_button.ToolTipText = '复制管理面板链接到剪贴板'
+        copy_link_button.AccessibleName = '复制管理面板链接'
+        copy_link_button.DisplayStyle = WinForms.ToolStripItemDisplayStyle.Text
+        copy_link_button.Font = Font('Microsoft YaHei UI', 9.0)
+        copy_link_button.AutoSize = True
+        copy_link_button.Padding = WinForms.Padding(6, 0, 6, 0)
+
+        open_browser_button = WinForms.ToolStripButton()
+        open_browser_button.Name = 'ElainaQQOpenBrowserButton'
+        open_browser_button.Text = '前往浏览器打开'
+        open_browser_button.ToolTipText = '使用默认浏览器打开管理面板'
+        open_browser_button.AccessibleName = '使用默认浏览器打开管理面板'
+        open_browser_button.DisplayStyle = WinForms.ToolStripItemDisplayStyle.Text
+        open_browser_button.Font = Font('Microsoft YaHei UI', 9.0)
+        open_browser_button.AutoSize = True
+        open_browser_button.Padding = WinForms.Padding(6, 0, 6, 0)
+
+        def refresh_panel(*_):
+            try:
+                browser = getattr(form, 'browser', None)
+                native_webview = getattr(browser, 'webview', None) if browser is not None else None
+                try:
+                    core_webview = getattr(native_webview, 'CoreWebView2', None)
+                except Exception:
+                    core_webview = None
+                if core_webview is not None:
+                    core_webview.Reload()
+                elif native_webview is not None and hasattr(native_webview, 'Refresh'):
+                    native_webview.Refresh()
+                else:
+                    window.load_url(panel_url)
+            except Exception:
+                # The browser may still be initializing; retry through the
+                # public pywebview API instead of breaking the native window.
+                try:
+                    window.load_url(panel_url)
+                except Exception:
+                    pass
+
+        def copy_panel_link(*_):
+            try:
+                WinForms.Clipboard.SetText(panel_url)
+                copy_link_button.Text = '已复制'
+            except Exception:
+                copy_link_button.Text = '复制失败'
+
+            reset_timer = WinForms.Timer()
+            reset_timer.Interval = 1500
+
+            def reset_copy_button(*_):
+                reset_timer.Stop()
+                reset_timer.Dispose()
+                copy_link_button.Text = '复制链接'
+                try:
+                    _native_toolbar_refs.remove((reset_timer, reset_copy_button))
+                except ValueError:
+                    pass
+
+            reset_timer.Tick += reset_copy_button
+            _native_toolbar_refs.append((reset_timer, reset_copy_button))
+            reset_timer.Start()
+
+        def open_panel_in_browser(*_):
+            try:
+                webbrowser.open(panel_url, new=2)
+            except Exception:
+                pass
+
+        refresh_button.Click += refresh_panel
+        copy_link_button.Click += copy_panel_link
+        open_browser_button.Click += open_panel_in_browser
+        toolbar.Items.Add(refresh_button)
+        toolbar.Items.Add(WinForms.ToolStripSeparator())
+        toolbar.Items.Add(copy_link_button)
+        toolbar.Items.Add(open_browser_button)
+
+        form.SuspendLayout()
+        try:
+            if browser_control.Parent is not None:
+                browser_control.Parent.Controls.Remove(browser_control)
+            browser_control.Dock = WinForms.DockStyle.Fill
+            browser_control.Margin = WinForms.Padding(0)
+            layout.Controls.Add(toolbar, 0, 0)
+            layout.Controls.Add(browser_control, 0, 1)
+            form.Controls.Add(layout)
+        finally:
+            form.ResumeLayout(True)
+
+        # Keep the managed controls and Python delegate alive for the window lifetime.
+        _native_toolbar_refs.append((
+            layout, toolbar, refresh_button, copy_link_button, open_browser_button,
+            refresh_panel, copy_panel_link, open_panel_in_browser,
+        ))
+
+    form.BeginInvoke(Action(install_toolbar))
+
+
+window.events.shown += add_native_refresh_toolbar
 webview.start()
 '@
     }
@@ -989,6 +1480,9 @@ webview.start()
 
 try {
     Write-Step '正在准备运行环境...'
+    if (-not $UseLegacyWindowsPath -and -not $UseRichConsoleOutput) {
+        Write-Step '当前控制台无法可靠显示动态进度，已自动切换到纯文本兼容模式。'
+    }
     Ensure-VirtualEnvironment
     Ensure-Framework
     Ensure-Dependencies
@@ -1021,7 +1515,7 @@ try {
     Write-Step '面板就绪后将自动打开 ElainaQQ 管理面板。'
     # Keep the framework in the foreground on every supported Windows version
     # so this console remains available for runtime logs and diagnostics.
-    $panelWindow = Start-WebPanelWindow -Url $panelUrl
+   $panelWindow = Start-WebPanelWindow -Url $panelUrl
     try {
         & $VenvPython (Join-Path $RootDir 'main.py')
         $frameworkExitCode = $LASTEXITCODE
@@ -1035,6 +1529,6 @@ try {
     }
     exit $frameworkExitCode
 } catch {
-    Write-ConsoleLine "[ElainaBot] 错误：$($_.Exception.Message)" Red
+    Write-ConsoleLine "[ElainaQQ] 错误：$($_.Exception.Message)" Red
     exit 1
 }

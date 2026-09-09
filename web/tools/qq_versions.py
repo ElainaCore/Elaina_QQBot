@@ -21,16 +21,17 @@ def _qq_error_response(exc: Exception):
         return web.json_response(
             {
                 'success': False,
-                'error': 'QQ 安装包下载失败：所有备用地址均不可用，请稍后重试或手动下载官方安装包',
-                'detail': str(exc),
+                'error': 'QQ 安装包下载失败，请稍后重试',
             },
             status=502,
         )
-    if isinstance(exc, (ValueError, FileNotFoundError)):
+    if isinstance(exc, ValueError):
         return web.json_response({'success': False, 'error': str(exc)}, status=400)
+    if isinstance(exc, FileNotFoundError):
+        return web.json_response({'success': False, 'error': '未找到 QQ 安装文件'}, status=400)
     if isinstance(exc, RuntimeError):
-        return web.json_response({'success': False, 'error': str(exc)}, status=409)
-    return web.json_response({'success': False, 'error': str(exc)}, status=500)
+        return web.json_response({'success': False, 'error': 'QQ 客户端操作失败，请稍后重试'}, status=409)
+    return web.json_response({'success': False, 'error': 'QQ 客户端操作失败，请稍后重试'}, status=500)
 
 
 def set_context(app_instance):
@@ -69,7 +70,7 @@ def _windows_official_response(manager) -> web.Response | None:
             'success': True,
             'external': True,
             'url': _QQ_OFFICIAL_DOWNLOAD_URL,
-            'message': '请前往 QQ 官网下载安装并登录，再从“添加接入”中选择要注入的 QQ 进程',
+            'message': '请安装并登录 QQ，然后返回此页面继续操作',
             'status': _install_status(manager),
         }
     )
@@ -177,15 +178,15 @@ async def _run_job(job: dict, manager, operation: str, version_key: str, auto_do
                 stage='manual_install_required',
                 percent=100,
                 indeterminate=False,
-                message='安装包已准备，但系统需要手动完成安装',
+                message='安装包已准备，请完成安装后继续',
                 install_path=str(install_path),
                 success=False,
             )
         else:
             _set_job(job, state='failed', stage='failed', percent=0, indeterminate=False, message='QQ 安装失败', success=False)
     except Exception as exc:
-        message = 'QQ 安装包下载失败：所有备用地址均不可用' if isinstance(exc, QQDownloadError) else str(exc)
-        _set_job(job, state='failed', stage='failed', percent=0, indeterminate=False, message=message, error=str(exc), success=False)
+        message = 'QQ 安装包下载失败，请稍后重试' if isinstance(exc, QQDownloadError) else 'QQ 安装失败，请稍后重试'
+        _set_job(job, state='failed', stage='failed', percent=0, indeterminate=False, message=message, error=message, success=False)
     finally:
         job['task'] = None
 
@@ -300,13 +301,13 @@ async def handle_uninstall_qq(request: web.Request):
                     'success': False,
                     'result': result,
                     'status': status,
-                    'error': 'QQ 位于系统安装目录，未自动删除：' + '；'.join(result['manual']),
+                    'error': '系统安装的 QQ 不会由框架自动删除',
                 },
                 status=422,
             )
         return web.json_response({'success': True, 'result': result, 'status': status, 'message': 'QQ 已卸载'})
     except Exception as exc:
-        return web.json_response({'success': False, 'error': str(exc)}, status=500)
+        return _qq_error_response(exc)
 
 
 async def handle_cleanup_qq(request: web.Request):
@@ -327,7 +328,7 @@ async def handle_cleanup_qq(request: web.Request):
             }
         )
     except Exception as exc:
-        return web.json_response({'success': False, 'error': str(exc)}, status=500)
+        return _qq_error_response(exc)
 
 
 async def handle_detect_qq(request: web.Request):

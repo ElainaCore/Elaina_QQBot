@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import itertools
 import json
@@ -71,6 +72,20 @@ from core.services.files import write_json
 log = logging.getLogger('ElainaQQ.embedded_qq')
 
 
+def _stable_device_guid(bot_id: str) -> str:
+    """从 bot_id 派生稳定的 36 位设备 GUID（格式 8-4-4-4-12）。"""
+    digest = hashlib.sha256(f'elainaqq-device:{bot_id}'.encode('utf-8')).hexdigest()
+    raw = digest[:32]
+    return f'{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}'
+
+
+def _device_name(bot_id: str) -> str:
+    """每个账号一个独立设备名，避免多账号共享同一主机指纹。"""
+    host = os.uname().nodename if hasattr(os, 'uname') else (os.environ.get('COMPUTERNAME') or 'elainaqq')
+    safe_id = re.sub(r'[^A-Za-z0-9._-]', '_', bot_id).strip('._') or 'account'
+    return f'{host[:48]}-{safe_id}'
+
+
 @dataclass
 class EmbeddedBot:
     bot_id: str
@@ -126,6 +141,9 @@ class EmbeddedQQManager:
         self._red_packet_bot_aliases: dict[str, str] = {}
         self._red_packet_listeners: dict[str, Any] = {}
         self._red_packet_tasks: dict[str, set[asyncio.Task]] = {}
+        self._hook_red_packets: dict[str, dict[str, Any]] = {}
+        self._grab_agent_sessions: dict[int, Any] = {}
+        self._grab_agent_lock = asyncio.Lock()
         self._bridge_runners: dict[str, web.AppRunner] = {}
         self._accounts_save_lock = asyncio.Lock()
         self._deleted_accounts_save_lock = asyncio.Lock()
@@ -145,6 +163,10 @@ class EmbeddedQQManager:
     def headless(self) -> bool:
         if sys.platform.startswith('linux'):
             return True
+        if os.name == 'nt' and bool(cfg.get('settings', 'embedded_qq.windows_hook_launch', False)):
+            # Windows Hook 启动模式需要可见窗口（扫码登录 + 用户操作 QQ），
+            # 忽略服务器向的 headless 配置。
+            return False
         return bool(cfg.get('settings', 'embedded_qq.headless', True))
 
     @property
@@ -259,7 +281,7 @@ class EmbeddedQQManager:
             if port not in reserved:
                 bot.bridge_port = port
                 return port
-        raise RuntimeError(f'内置 QQ 桥接端口已耗尽: {start}-65535')
+        raise RuntimeError('内置 QQ 服务端口已耗尽')
 
     def _load_deleted_accounts(self) -> set[str]:
         if not self._deleted_accounts_file.is_file():
@@ -485,7 +507,11 @@ class EmbeddedQQManager:
             )
             command = self._linux_cgroup_command(bot, command)
             return command, dict(launcher.launch_env)
-        if os.name != 'nt':
+        if os.name == 'nt' and bool(cfg.get('settings', 'embedded_qq.windows_hook_launch', False)):
+            # Windows Hook 启动模式：QQ 复制到隔离副本后装载 loader + 验签补丁，
+            # 不触碰用户的日常 QQ 安装。
+            launcher = launcher.hook_runtime()
+        elif os.name != 'nt':
             try:
                 qq_path.relative_to(self._qq_manager.install_dir.resolve())
             except ValueError:
@@ -493,7 +519,10 @@ class EmbeddedQQManager:
         try:
             command = launcher.command(
                 data_dir,
-                headless=self.headless,
+                headless=self.headless and not (
+                    os.name == 'nt'
+                    and bool(cfg.get('settings', 'embedded_qq.windows_hook_launch', False))
+                ),
                 single_process=self.single_process,
                 quick_login=bot.uin if bot.force_quick_login else '',
             )
@@ -569,6 +598,18 @@ class EmbeddedQQManager:
                 'ELAINAQQ_ONEBOT_ACTIONS': json.dumps(get_supported_actions(), ensure_ascii=True),
                 'HOME': str(data_dir),
                 'ELAINAQQ_HEADLESS': '1' if self.headless else '0',
+                'ELAINAQQ_DEVICE_GUID': _stable_device_guid(bot.bot_id),
+                'ELAINAQQ_DEVICE_NAME': _device_name(bot.bot_id),
+                'ELAINAQQ_WINDOWS_HOOK_LAUNCH': (
+                    '1' if os.name == 'nt'
+                    and bool(cfg.get('settings', 'embedded_qq.windows_hook_launch', False))
+                    else '0'
+                ),
+                'ELAINAQQ_ATTACH_MODE': (
+                    '1' if os.name == 'nt'
+                    and bool(cfg.get('settings', 'embedded_qq.windows_hook_launch', False))
+                    else '0'
+                ),
             }
         )
         env.update(self._packet_backend_env())
@@ -577,6 +618,12 @@ class EmbeddedQQManager:
             # 因此每个内置账号仍能获得独立会话目录。
             app_data = data_dir / 'appdata'
             local_data = data_dir / 'localappdata'
+            profile = data_dir / 'profile'
+            # profile 必须真实存在：QQ 主入口 getMacShareSandBoxPath 调
+            # app.getPath('appData')，USERPROFILE 指向缺失目录时直接崩溃退出。
+            profile.mkdir(parents=True, exist_ok=True)
+            (profile / 'AppData' / 'Roaming').mkdir(parents=True, exist_ok=True)
+            (profile / 'AppData' / 'Local').mkdir(parents=True, exist_ok=True)
             app_data.mkdir(parents=True, exist_ok=True)
             local_data.mkdir(parents=True, exist_ok=True)
             env.update(
@@ -591,6 +638,10 @@ class EmbeddedQQManager:
             env.pop('NODE_PATH', None)
             env['MALLOC_ARENA_MAX'] = '2'
             env['MALLOC_TRIM_THRESHOLD_'] = '131072'
+            # 每账号独立 XDG 运行时目录，避免多实例争用同一套运行时锁。
+            runtime_dir = data_dir / 'xdg-runtime'
+            runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            env['XDG_RUNTIME_DIR'] = str(runtime_dir)
         env['ELAINAQQ_BRIDGE_ENTRY'] = bridge_entry
         if launch_env:
             env.update(launch_env)
@@ -627,7 +678,7 @@ class EmbeddedQQManager:
                 raise web.HTTPBadRequest(text='JSON 根节点必须是对象')
             incoming_bot_id = str(payload.get('bot_id') or '')
             if incoming_bot_id and incoming_bot_id != bot.bot_id:
-                raise web.HTTPForbidden(text='账号与桥接端口不匹配')
+                raise web.HTTPForbidden(text='账号连接无效')
             payload['bot_id'] = bot.bot_id
             return payload
 
@@ -636,6 +687,22 @@ class EmbeddedQQManager:
             if not handled:
                 raise web.HTTPServiceUnavailable(text='内置 QQ 未初始化')
             return web.json_response({'success': True})
+
+        async def handle_action(request: web.Request) -> web.Response:
+            payload = await read_payload(request)
+            bot_id = str(payload.get('bot_id') or '')
+            action = str(payload.get('action') or '')
+            params = payload.get('params') or {}
+            if not bot_id or bot_id not in self.bots:
+                raise web.HTTPForbidden(text='账号不存在')
+            peer = request.remote or ''
+            if not peer.startswith('127.') and peer != '::1':
+                raise web.HTTPForbidden(text='仅限本机调用')
+            try:
+                result = await self.action(bot_id, action, params)
+            except Exception as error:
+                result = {'status': 'failed', 'retcode': 1500, 'data': None, 'message': str(error), 'wording': '', 'echo': ''}
+            return web.json_response(result)
 
         async def handle_red_packet(request: web.Request) -> web.Response:
             handled = await self.handle_red_packet(await read_payload(request))
@@ -646,7 +713,7 @@ class EmbeddedQQManager:
         async def poll_control(request: web.Request) -> web.Response:
             requested = str(request.query.get('bot_id') or '')
             if requested and requested != bot.bot_id:
-                raise web.HTTPForbidden(text='账号与桥接端口不匹配')
+                raise web.HTTPForbidden(text='账号连接无效')
             command = await self.next_control_command(bot.bot_id)
             if command is None:
                 return web.Response(status=204)
@@ -655,7 +722,7 @@ class EmbeddedQQManager:
         async def poll_priority_control(request: web.Request) -> web.Response:
             requested = str(request.query.get('bot_id') or '')
             if requested and requested != bot.bot_id:
-                raise web.HTTPForbidden(text='账号与桥接端口不匹配')
+                raise web.HTTPForbidden(text='账号连接无效')
             command = await self.next_control_command(bot.bot_id, priority=True)
             if command is None:
                 return web.Response(status=204)
@@ -672,6 +739,7 @@ class EmbeddedQQManager:
             [
                 web.post('/api/embedded/events', handle_event),
                 web.post('/api/embedded/red-packets', handle_red_packet),
+                web.post('/api/embedded/action', handle_action),
                 web.get('/api/embedded/control/poll', poll_control),
                 web.get('/api/embedded/control/priority-poll', poll_priority_control),
                 web.post('/api/embedded/control/result', resolve_control),
@@ -706,11 +774,11 @@ class EmbeddedQQManager:
             bot.bridge_port = port
             self._bridge_runners[bot.bot_id] = runner
             await self._save_accounts()
-            log.debug('内置 QQ 桥接服务已启动: 127.0.0.1:%s [%s]', port, bot.bot_id)
+            log.debug('内置 QQ 服务已启动 [%s]', bot.bot_id)
             return
 
         await runner.cleanup()
-        raise RuntimeError(f'无法绑定内置 QQ 桥接端口 {start}-65535') from last_error
+        raise RuntimeError('无法绑定内置 QQ 服务端口，请检查配置') from last_error
 
     async def _stop_bridge(self, bot_id: str) -> None:
         runner = self._bridge_runners.pop(bot_id, None)
@@ -1031,7 +1099,7 @@ class EmbeddedQQManager:
         future = asyncio.get_running_loop().create_future()
         self._control_futures[request_id] = (bot_id, future)
         # 红包查询/领取始终走独立队列；普通轮询本身兼容兜底消费，避免启动竞态。
-        priority = command.get('type') in {'query_red_packet', 'grab_red_packet'}
+        priority = command.get('type') in {'query_red_packet', 'grab_red_packet', 'set_poll_groups'}
         queue = self._control_queue(bot_id, priority=priority)
         try:
             item = {'request_id': request_id, **command}
@@ -1065,6 +1133,37 @@ class EmbeddedQQManager:
             except ValueError as error:
                 return action_failed(str(error), 1400)
             return await self._oidb_void_action(bot_id, action, packet)
+        if action in {'grab_red_packet', 'qq_grab_red_packet'}:
+            bill_no = str(params.get('bill_no') or '')
+            context = params.get('context') if isinstance(params.get('context'), dict) else None
+            if context:
+                bill_no = str(context.get('bill_no') or bill_no)
+                # 外部重放：上下文含 pc_body 等完整参数，走 bridge 原生 grabRedBag
+                self._hook_red_packets[bill_no] = {
+                    'grab_source': 'bridge',
+                    'bill_no': bill_no,
+                    'red_packet_type': int(context.get('red_packet_type') or 0),
+                    'wishing': str(context.get('wishing') or ''),
+                    'group_id': str(context.get('group_id') or ''),
+                    'group_name': str(context.get('group_name') or ''),
+                    'sender_id': str(context.get('sender_id') or ''),
+                    'sender_name': str(context.get('sender_name') or ''),
+                    'time': 0,
+                    'chat_type': int(context.get('chat_type') or 2),
+                    'peer_uid': str(context.get('peer_uid') or ''),
+                    'self_nick': str(context.get('self_nick') or ''),
+                    'url': str(context.get('pc_body') or ''),
+                    'key': str(context.get('string_index') or bill_no),
+                    'msg_seq': int(context.get('msg_seq') or 0),
+                    'raw_wallet': '',
+                }
+            return await self.grab_red_packet(
+                str(params.get('self_id') or bot_id or ''),
+                bill_no,
+                send_password_after=bool(params.get('send_password_after')),
+            )
+        if action in {'get_group_list', 'set_poll_groups'}:
+            return await self._control_call(bot_id, {'type': action, **params})
         if action in {'nc_get_rkey', 'get_rkey', 'get_rkey_server'}:
             return await self._get_rkeys(bot_id, action)
         if action in {'set_group_todo', 'complete_group_todo', 'cancel_group_todo'}:
@@ -1107,10 +1206,28 @@ class EmbeddedQQManager:
         )
 
     async def _send_packet(self, bot_id: str, packet: PacketRequest) -> dict[str, Any]:
+        # Windows 注入模式：无 Node 子进程，hook 桥直连 QQ 内部发包函数。
+        bridge = self._hook_bridge_for(bot_id)
+        if bridge is not None:
+            try:
+                reply = await bridge.request(packet.cmd, packet.data, reply_timeout=40.0)
+            except (ConnectionError, TimeoutError) as exc:
+                return action_failed(str(exc), 1500)
+            return {'status': 'ok', 'retcode': 0, 'data': reply.hex()}
         return await self._control_call(
             bot_id,
             {'type': 'packet', 'packet': packet.bridge_payload()},
         )
+
+    def _hook_bridge_for(self, bot_id: str):
+        """按 uin/bot_id 查找存活接管桥（Windows 注入模式）。"""
+        target = str(bot_id or '').strip()
+        if not target:
+            return None
+        for bridge in self.app._hook_bridges.values():
+            if str(bridge.status.uin or '') == target and bridge.status.control_open:
+                return bridge
+        return None
 
     async def _packet_bytes(self, bot_id: str, action: str, packet: PacketRequest) -> bytes:
         response = normalize_action_response(await self._send_packet(bot_id, packet), action=action)
@@ -1149,7 +1266,7 @@ class EmbeddedQQManager:
             'private_rkey': private['rkey'] if private else None,
             'group_rkey': group['rkey'] if group else None,
             'expired_time': int(time.time()) + min(ttl_values) if ttl_values else None,
-            'name': 'NapCat 4',
+            'name': 'ElainaQQ',
         })
 
     async def _group_todo_action(self, bot_id: str, action: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -1249,11 +1366,28 @@ class EmbeddedQQManager:
         bot_id = str(payload.get('bot_id') or '').strip()
         bot = self.bots.get(bot_id)
         packet = payload.get('red_packet')
-        if bot is None or not isinstance(packet, dict):
+        if bot is None and not self.app._hook_bridges:
+            # 注入模式（Windows）没有 Node 子进程 bot，但红包监听器仍需工作。
             return False
-        bot.last_seen = time.time()
+        if not isinstance(packet, dict):
+            return False
+        if bot is not None:
+            bot.last_seen = time.time()
         self_id = str(payload.get('self_id') or bot.uin or bot_id)
         self._red_packet_bot_aliases[self_id] = bot_id
+        if isinstance(packet, dict) and packet.get('bill_no'):
+            # 历史重放/外部触发的红包也进入 agent 上下文缓存
+            cached = dict(packet)
+            cached.setdefault('grab_source', 'bridge')  # node 框桥推送，有完整 pcBody 上下文
+            self._hook_red_packets[str(packet['bill_no'])] = cached
+        log.info(
+            '[%s] 检测到红包: bill_no=%s type=%s group=%s sender=%s',
+            self_id,
+            packet.get('bill_no'),
+            packet.get('red_packet_type'),
+            packet.get('group_id') or packet.get('peer_uin'),
+            packet.get('sender_name') or packet.get('sender_id'),
+        )
         listeners = tuple(self._red_packet_listeners.items())
         for index, (owner, callback) in enumerate(listeners):
             task = asyncio.create_task(
@@ -1280,17 +1414,49 @@ class EmbeddedQQManager:
                 return bot_id
         return ''
 
+    async def dispatch_hook_red_packet(self, self_id: str, packet: dict[str, Any]) -> None:
+        """Windows 注入模式：把 hook 桥解析出的红包派发给监听器。"""
+        self_id = str(self_id or '').strip()
+        if not self_id or not isinstance(packet, dict) or not packet.get('bill_no'):
+            return
+        self._red_packet_bot_aliases[self_id] = self_id
+        bill_no = str(packet['bill_no'])
+        if isinstance(self._hook_red_packets, dict):
+            cached = dict(packet)
+            cached.setdefault('grab_source', 'agent')  # DLL 接管桥：只有 raw_wallet，无 pcBody
+            self._hook_red_packets[bill_no] = cached
+            # 控制缓存规模
+            while len(self._hook_red_packets) > 500:
+                self._hook_red_packets.pop(next(iter(self._hook_red_packets)))
+        listeners = tuple(self._red_packet_listeners.items())
+        for index, (owner, callback) in enumerate(listeners):
+            task = asyncio.create_task(
+                self._run_red_packet_listener(
+                    owner, callback, self_id, packet if index == 0 else dict(packet),
+                ),
+                name=f'red-packet-hook-{owner}-{self_id}',
+            )
+            tasks = self._red_packet_tasks.setdefault(owner, set())
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+
     async def grab_red_packet(
         self, self_id: str, bill_no: str, *, send_password_after: bool = False,
+        context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """通过指定内置 QQ 账号直接调用原生 grabRedBag。"""
         bot_id = self._red_packet_bot_id(self_id)
         bill_no = str(bill_no or '').strip()
+        # 红包来源决定领取通道：
+        # - agent（DLL 接管桥）：只有 raw_wallet hex，无 pcBody，必须走 qq-grab-agent；
+        # - bridge（hook 启动模式的 node 框桥）：bridge.redPackets 里有完整 pcBody，
+        #   走 node 层原生 grabRedBag（LiteLoader 同款机制）。
+        cached = self._hook_red_packets.get(bill_no) if bill_no else None
+        source = str(cached.get('grab_source') or '') if isinstance(cached, dict) else ''
+        if source == 'agent':
+            return await self._grab_via_agent(self_id, bill_no)
         if not bot_id:
-            return {
-                'ok': False, 'amount': 0, 'err_code': -5,
-                'err_msg': '内置 QQ 账号不存在',
-            }
+            return await self._grab_via_agent(self_id, bill_no)
         if not bill_no:
             return {
                 'ok': False, 'amount': 0, 'err_code': -6,
@@ -1302,8 +1468,9 @@ class EmbeddedQQManager:
                 'type': 'grab_red_packet',
                 'bill_no': bill_no,
                 'send_password_after': bool(send_password_after),
+                **({'context': context} if context else {}),
             },
-            timeout=5,
+            timeout=15,
         )
         if response.get('status') == 'failed':
             return {
@@ -1318,6 +1485,170 @@ class EmbeddedQQManager:
         return {
             'ok': False, 'amount': 0, 'err_code': -8,
             'err_msg': '红包领取接口返回格式错误',
+        }
+
+    def _find_hook_qq_pid(self) -> int | None:
+        """找 hook-runtime QQ 主进程；找不到再退回任意 QQ 主进程。"""
+        try:
+            import psutil
+        except ImportError:
+            return None
+        fallback = None
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                if (proc.info['name'] or '').lower() != 'qq.exe':
+                    continue
+                parent = proc.parent()
+                if parent is not None and (parent.name() or '').lower() == 'qq.exe':
+                    continue
+                cmdline = ' '.join(proc.info['cmdline'] or [])
+                if 'hook-runtime' in cmdline:
+                    return proc.info['pid']
+                if fallback is None:
+                    fallback = proc.info['pid']
+            except (psutil.Error, OSError):
+                continue
+        return fallback
+
+    
+
+
+    @staticmethod
+    def _wallet_grab_params(raw_hex: str) -> dict[str, str]:
+        """从 WalletElem hex 提取 grabRedBag 参数候选。
+
+        WalletElem{1: WalletItem{3: detail{14: url}, 9: billNo, 10: key}}。
+        pcBody 是红包领取链接（QQ 用它生成 grabRedBag 的 pcBody），
+        index 候选为 item.f10 的 key。
+        """
+        try:
+            raw = bytes.fromhex(raw_hex or '')
+        except ValueError:
+            return {}
+        from core.runtime.embedded.hook_msgpush import _wallet_get, _wallet_str
+
+        item = _wallet_get(raw, 1)
+        if not isinstance(item, bytes):
+            return {}
+        detail = _wallet_get(item, 3)
+        url = _wallet_str(detail if isinstance(detail, bytes) else b'', 14)
+        key = _wallet_str(item, 10)
+        reserve = _wallet_str(item, 18)  # f18: 32位hex 票据（pbReserve 候选）
+        params: dict[str, str] = {}
+        if url:
+            params['pcBody'] = url
+        if key:
+            params['index'] = key
+        if reserve:
+            params['pbReserve'] = reserve
+        return params
+
+
+    async def _grab_via_agent(self, self_id: str, bill_no: str) -> dict[str, Any]:
+        """Windows 注入模式：通过 qq-grab-agent 在 QQ 进程内领取。"""
+        if os.name != 'nt':
+            return {
+                'ok': False, 'amount': 0, 'err_code': -5,
+                'err_msg': '当前平台无注入模式，无法领取',
+            }
+        if not bill_no:
+            return {'ok': False, 'amount': 0, 'err_code': -6, 'err_msg': '缺少红包 bill_no'}
+        packet = self._hook_red_packets.get(bill_no)
+        if packet is None:
+            return {
+                'ok': False, 'amount': 0, 'err_code': -2,
+                'err_msg': '红包上下文不存在或已过期（重启后需重新收到红包消息）',
+            }
+        # 注入模式目标 QQ：优先接管桥所在的 QQ，否则任意 hook-runtime QQ 主进程。
+        bridge = self._hook_bridge_for(self_id)
+        target_pid = bridge.pid if bridge is not None else self._find_hook_qq_pid()
+        if target_pid is None:
+            return {
+                'ok': False, 'amount': 0, 'err_code': -3,
+                'err_msg': '未找到可注入的 QQ 主进程（QQ 未运行）',
+            }
+        from core.runtime.embedded.grab_agent import GrabAgentError, GrabAgentInjector
+
+        agent_dirs = [
+            # v8：HookAssemble 改为逐参数原始 dump（str+24B hex），校准参数映射
+            self._base_dir / 'core' / 'native' / 'qq-grab-agent' / 'v8',
+            # v3 目录存放当前验证过的 v6.x agent（双管道 + 正确 grab 链路）；
+            # v2 目录是旧版（单管道、grab 已禁用），严禁再被加载（会双实例抢同名管道）
+            self._base_dir / 'core' / 'native' / 'qq-grab-agent' / 'v3',
+            self._base_dir / 'core' / 'native' / 'qq-grab-agent',
+        ]
+        async with self._grab_agent_lock:
+            session = self._grab_agent_sessions.get(target_pid)
+            if session is None:
+                injector = None
+                for d in agent_dirs:
+                    candidate = GrabAgentInjector(d)
+                    if candidate.available:
+                        injector = candidate
+                        break
+                if injector is None:
+                    return {
+                        'ok': False, 'amount': 0, 'err_code': -9,
+                        'err_msg': 'agent DLL 缺失，请先编译 qq-grab-agent',
+                    }
+                try:
+                    await asyncio.to_thread(injector.inject, target_pid)
+                    session = await asyncio.to_thread(injector.connect, 30.0)
+                except GrabAgentError as exc:
+                    return {
+                        'ok': False, 'amount': 0, 'err_code': -10,
+                        'err_msg': f'agent 注入失败: {exc}',
+                    }
+                self._grab_agent_sessions[target_pid] = session
+        status = session.request({'op': 'status'}, timeout_seconds=10.0)
+        if not status.get('inst'):
+            return {
+                'ok': False, 'amount': 0, 'err_code': -11,
+                'err_msg': '尚未捕获 KernelMsgService 实例（等待消息事件触发，或手动点一次红包校准）',
+            }
+        wallet_params = self._wallet_grab_params(str(packet.get('raw_wallet') or ''))
+        # LiteLoader QQNT-Grab-RedBag 语义：
+        # 群聊 recvUin=peerUid=群号；name=自己昵称；pcBody=领取链接；
+        # index=stringIndex；wishing=标题；msgSeq=消息 seq；recvType=chatType。
+        group_id = str(packet.get('group_id') or '')
+        chat_type = int(packet.get('chat_type') if packet.get('chat_type') is not None else 2)
+        payload = {
+            'op': 'grab',
+            'pcBody': wallet_params.get('pcBody', '') or str(packet.get('url') or ''),
+            'index': wallet_params.get('index', '') or str(packet.get('key') or ''),
+            'pbReserve': '',
+            'name': str(packet.get('self_nick') or ''),
+            'wishing': str(packet.get('wishing') or ''),
+            'peerUid': str(packet.get('peer_uid') or group_id),
+            'recvUin': int(group_id) if group_id.isdigit() else 0,
+            'recvType': chat_type,
+            'msgSeq': int(packet.get('msg_seq') or 0),
+        }
+        try:
+            result = await asyncio.to_thread(session.request, payload, 60.0)
+        except GrabAgentError as exc:
+            return {'ok': False, 'amount': 0, 'err_code': -12, 'err_msg': str(exc)}
+        code = int(result.get('code') or 0)
+        data = str(result.get('data') or '')
+        log.info('[%s] agent grabRedBag 原始响应: code=%s data=%s', self_id, code, data[:500])
+        amount = 0
+        try:
+            import json as _json
+            parsed = _json.loads(data) if data.startswith('{') else {}
+            detail = parsed.get('recvdOrder') or parsed.get('grabRedBagRsp') or parsed
+            amount = int(str(detail.get('amount') or 0))
+        except Exception:
+            amount = 0
+        ok = code == 0 and amount > 0
+        if code == 0 and amount == 0:
+            # code=0 但无金额：QQ 回调数据为空，多半参数不匹配（tag/uid 类错误）或已领完
+            detail = data[:200] or '回调数据为空（参数不匹配或红包已领完）'
+            log.warning('[%s] grabRedBag code=0 但金额为空: %s', self_id, detail)
+        return {
+            'ok': ok,
+            'amount': amount,
+            'err_code': code,
+            'err_msg': data or ('领取成功' if ok else f'grabRedBag 响应异常 code={code}'),
         }
 
     async def query_red_packet(self, self_id: str, bill_no: str) -> dict[str, Any]:

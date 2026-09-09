@@ -75,6 +75,7 @@ SUPPORTED_ACTIONS = frozenset(
         'get_cookies',
         'get_credentials',
         'get_csrf_token',
+        'scan_red_packet_history',
         'get_doubt_friends_add_request',
         'get_emoji_likes',
         'get_essence_msg_list',

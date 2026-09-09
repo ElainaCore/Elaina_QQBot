@@ -45,6 +45,8 @@ def _public_settings(parsed: dict) -> dict:
     if not isinstance(embedded, dict):
         result['embedded_qq'] = embedded = {}
     embedded.setdefault('self_message_enabled', True)
+    embedded.setdefault('inject_enhanced', False)
+    embedded.setdefault('windows_hook_launch', False)
     return result
 
 
@@ -60,7 +62,7 @@ def _set_path(target: dict, path: str, value):
         'server': {'host', 'port'},
         'web': {'trust_forwarded_headers', 'framework_name', 'favicon_url'},
         'owner': {'ids'},
-        'embedded_qq': {'enabled', 'bridge_port_start', 'command', 'qq_path', 'packet_backend', 'packet_verbose', 'packet_o3_hook', 'data_dir', 'headless', 'single_process', 'rss_target_mb', 'swap_reclaim', 'self_message_enabled'},
+        'embedded_qq': {'enabled', 'bridge_port_start', 'command', 'qq_path', 'windows_hook_launch', 'packet_backend', 'packet_verbose', 'packet_o3_hook', 'data_dir', 'headless', 'single_process', 'rss_target_mb', 'swap_reclaim', 'self_message_enabled', 'inject_enhanced'},
         'logging': {'dir', 'insert_interval', 'max_batch_size', 'max_queue_entries', 'retention_days', 'wal_mode'},
         'pip': {'auto_install', 'mirror'},
         # 仅保留旧插件配置的读写兼容性；框架本身不加载 AI 服务。
@@ -78,6 +80,8 @@ def _set_path(target: dict, path: str, value):
         ('embedded_qq', 'single_process'),
         ('embedded_qq', 'swap_reclaim'),
         ('embedded_qq', 'self_message_enabled'),
+        ('embedded_qq', 'inject_enhanced'),
+        ('embedded_qq', 'windows_hook_launch'),
         ('logging', 'wal_mode'),
         ('pip', 'auto_install'),
         ('ai', 'enabled'),
@@ -129,7 +133,7 @@ def _set_path(target: dict, path: str, value):
         if not 1 <= value <= 65535:
             raise ValueError('服务端口必须在 1-65535 之间')
     if section == 'embedded_qq' and key == 'bridge_port_start' and not 1 <= value <= 65535:
-        raise ValueError('QQ 桥接端口必须在 1-65535 之间')
+        raise ValueError('账号服务端口必须在 1-65535 之间')
     positive_integer_fields = {
         ('logging', 'max_batch_size'),
         ('logging', 'max_queue_entries'),
