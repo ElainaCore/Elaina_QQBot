@@ -1,6 +1,6 @@
 [project]
 name = "elainaqq-onebot"
-version = "1.0.1"
+version = "1.0.2"
 description = "兼容 OneBot v11 的 ElainaQQ 异步 QQ 机器人框架"
 requires-python = ">=3.11"
 readme = "README.md"
