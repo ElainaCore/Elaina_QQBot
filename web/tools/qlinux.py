@@ -37,7 +37,7 @@ def mgr_version(mgr) -> str:
 
 
 async def handle_qlinux_create(request: web.Request) -> web.Response:
-    """POST /api/qlinux/create {bot_id} — 创建账号实例。"""
+    """POST /api/qlinux/create {bot_id} — 创建 Linux 协议账号实例。"""
     mgr = _manager(request)
     if mgr is None:
         return error('QLinux 渠道未启用', status=404)
@@ -61,8 +61,16 @@ async def handle_qlinux_login_qr(request: web.Request) -> web.Response:
     if bot_id not in {a['bot_id'] for a in mgr.list_accounts()}:
         return error('账号不存在')
     result = await mgr.login_qr(bot_id)
-    return ok({'started': bool(result.get('started', True)), 'bot_id': bot_id},
-              message='二维码生成中, 请轮询 /api/qlinux/qr 获取')
+    already_running = bool(result.get('already_running'))
+    return ok(
+        {
+            'started': bool(result.get('started', True)),
+            'already_running': already_running,
+            'bot_id': bot_id,
+        },
+        message='登录流程已在进行, 请轮询 /api/qlinux/qr 获取'
+        if already_running else '二维码生成中, 请轮询 /api/qlinux/qr 获取',
+    )
 
 
 async def handle_qlinux_login_password(request: web.Request) -> web.Response:

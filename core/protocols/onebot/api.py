@@ -311,10 +311,7 @@ class OneBotAPI:
         return get_supported_actions()
 
     def __getattribute__(self, name):
-        """让显式 API 封装统一接受 self_id/_self_id。
-
-        路由账号存入 ContextVar，避免不同 QQ 的并发事件互相覆盖目标账号。
-        """
+        """让显式 API 封装统一接受 self_id/_self_id。"""
         attr = object.__getattribute__(self, name)
         if name == 'call_api' or name.startswith('_') or not asyncio.iscoroutinefunction(attr):
             return attr
@@ -350,6 +347,8 @@ class OneBotAPI:
             self_id = route_id if route_id is not None else _routed_self_id.get()
         if not self._adapter:
             return action_failed('OneBot 适配器未初始化', 1500)
+        if self_id is None and self._adapter.has_ambiguous_routes():
+            return action_failed('存在多个机器人，请明确指定 self_id', 1400)
         self_id = self._adapter.default_self_id() if self_id is None else self._adapter.resolve_self_id(self_id)
 
         action, params = normalize_action_request(action, params)

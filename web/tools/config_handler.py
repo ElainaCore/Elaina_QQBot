@@ -2,7 +2,6 @@
 
 import copy
 import os
-from urllib.parse import urlparse
 
 from aiohttp import web
 
@@ -38,7 +37,6 @@ def _public_settings(parsed: dict) -> dict:
     if isinstance(web_settings, dict):
         web_settings.pop('admin_password', None)
     # 可视化面板的布尔开关用 !!value 渲染；键缺失会显示为关，
-    # 而运行时默认是开。这里显式回填默认值，避免 UI 与行为不一致。
     embedded = result.setdefault('embedded_qq', {})
     if not isinstance(embedded, dict):
         result['embedded_qq'] = embedded = {}
@@ -112,13 +110,11 @@ def _set_path(target: dict, path: str, value):
         if isinstance(value, bool):
             raise ValueError(f'{path} 必须是数字')
         value = float(value)
-    elif (section, key) in string_fields:
-        if not isinstance(value, str):
-            raise ValueError(f'{path} 必须是字符串')
+    elif (section, key) in string_fields and not isinstance(value, str):
+        raise ValueError(f'{path} 必须是字符串')
 
-    if section == 'server' and key == 'port':
-        if not 1 <= value <= 65535:
-            raise ValueError('服务端口必须在 1-65535 之间')
+    if section == 'server' and key == 'port' and not 1 <= value <= 65535:
+        raise ValueError('服务端口必须在 1-65535 之间')
     if section == 'embedded_qq' and key == 'bridge_port_start' and not 1 <= value <= 65535:
         raise ValueError('账号服务端口必须在 1-65535 之间')
     positive_integer_fields = {

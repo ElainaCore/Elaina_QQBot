@@ -34,6 +34,18 @@ def normalize_action_response(response: Any, *, action: str = '') -> dict[str, A
         return action_failed('机器人未连接或接口不可用', 1404)
 
     normalized = dict(response)
+    # Local protocol bridges historically returned the action payload itself
+    if not any(key in normalized for key in ('status', 'retcode', 'data')):
+        error_text = normalized.get('error') or normalized.get('error_message') or normalized.get('errMsg')
+        if error_text:
+            return action_failed(str(error_text), 1500)
+        normalized = {
+            'status': 'ok',
+            'retcode': 0,
+            'data': dict(response),
+            'message': '',
+            'wording': '',
+        }
     status = str(normalized.get('status') or '').lower()
     try:
         retcode = int(normalized.get('retcode', 0 if status != 'failed' else 1500))
@@ -41,7 +53,6 @@ def normalize_action_response(response: Any, *, action: str = '') -> dict[str, A
         retcode = 1500
 
     # QQNT 原生接口可能被包装成外层 OneBot success，但把真正的错误放在
-    # data.result/errMsg 中；Elaina 在 action 层统一检查这一层。
     nested = None
     for candidate in (normalized.get('data'), normalized.get('rsp'), normalized.get('payload')):
         if isinstance(candidate, dict):
@@ -60,10 +71,11 @@ def normalize_action_response(response: Any, *, action: str = '') -> dict[str, A
         has_native_error = any(nested.get(key) for key in (
             'errMsg', 'retMsg', 'clientWording', 'error', 'errorMessage'
         ))
-        if nested_retcode != 0 and (action == 'send_packet' or has_native_error):
+        if has_native_error or (nested_retcode != 0 and action == 'send_packet'):
             message = str(
                 nested.get('errMsg') or nested.get('retMsg') or nested.get('message')
-                or nested.get('clientWording') or normalized.get('message') or normalized.get('wording')
+                or nested.get('clientWording') or nested.get('error') or nested.get('errorMessage')
+                or normalized.get('message') or normalized.get('wording')
                 or f'OneBot 原生接口失败 ({nested_retcode})'
             )
             return action_failed(message, nested_retcode)

@@ -18,6 +18,11 @@ _base_dir = ''
 _READ_PATTERN = re.compile(r'^\s*(SELECT|PRAGMA|EXPLAIN|WITH)\b', re.IGNORECASE)
 
 
+def _quote_identifier(value: str) -> str:
+    """安全引用 SQLite 标识符。"""
+    return '"' + str(value).replace('"', '""') + '"'
+
+
 def set_context(app_instance, base_dir: str):
     global _app, _base_dir
     _app = app_instance
@@ -83,10 +88,11 @@ def _list_tables(db_path: str) -> list[dict]:
         tables = []
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"):
             name = row['name']
-            count = conn.execute(f'SELECT COUNT(*) AS c FROM "{name}"').fetchone()['c']
+            quoted = _quote_identifier(name)
+            count = conn.execute(f'SELECT COUNT(*) AS c FROM {quoted}').fetchone()['c']
             columns = [
                 {'name': column['name'], 'type': column['type'], 'notnull': bool(column['notnull']), 'pk': bool(column['pk'])}
-                for column in conn.execute(f'PRAGMA table_info("{name}")')
+                for column in conn.execute(f'PRAGMA table_info({quoted})')
             ]
             tables.append({'name': name, 'count': count, 'columns': columns})
         return tables
@@ -94,13 +100,14 @@ def _list_tables(db_path: str) -> list[dict]:
 
 def _query_table(db_path: str, table: str, order_clause: str, page_size: int, offset: int):
     with _open(db_path) as conn:
-        total = conn.execute(f'SELECT COUNT(*) AS c FROM "{table}"').fetchone()['c']
+        quoted = _quote_identifier(table)
+        total = conn.execute(f'SELECT COUNT(*) AS c FROM {quoted}').fetchone()['c']
         rows = conn.execute(
-            f'SELECT rowid AS _rowid, * FROM "{table}" {order_clause} LIMIT ? OFFSET ?',
+            f'SELECT rowid AS _rowid, * FROM {quoted} {order_clause} LIMIT ? OFFSET ?',
             (page_size, offset),
         ).fetchall()
         data = [dict(row) for row in rows]
-        columns = [{'name': column['name'], 'type': column['type']} for column in conn.execute(f'PRAGMA table_info("{table}")')]
+        columns = [{'name': column['name'], 'type': column['type']} for column in conn.execute(f'PRAGMA table_info({quoted})')]
         return data, columns, total
 
 
@@ -125,7 +132,7 @@ def _execute_sql(db_path: str, sql: str, is_read: bool):
 def _delete_rows(db_path: str, table: str, rowids: list[int]) -> int:
     with _open(db_path, readonly=False) as conn:
         placeholders = ','.join('?' * len(rowids))
-        cursor = conn.execute(f'DELETE FROM "{table}" WHERE rowid IN ({placeholders})', rowids)
+        cursor = conn.execute(f'DELETE FROM {_quote_identifier(table)} WHERE rowid IN ({placeholders})', rowids)
         conn.commit()
         return cursor.rowcount
 

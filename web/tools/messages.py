@@ -545,7 +545,6 @@ def _history_db_entry(event: dict, chat_type: str, chat_id: str, bot_qq: str) ->
         'content': _segment_content(message) or str(event.get('raw_message') or ''),
         'source': bot_qq,
         # 私聊中自己发出的历史事件 user_id 是机器人，日志会话键仍应是好友 QQ；
-        # 群聊则保留实际发送者，供消息记录显示昵称与成员身份。
         'user_id': event_user_id if chat_type == 'group' else chat_id,
         'group_id': chat_id if chat_type == 'group' else '',
         'message_id': str(event.get('message_id') or ''),
@@ -791,6 +790,7 @@ def _outbound_segments(
 
 
 async def handle_send_message(request: web.Request):
+    max_image_size = 16 * 1024 * 1024
     try:
         if request.content_type and 'multipart' in request.content_type:
             reader = await request.multipart()
@@ -804,7 +804,17 @@ async def handle_send_message(request: web.Request):
                     continue
                 field_name = part.name or ''
                 if field_name == 'image':
-                    image_data = await part.read()
+                    image_data = await part.read_chunk(size=1024 * 1024)
+                    chunks = [image_data]
+                    total = len(image_data)
+                    while image_data:
+                        image_data = await part.read_chunk(size=1024 * 1024)
+                        total += len(image_data)
+                        if total > max_image_size:
+                            return web.json_response({'success': False, 'message': '图片超过 16 MB 限制'}, status=413)
+                        if image_data:
+                            chunks.append(image_data)
+                    image_data = b''.join(chunks)
                 elif field_name:
                     fields[field_name] = (await part.read()).decode('utf-8', errors='replace')
         else:

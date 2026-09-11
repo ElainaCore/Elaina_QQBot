@@ -47,11 +47,27 @@ def _avatar(qq: str) -> str:
 def _conn_type(ad, self_id: str) -> str:
     """依据适配器记录判断连接方式 (WebSocket 优先于 HTTP)"""
     if self_id in ad.local_actions:
-        return 'QQ 注入'
+        labels = {
+            'embedded': '内置 QQ',
+            'injected': 'QQ 注入',
+            'lagrange': 'QLinux',
+        }
+        return labels.get(ad.local_channels.get(self_id, ''), '本地渠道')
     if self_id in ad.websockets:
         return 'WebSocket'
     rec = ad.bots.get(self_id) or {}
     return 'WebSocket' if rec.get('type') == 'websocket' else 'HTTP'
+
+
+def _qlinux_accounts() -> list[dict]:
+    """返回 QLinux 的全部账号，包括当前离线账号。"""
+    manager = getattr(_app, 'qlinux', None)
+    if manager is None:
+        return []
+    try:
+        return manager.list_accounts()
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _bot_identities(item) -> set[str]:
@@ -76,10 +92,32 @@ async def handle_get_bots(request: web.Request):
             embedded_ids.update(_bot_identities(item))
         for bot in getattr(manager, 'bots', {}).values():
             embedded_ids.update(_bot_identities(bot))
+    qlinux_accounts = _qlinux_accounts()
+    qlinux_ids = set()
+    for account in qlinux_accounts:
+        qlinux_ids.update(_bot_identities(account))
+        uin = str(account.get('uin') or '').strip()
+        bot_id = str(account.get('bot_id') or '').strip()
+        connected = bool(ad and uin and uin in ad.local_actions)
+        bots.append(
+            {
+                **account,
+                'bot_id': bot_id,
+                'bot_qq': uin or bot_id,
+                'name': account.get('nickname') or uin or bot_id,
+                'qq': uin,
+                'avatar': _avatar(uin),
+                'connected': connected,
+                'connection_type': 'QLinux',
+                'runtime_mode': 'QLinux',
+                'error': account.get('last_error') or '',
+                'enabled': True,
+            }
+        )
     if ad:
         for self_id in _common.connected_ids():
             self_id = str(self_id)
-            if self_id in embedded_ids:
+            if self_id in embedded_ids or self_id in qlinux_ids:
                 continue
             conn_type = _conn_type(ad, self_id)
             connected = self_id in ad.local_actions or self_id in ad.websockets or conn_type == 'WebSocket'
@@ -140,9 +178,8 @@ async def handle_create_embedded_bot(request: web.Request):
     bot_id = str(body.get('bot_id') or body.get('uin') or '').strip()
     if not bot_id:
         return error('缺少 bot_id')
-    if os.name == 'nt':
-        if str(body.get('runtime_mode') or '') != 'hookqq':
-            return error('Windows 内置账号必须使用 HookQQ 模式')
+    if os.name == 'nt' and str(body.get('runtime_mode') or '') != 'hookqq':
+        return error('Windows 内置账号必须使用 HookQQ 模式')
     try:
         bot = await manager.create_bot(
             bot_id,
@@ -155,7 +192,6 @@ async def handle_create_embedded_bot(request: web.Request):
         return error(str(exc))
     if os.name == 'nt' and not bool(cfg.get('settings', 'embedded_qq.windows_hook_launch', False)):
         # 这是用户显式选择内置 HookQQ 的时刻；普通注入流程不会修改此项，
-        # 也不会在下次框架启动时触发 QQ 探测或版本校验。
         cfg.set_value('settings', 'embedded_qq.windows_hook_launch', True)
     return ok(bot=next(item for item in manager.list_bots() if item['bot_id'] == bot.bot_id))
 

@@ -1,34 +1,20 @@
-"""SnowLuma 兼容 Hook DLL 的 Python 接管桥。
-
-一个 QQ 主进程一条 :class:`HookBridge`：持有 control/recv 两条 QHP1 管道，
-把 DLL 推送的 MsgPush 原始包解码为 OneBot 事件并注入框架，同时用 op=2 请求
-实现 send_msg / get_msg 等动作（与 SnowLuma ``QqHookClient`` 行为一致）。
-
-连接语义（对照 SnowLuma）::
-
-    control 连接后 DLL 立即推 HELLO(op=1)
-    recv 连接后 DLL 推 HELLO + LOGIN_STATE(op=7, flags 含 bit2=已登录)
-    recv 管道持续推 PACKET(op=6)，value0=seq、cmd=服务名、msg=uin
-    op=2 请求: DLL 先回 ACK(op=3) 再回 REPLY(op=4, status=错误码, body=响应)
-"""
+"""SnowLuma 兼容 Hook DLL 的 Python 接管桥。"""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
-import json
 import logging
-import struct
 import time
-from dataclasses import dataclass, field as dc_field
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any
 
 from core.runtime.embedded import hook_msgpush as msgpush
 from core.runtime.embedded import hook_send as sendpb
 from core.runtime.embedded.hook_pipe import (
     FLAG_LOGGED_IN,
-    Frame,
-    HookPipe,
     OP_ACK,
     OP_ERROR,
     OP_HELLO,
@@ -36,7 +22,8 @@ from core.runtime.embedded.hook_pipe import (
     OP_PACKET,
     OP_REPLY,
     OP_REQUEST,
-    PIPE_VERSION,
+    Frame,
+    HookPipe,
     control_pipe_name,
     recv_pipe_name,
 )
@@ -74,7 +61,7 @@ DISCONNECT_HANDLER = Callable[[], Awaitable[None] | None]
 def hash_message_id(sequence: int, session_id: int, event_name: str) -> int:
     """与 SnowLuma hashMessageIdInt32 完全一致的 int32 消息 ID。"""
     key = f'{int(sequence)}:{int(session_id)}:{event_name}'.encode()
-    id_ = int.from_bytes(hashlib.sha1(key).digest()[:4], 'big', signed=True)
+    id_ = int.from_bytes(hashlib.sha1(key, usedforsecurity=False).digest()[:4], 'big', signed=True)
     return id_ or 1
 
 
@@ -160,10 +147,8 @@ class HookBridge:
         self._pending.clear()
         if self._pump_task:
             self._pump_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._pump_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
             self._pump_task = None
         await self._control.close()
         await self._recv.close()
@@ -360,6 +345,7 @@ class HookBridge:
                 'nickname': ctx.member_name,
                 'card': ctx.member_card,
                 'role': 'member',
+                'permission': 'member',
                 'sex': 'unknown',
                 'age': 0,
             },
@@ -403,13 +389,7 @@ class HookBridge:
         return payload
 
     def _event_system(self, ctx: msgpush.MsgContext) -> dict[str, Any] | None:
-        """Convert QQNT group system packets into standard OneBot events.
-
-        The system event payload is stored in MessageBody.msgContent.  In
-        particular, PkgType 85 is emitted when the current robot is invited
-        into a group and must become group_increase for group-management
-        plugins to see it.
-        """
+        """Convert QQNT group system packets into standard OneBot events."""
         content = msgpush.pb_bytes(ctx.body, 2)
         group_id = msgpush.pb_int(content, 1, ctx.group_uin)
         if not group_id:
@@ -582,10 +562,7 @@ class HookBridge:
 
     async def send_private(self, user_id: int, segments: list[dict[str, Any]],
                            *, temp_group: int = 0) -> dict[str, Any]:
-        if temp_group:
-            routing = sendpb.routing_grp_tmp(temp_group, '')
-        else:
-            routing = sendpb.routing_c2c(user_id)
+        routing = sendpb.routing_grp_tmp(temp_group, '') if temp_group else sendpb.routing_c2c(user_id)
         parsed = await self._send_request(routing, 11, self._encode_elements(segments))
         sequence = parsed['private_seq']
         message_id = self._next_random() or sequence
@@ -692,7 +669,7 @@ class HookBridge:
             return b''
         try:
             return await asyncio.wait_for(fut, reply_timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._pending.pop(request_id, None)
             raise TimeoutError(f'hook 请求 {cmd} 回复超时 ({reply_timeout}s)') from None
 

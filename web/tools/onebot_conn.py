@@ -34,7 +34,7 @@ def _sanitize(conn: dict) -> dict:
         'enable': bool(c['enable']),
     }
     if out['type'] in ('ws_reverse', 'http_server'):
-        out['host'] = str(c.get('host') or '0.0.0.0')
+        out['host'] = str(c.get('host') or '127.0.0.1')
         out['port'] = int(c.get('port') or 5201)
         out['path'] = str(c.get('path') or '/')
     if out['type'] in ('ws_forward', 'http_client'):
@@ -60,7 +60,7 @@ async def handle_get_connections(request: web.Request):
         connections=conns,
         status=status,
         server={
-            'host': cfg.get('settings', 'server.host', '0.0.0.0'),
+            'host': cfg.get('settings', 'server.host', '127.0.0.1'),
             'port': cfg.get('settings', 'server.port', 5201),
         },
     )

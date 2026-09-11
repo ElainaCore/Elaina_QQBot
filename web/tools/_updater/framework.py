@@ -28,6 +28,18 @@ from web.tools._updater.shared import (
     log,
 )
 
+_SEMVER_RE = re.compile(r'^v?(\d+)\.(\d+)\.(\d+)$')
+_MAX_API_RESPONSE_SIZE = 4 * 1024 * 1024
+
+
+def _version_key(value: str) -> tuple[int, int, int] | None:
+    match = _SEMVER_RE.fullmatch(str(value or '').strip())
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def _display_version(value: str) -> str:
+    return f'v{value}' if _version_key(value) and not str(value).startswith('v') else str(value)
+
 
 def _prepare_download(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -75,10 +87,23 @@ class FrameworkUpdater:
             with open(self.version_file, encoding='utf-8') as f:
                 version = json.load(f).get('version')
                 if version and version != 'unknown':
-                    return version
+                    value = str(version).strip()
+                    # Versions written by the old updater were short Git SHAs;
+                    if _version_key(value) or not re.fullmatch(r'[0-9a-fA-F]{7,40}', value):
+                        return value
         except Exception:
             pass
-        return self._read_git_version() or 'unknown'
+        return self._read_project_version() or self._read_git_version() or 'unknown'
+
+    def _read_project_version(self):
+        """Read the checked-in semantic version when Git metadata is absent."""
+        try:
+            pyproject = self.base_dir / 'pyproject.toml'
+            text = pyproject.read_text(encoding='utf-8')
+            match = re.search(r'^version\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+            return match.group(1) if match else ''
+        except (OSError, UnicodeError):
+            return ''
 
     def _read_git_version(self):
         """读取源码仓库当前提交；发布压缩包环境没有 Git 时安静回退。"""
@@ -223,9 +248,7 @@ class FrameworkUpdater:
     # ==================== 检查更新 ====================
 
     async def _fetch_api(self, path=''):
-        """尝试通过多个 API 代理访问 GitHub API
-        path 举例: '/commits?per_page=20'
-        """
+        """尝试通过多个 API 代理访问 GitHub API"""
         headers = {
             'User-Agent': 'Mozilla/5.0 ElainaQQ/1.0',
             'Accept': 'application/vnd.github+json',
@@ -244,7 +267,17 @@ class FrameworkUpdater:
                     ) as resp:
                         if resp.status == 200:
                             ct = resp.headers.get('content-type', '')
-                            body = await resp.read()
+                            declared = int(resp.headers.get('content-length', 0) or 0)
+                            if declared > _MAX_API_RESPONSE_SIZE:
+                                raise ValueError('GitHub API 响应超过大小限制')
+                            chunks = []
+                            size = 0
+                            async for chunk in resp.content.iter_chunked(256 * 1024):
+                                size += len(chunk)
+                                if size > _MAX_API_RESPONSE_SIZE:
+                                    raise ValueError('GitHub API 响应超过大小限制')
+                                chunks.append(chunk)
+                            body = b''.join(chunks)
                             if b'[' in body[:2] or b'{' in body[:2]:
                                 return json.loads(body)
                             log.debug(f'API 返回非 JSON: {ct}, url={u}')
@@ -258,6 +291,23 @@ class FrameworkUpdater:
     async def check_for_updates(self):
         try:
             self._report('checking', '正在检查更新...', 0)
+            release = await self._fetch_api('/releases/latest')
+            if isinstance(release, dict) and release.get('tag_name'):
+                latest = _display_version(str(release['tag_name']))
+                current_key = _version_key(self.current_version)
+                latest_key = _version_key(latest)
+                has_update = current_key is None or (latest_key is not None and current_key < latest_key)
+                self._report('idle', '', 0)
+                return {
+                    'has_update': has_update,
+                    'latest_version': latest,
+                    'current_version': self.current_version,
+                    'changelog': release.get('body') or '',
+                    'release_url': release.get('html_url', ''),
+                    'error': None,
+                }
+
+            # Older installations may point at a repository without Releases.
             commits = await self._fetch_api('/commits?per_page=10')
             if not commits or not isinstance(commits, list):
                 self._report('idle', '', 0)
@@ -288,7 +338,8 @@ class FrameworkUpdater:
     async def download_update(self, version):
         zip_file = None
         try:
-            if not re.fullmatch(r'[0-9a-fA-F]{7,40}', str(version or '')):
+            version = str(version or '').strip()
+            if not (_version_key(version) or re.fullmatch(r'[0-9a-fA-F]{7,40}', version)):
                 self._report('failed', '无效的更新版本', 0)
                 return None
             self._report('downloading', '正在选择最快镜像...', 5)
@@ -374,8 +425,6 @@ class FrameworkUpdater:
             log_prefix_win = f'data\\{log_dir_name}'
 
             # 内置 QQ 的客户端/账号运行数据体积较大且可由 QQ 自身重新生成，
-            # 更新备份不应把它们打进压缩包。data_dir 支持相对项目目录和绝对路径；
-            # 只有位于项目目录内的路径才需要加入本次遍历的排除项。
             embedded_data_prefix = ''
             try:
                 embedded_raw = str((_s.get('embedded_qq') or {}).get('data_dir', 'data/qq') or '').strip()

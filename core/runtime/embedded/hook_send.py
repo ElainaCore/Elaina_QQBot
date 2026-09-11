@@ -1,48 +1,7 @@
-"""PbSendMsg / 撤回等发送侧 protobuf 编码（字段号与 SnowLuma encoder 对齐）。
-
-字段表（``index.mjs`` ``protobuf_encode_*`` 系列逐一核对）::
-
-    SendMessageRequest   f1=routingHead f2=contentHead f3=messageBody
-                         f4=clientSequence f5=random f6=syncCookie
-                         f7=via f8=dataStatist f9=ctrl(MessageControl)
-                         f10=multiSendSeq
-    RoutingHead          f1=c2c(RoutingC2C) f2=grp(RoutingGroup)
-                         f3=grpTmp(RoutingGrpTmp) f4=trans0x211(RoutingTrans0x211)
-    RoutingC2C           f1=uin f2=uid
-    RoutingGroup         f1=groupCode(u64)
-    RoutingGrpTmp        f1=groupUin(u64) f2=toUid
-    RoutingTrans0x211    f1=toUin f2=ccCmd f3=uid
-    SendContentHead      f1=type f2=subType f3=c2cCmd
-    MessageControl       f1=msgFlag
-    MessageBody          f1=richText f2=msgContent
-    RichText             f2=elems[](Elem)   (attr f1/attr2 忽略)
-    Elem                 f1=text f2=face f6=marketFace f8=customFace
-                         f12=richMsg f13=groupFile f45=srcMsg f51=lightApp
-                         f53=commonElem
-    TextElem             f1=str f3=attr6Buf f12=pbReserve(MentionExtraSend)
-    MentionExtraSend     f3=type f4=uin f5=field5 f9=uid
-    FaceElem             f1=index
-    QSmallFaceExtra      f1=faceId f2=preview f3=preview2
-    QFaceExtra           f1=packId f2=stickerId f3=qsid f4=sourceType
-                         f5=stickerType f7=text f8=randomType
-    LightAppElem         f1=data f2=msgResid
-    RichMsg              f1=template1 f2=serviceId
-    CommonElem           f1=serviceType f2=pbElem f3=businessType
-    SrcMsg               f1=origSeqs(rep varint) f2=senderUin(u64) f3=time
-    SendMessageResponse  f1=result f2=errMsg f3=timestamp1
-                         f5=groupSequence f7=privateSequence
-    GroupRecallRequest   f1=type f2=groupUin(u64) f4=info f5=settings
-    GroupRecallInfo      f1=sequence f2=random f3=field3
-    GroupRecallSettings  f1=field1
-    C2CRecallRequest     f1=type f4=info f5=settings f6=field6(bool)
-    C2CRecallInfo        f1=clientSequence f2=random f3=messageId(u64)
-                         f4=timestamp f5=field5 f6=messageSequence
-    C2CRecallSettings    f1=field1(bool) f2=field2(bool)
-"""
+"""PbSendMsg / 撤回等发送侧 protobuf 编码（字段号与 SnowLuma encoder 对齐）。"""
 
 from __future__ import annotations
 
-import struct
 import zlib
 from typing import Any
 
@@ -208,7 +167,7 @@ def encode_c2c_recall_request(target_uid: str, client_seq: int, msg_seq: int,
 
 def parse_send_response(body: bytes) -> dict[str, Any]:
     """SendMessageResponse → {result, err_msg, timestamp, group_seq, private_seq}。"""
-    from core.runtime.embedded.hook_msgpush import pb_bytes, pb_int, pb_str
+    from core.runtime.embedded.hook_msgpush import pb_int, pb_str
 
     return {
         'result': pb_int(body, 1),

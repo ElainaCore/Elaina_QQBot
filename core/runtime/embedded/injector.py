@@ -1,12 +1,4 @@
-"""SnowLuma 兼容的 QQ 进程注入生命周期（纯 Python ctypes 实现）。
-
-Python 直接调用 Win32 API，把 ``core/native/qq-win32-x64.dll`` 加载进已运行的
-QQ 主进程。DLL 在 QQ 进程内部复用其自带的 Electron/Node 环境并启动 Elaina
-桥接。框架因此不再携带或解压 node.exe，也不派生任何辅助 Node 进程。
-
-对外接口保持 ``load(pid)`` / ``unload(pid)`` / ``refresh(pid)`` / ``close()``，
-调用方（``web/tools/processes.py`` 与前端）无需感知实现切换。
-"""
+"""SnowLuma 兼容的 QQ 进程注入生命周期（纯 Python ctypes 实现）。"""
 
 from __future__ import annotations
 
@@ -129,9 +121,7 @@ class NativeQQInjector:
         self._owned_pids: set[int] = set()
         self._before_unload: list[Callable[[int], Awaitable[None] | None]] = []
 
-    # ------------------------------------------------------------------
     # 状态与注册
-    # ------------------------------------------------------------------
 
     def availability_error(self) -> str:
         if os.name != 'nt' or platform.machine().lower() not in {'amd64', 'x86_64'}:
@@ -169,9 +159,7 @@ class NativeQQInjector:
 
         return _remove
 
-    # ------------------------------------------------------------------
     # 对外异步接口
-    # ------------------------------------------------------------------
 
     async def load(self, pid: int) -> dict[str, Any]:
         self._require_available()
@@ -202,9 +190,7 @@ class NativeQQInjector:
                 await self.unload(pid)
         self._owned_pids.clear()
 
-    # ------------------------------------------------------------------
     # 同步实现（全部在线程中执行，绝不阻塞事件循环）
-    # ------------------------------------------------------------------
 
     def _load_sync(self, pid: int) -> dict[str, Any]:
         self._verify_target_sync(pid)
@@ -212,7 +198,6 @@ class NativeQQInjector:
         owned = pid in self._owned_pids
         if owned or pid in pipes:
             # 管道存在说明 DLL 已经在 QQ 内：不重复 LoadLibrary，避免引用计数叠加。
-            # 认领（adopt）所有权：无论 DLL 由谁加载，本框架从此接管其生命周期。
             self._owned_pids.add(pid)
             return {'pid': pid, 'loaded': True, 'owned': True, 'alreadyLoaded': True, 'adopted': not owned}
 
@@ -257,9 +242,7 @@ class NativeQQInjector:
         self._owned_pids.discard(pid)
         return {'pid': pid, 'loaded': False, 'owned': False, 'alreadyUnloaded': False}
 
-    # ------------------------------------------------------------------
     # 目标验证
-    # ------------------------------------------------------------------
 
     def _verify_target_sync(self, pid: int) -> str:
         """独立验证目标 PID：进程名、主进程身份、可执行文件与权限。"""
@@ -326,9 +309,7 @@ class NativeQQInjector:
             raise NativeInjectionError('QQ 以管理员权限运行，请以管理员身份重启框架后再操作', 'ELEVATION_REQUIRED')
         raise NativeInjectionError(f'无法打开 QQ 进程 (PID {pid})，Win32 错误码 {error}', 'OPEN_FAILED')
 
-    # ------------------------------------------------------------------
     # Win32 注入细节
-    # ------------------------------------------------------------------
 
     def _write_dll_path(self, handle: int) -> int:
         """在 QQ 进程内分配内存并写入 DLL 的绝对 Unicode 路径。"""
@@ -369,7 +350,6 @@ class NativeQQInjector:
                 raise NativeInjectionError(f'无法读取加载线程退出码，Win32 错误码 {_win32_error()}', 'LOAD_FAILED')
             if not exit_code.value:
                 # x64 下 GetExitCodeThread 只能看到低 32 位：模块基址低 32 位
-                # 恰好为 0 时会误报失败，用模块枚举复核后再下结论。
                 if self._find_remote_module(pid) is not None:
                     return
                 raise NativeInjectionError(
@@ -422,9 +402,7 @@ class NativeQQInjector:
         finally:
             _k32.CloseHandle(snapshot)
 
-    # ------------------------------------------------------------------
     # 公共工具
-    # ------------------------------------------------------------------
 
     def _pipe_pids(self) -> frozenset[int]:
         """读取 mojo.<pid>.control 命名管道，判断 DLL 是否已在 QQ 内运行。"""

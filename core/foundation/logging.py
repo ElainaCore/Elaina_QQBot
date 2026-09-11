@@ -41,7 +41,6 @@ def setup(framework_name: str = PRODUCT_NAME, level: int = logging.INFO):
 
     formatter = _PublicNameFormatter(f'[{framework_name}] %(asctime)s - %(levelname)s - %(message)s', datefmt='%m-%d %H:%M:%S')
     # Windows 默认控制台可能仍使用 GBK，遇到插件日志中的非 ASCII 字符会触发
-    # logging 内部异常。优先切换为 UTF-8，无法切换时使用可替代错误策略。
     stream = sys.stdout
     with contextlib.suppress(AttributeError, OSError, ValueError):
         reconfigure = getattr(stream, 'reconfigure', None)

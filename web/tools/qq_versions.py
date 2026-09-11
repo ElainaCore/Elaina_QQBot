@@ -42,7 +42,6 @@ def set_context(app_instance):
 def _manager():
     base_dir = getattr(_app, '_base_dir', None)
     # Web 安装和内置 QQ 启动必须共享同一个运行时目录，否则面板显示
-    # 已安装而启动器仍会报“未找到 QQ 可执行文件”。
     return get_qq_manager(Path(base_dir) / 'data' / 'qq' if base_dir else None)
 
 

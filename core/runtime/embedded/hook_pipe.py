@@ -1,39 +1,9 @@
-"""SnowLuma 兼容 Hook DLL 的本机管道客户端（QHP1 协议）。
-
-DLL 注入 QQ 后在进程内创建两条命名管道（``mojo.<pid>.control`` 与
-``mojo.<pid>.recv``，位于 named-pipe 根目录）。协议帧格式（全部小端）::
-
-    magic  u32 = 0x314D5151 ('QHP1'  ASCII)
-    ver    u16 = 1
-    op     u16
-    reqId  u32
-    status i32
-    flags  u32   (bit0 = 期望回复, bit2 = 已登录)
-    cmdLen u32
-    msgLen u32
-    bodyLen u32
-    pad    u32
-    value0 u64
-    cmd    bytes[cmdLen]
-    msg    bytes[msgLen]
-    body   bytes[bodyLen]
-
-op 码（由 SnowLuma ``index.mjs`` 桥接源反推）::
-
-    1 = HELLO       控制端连接后由 DLL 主动推送
-    2 = REQUEST     客户端 → DLL 的服务请求（cmd=trpc 服务名）
-    3 = ACK         请求已受理
-    4 = REPLY       请求最终回复（status=错误码，body=响应）
-    5 = ERROR       请求失败通知
-    6 = PACKET      recv 管道上的原始包事件（value0=seq, cmd=服务名, msg=uin）
-    7 = LOGIN_STATE 登录态推送（value0=uin, msg=uin 字符串）
-"""
+"""SnowLuma 兼容 Hook DLL 的本机管道客户端（QHP1 协议）。"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import struct
 from dataclasses import dataclass, field
 
@@ -68,7 +38,7 @@ class Frame:
     body: bytes = field(default=b'', repr=False)
 
     @classmethod
-    def decode(cls, buf: bytes) -> tuple['Frame', int]:
+    def decode(cls, buf: bytes) -> tuple[Frame, int]:
         """解析一帧，返回 (frame, 总字节数)；数据不足返回 (frame(空), 0)。"""
         if len(buf) < HEADER.size:
             return cls(), 0
@@ -199,7 +169,6 @@ class HookPipe:
                 self._buffer = self._buffer[used:]
         except ValueError as exc:
             # 坏帧（含流错位）：清空缓冲重同步。DLL 不会发非 QHP1 数据，
-            # 走到这里多半是上一帧长度解错后的连锁，重同步是最快恢复方式。
             self._buffer = b''
             log.warning('丢弃 %s 上的坏帧: %s', self.name, exc)
         return frames

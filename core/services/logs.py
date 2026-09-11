@@ -142,8 +142,6 @@ class LogService:
             conn.execute('CREATE INDEX IF NOT EXISTS idx_log_user ON log(user_id, group_id)')
             if log_type == 'message':
                 # 内置 QQ 的实时回调和历史同步可能命中同一条消息。先清理旧重复，
-                # 再按会话保证后续同步幂等。群消息的 user_id 是发送者，不能参与
-                # 会话身份；私聊则使用 user_id 作为会话身份。
                 schema_version = int(conn.execute('PRAGMA user_version').fetchone()[0])
                 if schema_version < 2:
                     conn.execute('DROP INDEX IF EXISTS idx_log_message_identity')
@@ -188,10 +186,7 @@ class LogService:
         )
 
     def add_nowait(self, log_type: str, entry: dict, bot_qq: str = '') -> bool:
-        """同步入队，仅追加到内存队列，不执行磁盘读写。
-
-        队列有界，避免数据库异常或磁盘拥塞时无限占用内存。
-        """
+        """同步入队，仅追加到内存队列，不执行磁盘读写。"""
         key = (log_type, bot_qq or '')
         with self._queue_lock:
             if self._queued_entries >= self._max_queue_entries:
@@ -293,7 +288,6 @@ class LogService:
                     await asyncio.to_thread(self._write_entries, key[0], key[1], entries)
                 except Exception:
                     # 失败批次完整放回。短暂超过软上限时，新日志会被拒绝，
-                    # 但已经接收的日志不会因为并发入队而丢失。
                     with self._queue_lock:
                         queue = self._queues.setdefault(key, deque())
                         queue.extendleft(reversed(entries))

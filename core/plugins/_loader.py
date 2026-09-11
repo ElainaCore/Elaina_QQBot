@@ -190,7 +190,6 @@ class _LoaderMixin:
                     plugin.enabled = old_plugin.enabled
 
                 # 新版本加载成功后才卸载旧版本。切换期间保存两代模块和
-                # Web 注册项，确保任何一步失败都能恢复原有可用版本。
                 new_modules = self._pop_modules(name)
                 if old_plugin is not None:
                     self._restore_modules(name, old_modules)

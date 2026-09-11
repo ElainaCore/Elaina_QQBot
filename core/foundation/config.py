@@ -2,6 +2,8 @@
 
 import logging
 import os
+import secrets
+import shutil
 import threading
 from typing import Any
 
@@ -16,7 +18,7 @@ class Config:
     def __init__(self):
         self._config_dir = ''
         self._data = {}  # 配置文件名映射到配置内容
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._callbacks = {}  # 配置文件名映射到回调列表
 
     def init(self, config_dir: str):
@@ -33,16 +35,29 @@ class Config:
             if not os.path.isfile(target):
                 example = os.path.join(self._config_dir, f'{name}.example.yaml')
                 if os.path.isfile(example):
-                    import shutil
-
                     shutil.copy2(example, target)
                 else:
-                    # 从项目根目录的 config/ 复制
                     root_example = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'config', f'{name}.example.yaml')
                     if os.path.isfile(root_example):
-                        import shutil
-
                         shutil.copy2(root_example, target)
+                if name == 'settings' and os.path.isfile(target):
+                    self._set_initial_admin_password(target)
+
+    @staticmethod
+    def _set_initial_admin_password(path: str) -> None:
+        """为首次生成的设置写入随机管理密码。"""
+        try:
+            with open(path, encoding='utf-8') as file:
+                content = file.read()
+            marker = 'admin_password: ""'
+            if marker not in content:
+                return
+            password = secrets.token_urlsafe(18)
+            with open(path, 'w', encoding='utf-8') as file:
+                file.write(content.replace(marker, f'admin_password: "{password}"', 1))
+            log.warning('首次管理密码已生成，请查看 config/settings.yaml')
+        except OSError as error:
+            log.error('生成首次管理密码失败: %s', error)
 
     def _load_all(self):
         """加载配置目录下所有 yaml 文件"""
@@ -109,16 +124,14 @@ class Config:
             if file not in self._data:
                 self._data[file] = {}
             data = self._data[file]
-
-        parts = key.split('.')
-        target = data
-        for part in parts[:-1]:
-            if part not in target or not isinstance(target[part], dict):
-                target[part] = {}
-            target = target[part]
-        target[parts[-1]] = value
-
-        self._save_file(file)
+            parts = key.split('.')
+            target = data
+            for part in parts[:-1]:
+                if part not in target or not isinstance(target[part], dict):
+                    target[part] = {}
+                target = target[part]
+            target[parts[-1]] = value
+            self._save_file(file)
         self._fire_callbacks(file)
 
     def _save_file(self, name: str):
@@ -128,7 +141,7 @@ class Config:
             data = self._data.get(name, {})
         try:
             with open(path, 'w', encoding='utf-8') as f:
-                yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+                yaml.safe_dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
         except Exception as e:
             log.error(f'保存配置失败 [{name}]: {e}')
 
@@ -155,7 +168,7 @@ class Config:
         """设置文件完整配置"""
         with self._lock:
             self._data[file] = data
-        self._save_file(file)
+            self._save_file(file)
         self._fire_callbacks(file)
 
 

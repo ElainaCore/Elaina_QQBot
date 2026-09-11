@@ -1,37 +1,32 @@
-"""QLinux 渠道 — Lagrange 多 bot runner 进程管理器。
-
-职责:
-1. runner 二进制管理: 检查本地 → 缺失时从 GitHub Releases 下载 (镜像回退) → 解压
-2. runner 子进程托管: 启动 (SIGN_SERVER_URL 环境变量注入签名地址)、stdin/stdout JSON-RPC 通信
-3. 多 bot 生命周期: bot.create / login.qr / login.password / submit.captcha / submit.sms / bot.stop
-4. 事件转发: runner 事件 → OneBot v11 形状 → app.ingest_event() (与内嵌 QQ 同一条管线)
-5. 动作绑定: register_local_bot → send_group_msg / send_private_msg / get_login_info 等
-"""
+"""QLinux 渠道 — Lagrange 多 bot runner 进程管理器。"""
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import os
 import platform
-import shutil
 import stat
-import sys
 import tarfile
 import time
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import aiohttp
+
+from core.foundation.archives import safe_extract_tar, safe_extractall
+from core.protocols.onebot.contract import normalize_role
+from core.protocols.onebot.event import normalize_event
+from core.protocols.onebot.message import normalize_message
 
 log = logging.getLogger('ElainaQQ.qlinux')
 
 # ==================== 默认配置 ====================
 
-RUNNER_VERSION = 'v1.0.1'
+RUNNER_VERSION = 'v1.0.3'
 # 发布仓库 (与框架更新同一镜像体系拉取)
 RUNNER_REPO = 'ElainaCore/lagrange-runner'
 
@@ -45,6 +40,7 @@ _FALLBACK_MIRRORS = [
 ]
 
 _DEFAULT_SIGN_SERVER = 'https://esign.linsur.cn/'
+_MAX_RUNNER_ARCHIVE_SIZE = 256 * 1024 * 1024
 
 
 def _runner_asset() -> str:
@@ -135,9 +131,12 @@ class RunnerDownloader:
                 await self._download(final_url, archive_path)
                 self._extract(archive_path)
                 self._make_executable()
+                if not self.has_runner():
+                    raise RuntimeError('压缩包中未找到有效的 runner 二进制')
                 log.info('QLinux runner 下载完成: %s', self.exe_path)
                 return
             except Exception as e:  # noqa: BLE001 — 逐镜像尝试
+                archive_path.unlink(missing_ok=True)
                 log.warning('下载失败 (%s): %s', final_url, e)
                 last_err = e
 
@@ -145,25 +144,28 @@ class RunnerDownloader:
 
     async def _download(self, url: str, dest: Path) -> None:
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=300)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as resp:
-                resp.raise_for_status()
-                total = int(resp.headers.get('Content-Length') or 0)
-                done = 0
-                with dest.open('wb') as f:
-                    async for chunk in resp.content.iter_chunked(256 * 1024):
-                        f.write(chunk)
-                        done += len(chunk)
-                        if self._progress_cb and total:
-                            self._progress_cb(done, total)
+        async with aiohttp.ClientSession(timeout=timeout) as session, session.get(url) as resp:
+            resp.raise_for_status()
+            total = int(resp.headers.get('Content-Length') or 0)
+            if total > _MAX_RUNNER_ARCHIVE_SIZE:
+                raise ValueError('QLinux runner 压缩包超过大小限制')
+            done = 0
+            with dest.open('wb') as f:
+                async for chunk in resp.content.iter_chunked(256 * 1024):
+                    if done + len(chunk) > _MAX_RUNNER_ARCHIVE_SIZE:
+                        raise ValueError('QLinux runner 压缩包超过大小限制')
+                    f.write(chunk)
+                    done += len(chunk)
+                    if self._progress_cb and total:
+                        self._progress_cb(done, total)
 
     def _extract(self, archive_path: Path) -> None:
         if archive_path.suffix == '.zip':
             with zipfile.ZipFile(archive_path) as zf:
-                zf.extractall(self._bin_dir)
+                safe_extractall(zf, str(self._bin_dir), max_size=_MAX_RUNNER_ARCHIVE_SIZE)  # nosec B202
         else:
             with tarfile.open(archive_path) as tf:
-                tf.extractall(self._bin_dir)
+                safe_extract_tar(tf, str(self._bin_dir), max_size=_MAX_RUNNER_ARCHIVE_SIZE)
         archive_path.unlink(missing_ok=True)
 
     def _make_executable(self) -> None:
@@ -175,11 +177,7 @@ class RunnerDownloader:
 
 
 class RunnerRPC:
-    """单例 runner 子进程: 承载全部 bot 实例。
-
-    协议: 每行一个 JSON。stdin 发请求 {id, method, params}; stdout 收
-    响应 {id, result|error} 与事件 {event, bot_id, ...} (区分键为 event)。
-    """
+    """单例 runner 子进程: 承载全部 bot 实例。"""
 
     def __init__(self, exe_path: Path, data_root: Path, sign_server: str,
                  event_handler: Callable[[dict], None]):
@@ -219,17 +217,24 @@ class RunnerRPC:
             self._alive = True
             self._reader_task = asyncio.create_task(self._read_loop(), name='qlinux-runner-reader')
             # 等待进程就绪 (ping 探活)
-            await asyncio.wait_for(self.call('ping'), timeout=15)
+            try:
+                await asyncio.wait_for(self.call('ping'), timeout=15)
+            except BaseException:
+                await self.stop()
+                raise
 
     async def stop(self) -> None:
         self._alive = False
-        if self._reader_task:
-            self._reader_task.cancel()
+        reader_task = self._reader_task
+        self._reader_task = None
+        if reader_task:
+            reader_task.cancel()
+            await asyncio.gather(reader_task, return_exceptions=True)
         if self._proc and self._proc.returncode is None:
             try:
                 self._proc.terminate()
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
-            except (ProcessLookupError, asyncio.TimeoutError):
+            except (TimeoutError, ProcessLookupError):
                 if self._proc.returncode is None:
                     self._proc.kill()
         self._proc = None
@@ -243,22 +248,24 @@ class RunnerRPC:
         """发起 RPC 请求并等待响应。"""
         if not self.alive:
             raise RuntimeError('runner 未运行')
+        if self._proc is None or self._proc.stdin is None:
+            raise RuntimeError('runner 标准输入不可用')
         self._id_counter += 1
         rid = f'q{self._id_counter}'
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[rid] = fut
         payload = json.dumps({'id': rid, 'method': method, 'params': params or {}},
                              ensure_ascii=False, separators=(',', ':'))
-        assert self._proc and self._proc.stdin
-        self._proc.stdin.write(payload.encode('utf-8') + b'\n')
-        await self._proc.stdin.drain()
         try:
+            self._proc.stdin.write(payload.encode('utf-8') + b'\n')
+            await self._proc.stdin.drain()
             return await asyncio.wait_for(fut, timeout=timeout)
         finally:
             self._pending.pop(rid, None)
 
     async def _read_loop(self) -> None:
-        assert self._proc and self._proc.stdout
+        if self._proc is None or self._proc.stdout is None:
+            raise RuntimeError('runner 标准输出不可用')
         try:
             while True:
                 raw = await self._proc.stdout.readline()
@@ -307,7 +314,12 @@ def _msg_time() -> int:
 def _entities_to_ob(data: dict) -> list[dict]:
     """runner 消息实体 (entities) → OneBot v11 消息段。"""
     out: list[dict] = []
-    for seg in data.get('entities', []):
+    entities = data.get('entities', [])
+    if not isinstance(entities, list):
+        return out
+    for seg in entities:
+        if not isinstance(seg, dict):
+            continue
         t = seg.get('type')
         if t == 'text':
             out.append({'type': 'text', 'data': {'text': seg.get('text', '')}})
@@ -326,11 +338,29 @@ def _entities_to_ob(data: dict) -> list[dict]:
             out.append({'type': 'json', 'data': {'data': seg.get('data', '')}})
         elif t == 'reply':
             out.append({'type': 'reply', 'data': {'id': str(seg.get('seq', ''))}})
+        else:
+            # 新版 Lagrange 实体（file/video/markdown/forward 等）不应在
+            segment_data = (
+                dict(seg['data'])
+                if isinstance(seg.get('data'), dict)
+                else {key: value for key, value in seg.items() if key != 'type'}
+            )
+            out.append({'type': str(t or 'unknown'), 'data': segment_data})
     return out
 
 
-def _ob_message_id(bot_id: str, sequence: int, group: bool) -> str:
-    return f'{bot_id}:{group and "g" or "p"}:{sequence}'
+def _ob_message_id(bot_id: str, sequence: int, group: bool) -> int:
+    """Return a normal OneBot v11 message id."""
+    del bot_id, group
+    return int(sequence or 0)
+
+
+def _normalize_onebot_payload(payload: dict, fallback_uin: str, bot_id: str) -> dict:
+    """Keep runner-forwarded OneBot events equivalent to native events."""
+    payload = dict(payload)
+    payload.setdefault('self_id', str(fallback_uin or bot_id))
+    normalized = normalize_event(payload, str(fallback_uin or bot_id))
+    return normalized or payload
 
 
 def runner_event_to_onebot(event: dict) -> dict | None:
@@ -339,31 +369,37 @@ def runner_event_to_onebot(event: dict) -> dict | None:
     bot_id = str(event.get('bot_id', ''))
 
     # 新版 runner 可以直接转发已经规范化的 OneBot 事件；保留这条
-    # 兼容路径，避免新增通知类型时 Python 层再次丢弃。
     if etype in {'onebot', 'onebot.event'}:
         payload = event.get('payload') or event.get('data')
         if not isinstance(payload, dict):
             return None
-        payload = dict(payload)
-        payload.setdefault('self_id', str(event.get('uin') or bot_id))
-        return payload
+        return _normalize_onebot_payload(
+            payload, str(event.get('uin') or bot_id), bot_id)
 
-    if etype == 'message':
+    # runner 可以直接发送 notice/request/meta_event，也可以使用
+    direct_data = event.get('data')
+    direct_payload = event.get('payload')
+    candidate = direct_payload if isinstance(direct_payload, dict) else direct_data
+    if isinstance(candidate, dict) and candidate.get('post_type'):
+        return _normalize_onebot_payload(
+            candidate, str(event.get('uin') or bot_id), bot_id)
+
+    if etype == 'message' or etype.startswith('message.') or etype.endswith('.message'):
         d = event.get('data', {})
         if not isinstance(d, dict):
             return None
         # 允许 runner 直接携带 OneBot message 数组，避免消息实体扩展
-        # （视频、文件、Markdown 等）在协议桥接层被静默丢弃。
         if isinstance(d.get('message'), list) and d.get('post_type'):
-            payload = dict(d)
-            payload.setdefault('self_id', str(event.get('uin') or bot_id))
-            return payload
+            return _normalize_onebot_payload(
+                d, str(event.get('uin') or bot_id), bot_id)
         uin = str(event.get('uin') or d.get('self_uin') or bot_id)
-        contact = d.get('contact', {})
+        contact = d.get('contact') if isinstance(d.get('contact'), dict) else {}
         group_id = contact.get('group_uin')
-        is_group = group_id is not None
-        message_id = _ob_message_id(bot_id, int(d.get('sequence', 0)), is_group)
+        is_group = group_id not in (None, '')
+        sequence = int(d.get('sequence', 0) or 0)
+        message_id = _ob_message_id(bot_id, sequence, is_group)
         sender_uin = int(contact.get('uin', 0) or 0)
+        role = normalize_role(contact.get('permission')) if is_group else 'member'
         payload = {
             'time': int(d.get('time') or _msg_time()),
             'self_id': uin,
@@ -371,8 +407,11 @@ def runner_event_to_onebot(event: dict) -> dict | None:
             'message_type': 'group' if is_group else 'private',
             'sub_type': 'normal',
             'message_id': message_id,
+            'message_seq': sequence,
+            'real_seq': sequence,
             'user_id': sender_uin,
-            'message': _entities_to_ob(d),
+            'group_name': contact.get('group_name', '') if is_group else '',
+            'message': normalize_message(_entities_to_ob(d)),
             'raw_message': ''.join(
                 s.get('text', '') if s.get('type') == 'text' else f"[{s.get('type')}]"
                 for s in d.get('entities', [])),
@@ -381,12 +420,50 @@ def runner_event_to_onebot(event: dict) -> dict | None:
                 'user_id': sender_uin,
                 'nickname': contact.get('nickname', ''),
                 'card': contact.get('card', '') if is_group else '',
-                'role': _map_role(contact.get('permission')) if is_group else None,
+                'role': role,
+                'permission': role,
+                'title': contact.get('special_title', '') if is_group else '',
+                'level': int(contact.get('group_level', 0) or 0) if is_group else 0,
             },
         }
         if is_group:
             payload['group_id'] = int(group_id)
         return payload
+
+    # 兼容 runner 的显式 lifecycle/notice/request 事件。事件名称本身是
+    if etype.startswith('notice.') or etype == 'notice':
+        data = event.get('data') if isinstance(event.get('data'), dict) else {}
+        return _normalize_onebot_payload(
+            {
+                **data,
+                'post_type': 'notice',
+                'notice_type': data.get('notice_type') or etype.partition('.')[2] or 'notify',
+            },
+            str(event.get('uin') or bot_id),
+            bot_id,
+        )
+    if etype.startswith('request.') or etype == 'request':
+        data = event.get('data') if isinstance(event.get('data'), dict) else {}
+        return _normalize_onebot_payload(
+            {
+                **data,
+                'post_type': 'request',
+                'request_type': data.get('request_type') or etype.partition('.')[2] or 'unknown',
+            },
+            str(event.get('uin') or bot_id),
+            bot_id,
+        )
+    if etype.startswith('meta.') or etype == 'meta_event':
+        data = event.get('data') if isinstance(event.get('data'), dict) else {}
+        return _normalize_onebot_payload(
+            {
+                **data,
+                'post_type': 'meta_event',
+                'meta_event_type': data.get('meta_event_type') or etype.partition('.')[2] or 'lifecycle',
+            },
+            str(event.get('uin') or bot_id),
+            bot_id,
+        )
 
     if etype == 'bot.online':
         return {
@@ -401,9 +478,4 @@ def runner_event_to_onebot(event: dict) -> dict | None:
             'reason': event.get('reason', ''), 'tips': event.get('tips'),
         }
     # qr.code / qr.state / login.* / keystore.refreshed 是登录流程事件,
-    # 由 RunnerManager 状态机消化, 不进 OneBot 管线
     return None
-
-
-def _map_role(permission: str | None) -> str:
-    return {'Owner': 'owner', 'Admin': 'admin'}.get(permission or '', 'member')

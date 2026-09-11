@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import stat
+import tarfile
 import zipfile
 
 MAX_ARCHIVE_FILES = 20_000
@@ -65,3 +66,46 @@ def validate_archive(
         total_size += member.file_size
         if total_size > max_size:
             raise ValueError(f'压缩包解压后超过限制: {max_size} 字节')
+
+
+def safe_extract_tar(
+    archive: tarfile.TarFile,
+    dest_dir: str,
+    *,
+    max_files: int = MAX_ARCHIVE_FILES,
+    max_size: int = MAX_ARCHIVE_SIZE,
+    max_member_size: int = MAX_MEMBER_SIZE,
+) -> None:
+    """校验路径、链接、文件类型与容量后解压 TAR。"""
+    members = archive.getmembers()
+    if len(members) > max_files:
+        raise ValueError(f'压缩包文件过多: {len(members)} > {max_files}')
+    root = os.path.realpath(dest_dir)
+    total_size = 0
+    for member in members:
+        name = member.name.replace('\\', '/')
+        target = os.path.join(root, name)
+        if not is_within(root, target):
+            raise ValueError(f'非法压缩包成员路径: {member.name!r}')
+        if member.issym() or member.islnk():
+            raise ValueError(f'压缩包不允许链接: {member.name!r}')
+        if not (member.isdir() or member.isfile()):
+            raise ValueError(f'压缩包不允许特殊文件: {member.name!r}')
+        if member.size > max_member_size:
+            raise ValueError(f'压缩包成员过大: {member.name!r}')
+        total_size += member.size
+        if total_size > max_size:
+            raise ValueError(f'压缩包解压后超过限制: {max_size} 字节')
+
+    os.makedirs(root, exist_ok=True)
+    for member in members:
+        target = os.path.join(root, member.name.replace('\\', '/'))
+        if member.isdir():
+            os.makedirs(target, exist_ok=True)
+            continue
+        os.makedirs(os.path.dirname(target) or root, exist_ok=True)
+        source = archive.extractfile(member)
+        if source is None:
+            raise ValueError(f'无法读取压缩包成员: {member.name!r}')
+        with source, open(target, 'wb') as output:
+            shutil.copyfileobj(source, output, length=1024 * 1024)

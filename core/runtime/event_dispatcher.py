@@ -67,6 +67,9 @@ class EventDispatcher:
                     queue.popleft()
                     self._pending -= 1
         finally:
+            if queue:
+                self._pending = max(0, self._pending - len(queue))
+                queue.clear()
             self._workers.pop(ordering_key, None)
             if not queue:
                 self._queues.pop(ordering_key, None)

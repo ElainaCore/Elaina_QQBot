@@ -38,9 +38,9 @@ from core.runtime.embedded.packet import (
     PacketRequest,
     build_ai_characters_packet,
     build_ai_voice_packet,
-    build_group_special_title_packet,
     build_group_ptt_url_packet,
     build_group_sign_packet,
+    build_group_special_title_packet,
     build_group_todo_packet,
     build_mini_app_packet,
     build_poke_packet,
@@ -74,7 +74,7 @@ log = logging.getLogger('ElainaQQ.embedded_qq')
 
 def _stable_device_guid(bot_id: str) -> str:
     """从 bot_id 派生稳定的 36 位设备 GUID（格式 8-4-4-4-12）。"""
-    digest = hashlib.sha256(f'elainaqq-device:{bot_id}'.encode('utf-8')).hexdigest()
+    digest = hashlib.sha256(f'elainaqq-device:{bot_id}'.encode()).hexdigest()
     raw = digest[:32]
     return f'{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}'
 
@@ -166,11 +166,7 @@ class EmbeddedQQManager:
 
     @property
     def autostart(self) -> bool:
-        """是否在框架启动后恢复内置 QQ。
-
-        Windows 普通注入模式不拥有 QQ 生命周期，不能在框架启动时探测或拉起 QQ；
-        Windows 只有显式 HookQQ 模式才自动恢复。Linux/macOS 保留原有内置运行时行为。
-        """
+        """是否在框架启动后恢复内置 QQ。"""
         return not (os.name == 'nt' and not self.hookqq_mode)
 
     @property
@@ -179,7 +175,6 @@ class EmbeddedQQManager:
             return True
         if os.name == 'nt' and bool(cfg.get('settings', 'embedded_qq.windows_hook_launch', False)):
             # Windows Hook 启动模式需要可见窗口（扫码登录 + 用户操作 QQ），
-            # 忽略服务器向的 headless 配置。
             return False
         return bool(cfg.get('settings', 'embedded_qq.headless', True))
 
@@ -254,7 +249,6 @@ class EmbeddedQQManager:
                 bot_id=bot_id,
                 bridge_port=self._parse_bridge_port(item.get('bridge_port')),
                 # 不在框架启动时探测/校验 QQ 版本。只有真正启动 HookQQ
-                # 时才由启动器读取客户端版本；普通注入模式不会拖慢启动。
                 qq_version_key=str(item.get('qq_version_key') or item.get('version_key') or ''),
                 qq_path=str(item.get('qq_path') or ''),
                 uin=str(item.get('uin') or ''),
@@ -525,7 +519,6 @@ class EmbeddedQQManager:
             return command, dict(launcher.launch_env)
         if os.name == 'nt' and bool(cfg.get('settings', 'embedded_qq.windows_hook_launch', False)):
             # Windows Hook 启动模式：QQ 复制到隔离副本后装载 loader + 验签补丁，
-            # 不触碰用户的日常 QQ 安装。
             launcher = launcher.hook_runtime()
         elif os.name != 'nt':
             try:
@@ -631,12 +624,10 @@ class EmbeddedQQManager:
         env.update(self._packet_backend_env())
         if os.name == 'nt':
             # Windows 启动器不会转发任意 Chromium 参数；QQ 会从进程环境读取这些路径，
-            # 因此每个内置账号仍能获得独立会话目录。
             app_data = data_dir / 'appdata'
             local_data = data_dir / 'localappdata'
             profile = data_dir / 'profile'
             # profile 必须真实存在：QQ 主入口 getMacShareSandBoxPath 调
-            # app.getPath('appData')，USERPROFILE 指向缺失目录时直接崩溃退出。
             profile.mkdir(parents=True, exist_ok=True)
             (profile / 'AppData' / 'Roaming').mkdir(parents=True, exist_ok=True)
             (profile / 'AppData' / 'Local').mkdir(parents=True, exist_ok=True)
@@ -1469,9 +1460,6 @@ class EmbeddedQQManager:
         bot_id = self._red_packet_bot_id(self_id)
         bill_no = str(bill_no or '').strip()
         # 红包来源决定领取通道：
-        # - agent（DLL 接管桥）：只有 raw_wallet hex，无 pcBody，必须走 qq-grab-agent；
-        # - bridge（hook 启动模式的 node 框桥）：bridge.redPackets 里有完整 pcBody，
-        #   走 node 层原生 grabRedBag（LiteLoader 同款机制）。
         cached = self._hook_red_packets.get(bill_no) if bill_no else None
         source = str(cached.get('grab_source') or '') if isinstance(cached, dict) else ''
         if source == 'agent':
@@ -1531,17 +1519,12 @@ class EmbeddedQQManager:
                 continue
         return fallback
 
-    
+
 
 
     @staticmethod
     def _wallet_grab_params(raw_hex: str) -> dict[str, str]:
-        """从 WalletElem hex 提取 grabRedBag 参数候选。
-
-        WalletElem{1: WalletItem{3: detail{14: url}, 9: billNo, 10: key}}。
-        pcBody 是红包领取链接（QQ 用它生成 grabRedBag 的 pcBody），
-        index 候选为 item.f10 的 key。
-        """
+        """从 WalletElem hex 提取 grabRedBag 参数候选。"""
         try:
             raw = bytes.fromhex(raw_hex or '')
         except ValueError:
@@ -1594,7 +1577,6 @@ class EmbeddedQQManager:
             # v8：HookAssemble 改为逐参数原始 dump（str+24B hex），校准参数映射
             self._base_dir / 'core' / 'native' / 'qq-grab-agent' / 'v8',
             # v3 目录存放当前验证过的 v6.x agent（双管道 + 正确 grab 链路）；
-            # v2 目录是旧版（单管道、grab 已禁用），严禁再被加载（会双实例抢同名管道）
             self._base_dir / 'core' / 'native' / 'qq-grab-agent' / 'v3',
             self._base_dir / 'core' / 'native' / 'qq-grab-agent',
         ]
@@ -1629,8 +1611,6 @@ class EmbeddedQQManager:
             }
         wallet_params = self._wallet_grab_params(str(packet.get('raw_wallet') or ''))
         # LiteLoader QQNT-Grab-RedBag 语义：
-        # 群聊 recvUin=peerUid=群号；name=自己昵称；pcBody=领取链接；
-        # index=stringIndex；wishing=标题；msgSeq=消息 seq；recvType=chatType。
         group_id = str(packet.get('group_id') or '')
         chat_type = int(packet.get('chat_type') if packet.get('chat_type') is not None else 2)
         payload = {
@@ -1778,6 +1758,8 @@ class EmbeddedQQManager:
                 bot.qr_code = bot.qr_url = ''
             if bot.uin and bot.status == 'online':
                 self.app.adapter.register_identity_alias(bot.bot_id, bot.uin)
+                from core.protocols.onebot.contract import Channel
+
                 self.app.adapter.register_local_bot(
                     bot.uin,
                     lambda action, params, bot_key=bot.bot_id: self.action(
@@ -1785,13 +1767,22 @@ class EmbeddedQQManager:
                         action,
                         params,
                     ),
+                    channel=Channel.EMBEDDED,
                 )
             elif bot.uin and bot.status in {'offline', 'error'}:
                 self._unregister_bot_aliases(bot)
             await self._save_accounts()
 
         event = payload.get('event')
-        return not isinstance(event, dict) or await self.app.ingest_event(event, bot.uin or bot_id)
+        if not isinstance(event, dict):
+            return True
+        from core.protocols.onebot.contract import Channel
+
+        # 内置 QQ 的运行时桥接与注入 Hook 共用同一条事件管线；渠道标识
+        source = Channel.EMBEDDED
+        if event.get('_source') == Channel.INJECTED:
+            source = Channel.INJECTED
+        return await self.app.ingest_event(event, bot.uin or bot_id, source=source)
 
     async def _reclaim_process_memory(
         self,

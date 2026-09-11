@@ -1,11 +1,4 @@
-# -*- coding: utf-8 -*-
-r"""GrabAgentInjector：把 qq-grab-agent.dll 注入 QQ 主进程并通过命名管道通信。
-
-agent 侧（core/native/qq-grab-agent/agent.cpp）：
-  - hook wrapper.node 的 napi_unwrap 跳转槽，捕获 KernelMsgService 实例
-  - 监听 \\.\pipe\elaina_grab_agent，处理 status/grab 命令
-  - grab 走 QQ 自己的 assemble + vtable+0x810 路径，签名由 QQ 内部完成
-"""
+"""GrabAgentInjector：把 qq-grab-agent.dll 注入 QQ 主进程并通过命名管道通信。"""
 from __future__ import annotations
 
 import contextlib
@@ -13,7 +6,6 @@ import ctypes
 import ctypes.wintypes as wt
 import json
 import logging
-import os
 import threading
 import time
 from pathlib import Path
@@ -103,7 +95,7 @@ class GrabAgentInjector:
 
     # -- 管道会话 ---------------------------------------------------------
 
-    def connect(self, timeout: float = 10.0) -> 'GrabAgentSession':
+    def connect(self, timeout: float = 10.0) -> GrabAgentSession:
         import time
         deadline = time.monotonic() + timeout
         cmd_h = None
@@ -128,7 +120,6 @@ class GrabAgentInjector:
             raise GrabAgentError('agent 管道连接超时（agent 未注入或 hook 失败）')
         except BaseException:
             # 连接中途失败必须关闭已拿到的句柄，否则 agent 的 cmd server
-            # 会阻塞在旧客户端的 ReadFrame 上，后续连接全部超时。
             if cmd_h is not None:
                 _kernel32.CloseHandle(cmd_h)
             if ev_h is not None:
@@ -177,7 +168,6 @@ class GrabAgentSession:
 
     def _read_event(self) -> dict | None:
         # Transient reconnect: the agent's ev-pipe server needs a moment to
-        # re-arm after the previous client disconnects (err 233 window).
         for attempt in range(2):
             ev = self._read_event_once()
             if ev is not None or attempt == 1:

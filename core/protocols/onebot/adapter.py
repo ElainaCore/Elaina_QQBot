@@ -9,7 +9,9 @@ from urllib.parse import quote, urlsplit
 
 import aiohttp
 
+from core.protocols.onebot.contract import Channel
 from core.protocols.onebot.event import OneBotEvent, parse_event
+from core.protocols.onebot.protocol import normalize_action_response
 
 logger = logging.getLogger('ElainaQQ.onebot.adapter')
 
@@ -26,6 +28,7 @@ class OneBotAdapter:
         self._api_response_owners: dict[str, Any] = {}
         self.http_clients: dict[str, dict[str, str]] = {}  # 名称映射到地址和令牌
         self.local_actions: dict[str, Any] = {}
+        self.local_channels: dict[str, str] = {}
         self.identity_aliases: dict[str, str] = {}
         # 鉴权按端口和路径隔离，避免不同连接误用令牌或签名密钥。
         self.reverse_ws_tokens: dict[tuple, str] = {}
@@ -33,11 +36,16 @@ class OneBotAdapter:
         self._http_session: aiohttp.ClientSession | None = None
         self.action_result_handler = action_result_handler
 
-    def register_local_bot(self, self_id: str, action):
-        """注册由框架直接 Hook 的本机 QQ 账号。"""
+    def register_local_bot(self, self_id: str, action, *, channel: str = Channel.EMBEDDED):
+        """注册由框架直接托管的账号动作。"""
         self_id = str(self_id)
         self.local_actions[self_id] = action
-        self.bots[self_id] = {'self_id': self_id, 'type': 'embedded'}
+        self.local_channels[self_id] = str(channel or Channel.EMBEDDED)
+        self.bots[self_id] = {
+            'self_id': self_id,
+            'type': 'local',
+            'channel': self.local_channels[self_id],
+        }
 
     def register_identity_alias(self, alias: str, self_id: str) -> None:
         """登记配置编号到真实 OneBot self_id 的稳定映射。"""
@@ -69,8 +77,9 @@ class OneBotAdapter:
     def unregister_local_bot(self, self_id: str):
         self_id = str(self_id)
         self.local_actions.pop(self_id, None)
+        self.local_channels.pop(self_id, None)
         record = self.bots.get(self_id)
-        if record and record.get('type') == 'embedded':
+        if record and record.get('type') == 'local':
             self.bots.pop(self_id, None)
 
     async def call_local_action(
@@ -89,16 +98,39 @@ class OneBotAdapter:
             logger.warning('多条内置 QQ 连接未指定 self_id，拒绝随机选择本地动作')
         if handler is None:
             return None
-        return await handler(action, params or {})
+        response = await handler(action, params or {})
+        if response is None:
+            return None
+        return normalize_action_response(response, action=action)
 
     def default_self_id(self) -> str | None:
-        """按本机、WebSocket、已登记账号的顺序选择默认机器人。"""
+        """仅在所有出站连接属于同一账号时返回默认机器人。"""
         identities = {
             str(self.resolve_self_id(self_id) or self_id)
-            for registry in (self.local_actions, self.websockets, self.bots)
+            for registry in (self.local_actions, self.websockets)
             for self_id in registry
         }
+        identities.update(
+            str(self.resolve_self_id(client.get('self_id')) or client.get('self_id'))
+            for client in self.http_clients.values()
+            if client.get('self_id')
+        )
         return next(iter(identities)) if len(identities) == 1 else None
+
+    def has_ambiguous_routes(self) -> bool:
+        """判断未指定账号时是否存在无法安全选择的出站连接。"""
+        identities = {
+            str(self.resolve_self_id(self_id) or self_id)
+            for registry in (self.local_actions, self.websockets)
+            for self_id in registry
+        }
+        anonymous_http = sum(1 for client in self.http_clients.values() if not client.get('self_id'))
+        identities.update(
+            str(self.resolve_self_id(client.get('self_id')) or client.get('self_id'))
+            for client in self.http_clients.values()
+            if client.get('self_id')
+        )
+        return len(identities) > 1 or anonymous_http > 1 or (anonymous_http and identities)
 
     def expected_ws_token(self, port=None, path=None) -> str:
         """返回指定 (端口, 路径) 反向 WS 入口应校验的 token。"""
@@ -131,7 +163,7 @@ class OneBotAdapter:
             return False
         return hmac.compare_digest(parts[1], token)
 
-    def parse_event(self, data: dict, default_self_id: str = '') -> OneBotEvent | None:
+    def parse_event(self, data: dict, default_self_id: str = '', source: str = '') -> OneBotEvent | None:
         """解析事件，并把全部账号别名收敛为标准 self_id。"""
         if not isinstance(data, dict):
             return None
@@ -140,6 +172,8 @@ class OneBotAdapter:
         canonical_self_id = self.resolve_self_id(str(supplied_self_id)) if supplied_self_id else ''
         if canonical_self_id:
             payload['self_id'] = canonical_self_id
+        if source:
+            payload['_source'] = str(source)
         return parse_event(payload, canonical_self_id or default_self_id)
 
     def decode_http_event(self, body: bytes, headers: dict, port=None, path=None) -> tuple[dict | None, int]:
@@ -167,7 +201,11 @@ class OneBotAdapter:
 
         self_id = str(self_id)
         if self_id not in self.bots:
-            self.bots[self_id] = {'self_id': self_id, 'type': 'http'}
+            self.bots[self_id] = {
+                'self_id': self_id,
+                'type': 'http',
+                'channel': str(Channel.ONEBOT),
+            }
             logger.info(f'Bot {self_id} HTTP 连接')
 
         return json_data, 204
@@ -191,7 +229,12 @@ class OneBotAdapter:
         previous_ws = self.websockets.get(self_id)
         if previous_ws is not None and previous_ws is not ws:
             self.cancel_api_responses(previous_ws)
-        self.bots[self_id] = {'self_id': self_id, 'type': 'websocket' if is_ws else 'http', 'ws': ws}
+        self.bots[self_id] = {
+            'self_id': self_id,
+            'type': 'websocket' if is_ws else 'http',
+            'channel': str(Channel.ONEBOT),
+            'ws': ws,
+        }
         if is_ws:
             self.websockets[self_id] = ws
 
@@ -336,9 +379,8 @@ class OneBotAdapter:
             if len(matches) > 1:
                 logger.warning('OneBot HTTP 账号标识重复，拒绝随机选择: self_id=%s', requested)
                 return None
-            if len(clients) > 1:
-                logger.warning('没有匹配 self_id 的 OneBot HTTP 连接: self_id=%s', requested)
-                return None
+            logger.warning('没有匹配 self_id 的 OneBot HTTP 连接: self_id=%s', requested)
+            return None
         if len(clients) == 1:
             return clients[0]
         logger.warning('多条 OneBot HTTP 连接未指定 self_id，拒绝随机选择')

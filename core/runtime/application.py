@@ -19,10 +19,12 @@ from core.plugins.manager import PluginManager
 from core.protocols.onebot.adapter import OneBotAdapter
 from core.protocols.onebot.api import set_adapter, set_main_loop
 from core.protocols.onebot.connection import ConnectionManager
+from core.protocols.onebot.contract import Channel
 from core.runtime.embedded.hook_bridge import HookBridge
 from core.runtime.embedded.injector import NativeQQInjector
 from core.runtime.embedded.manager import EmbeddedQQManager
 from core.runtime.event_dispatcher import EventDispatcher
+from core.runtime.event_pipeline import EventPipeline
 from core.runtime.extensions.hook import HookManager, bind_hook_manager
 from core.runtime.extensions.manager import ModuleManager
 from core.services.config_watcher import ConfigWatcherService
@@ -73,6 +75,7 @@ class Application:
         self._hook_bot_ids: set[str] = set()
         self._process_injector.register_before_unload(self.detach_hook_bridge)
         self._event_dispatcher = None
+        self._event_pipeline = None
         self._event_log_recorder = None
         self._last_queue_warning = 0.0
         self._static_settings = {}
@@ -93,6 +96,11 @@ class Application:
     def qlinux(self):
         """QLinux (Lagrange 协议端) 渠道管理器; 未启用时为 None。"""
         return self._qlinux_manager
+
+    @property
+    def event_pipeline(self):
+        """四渠道共享的事件管线（用于诊断和队列指标）。"""
+        return self._event_pipeline
 
     @property
     def process_injector(self):
@@ -121,8 +129,11 @@ class Application:
 
         async def ingest_hook_event(payload: dict) -> bool:
             # Hook 事件的载荷不一定包含 self_id；使用握手得到的 QQ 号兜底，
-            # 确保事件分发与消息/事件日志都进入正确的账号分库。
-            return await self.ingest_event(payload, str(bridge.status.uin or ''))
+            return await self.ingest_event(
+                payload,
+                str(bridge.status.uin or ''),
+                source=Channel.INJECTED,
+            )
 
         async def ingest_hook_red_packet(packet: dict) -> None:
             # Windows 注入模式：从 MsgPush 网络层解析出的红包，直通红包监听器。
@@ -131,7 +142,6 @@ class Application:
 
         async def on_hook_disconnect() -> None:
             # QQ 退出后，注入账号不再是有效接入；清理本地动作注册，
-            # 让 Web 面板中的账号列表同步消失。
             current = self._hook_bridges.get(pid)
             if current is bridge:
                 self._hook_bridges.pop(pid, None)
@@ -184,16 +194,9 @@ class Application:
             return
 
         async def _handler(action: str, params: dict, _bridge=bridge):
-            result = await _bridge.handle_action(action, params)
-            if result is not None and result.get('error'):
-                from core.protocols.onebot.protocol import action_failed
-                return action_failed(result['error'])
-            if result is not None:
-                from core.protocols.onebot.protocol import action_ok
-                return action_ok(result)
-            return None
+            return await _bridge.handle_action(action, params)
 
-        adapter.register_local_bot(uin, _handler)
+        adapter.register_local_bot(uin, _handler, channel=Channel.INJECTED)
         self._hook_bot_ids.add(uin)
         log.info('本地动作已绑定到 QQ 连接: uin=%s (pid=%s)', uin, bridge.pid)
 
@@ -257,12 +260,11 @@ class Application:
         set_main_loop(asyncio.get_running_loop())
 
         # 先创建内置 QQ 管理器，使插件加载钩子可以直接注册原生能力回调。
-        # QQ 进程仍在 HTTP 和连接服务就绪后启动。
         self._embedded_qq = EmbeddedQQManager(self)
 
         # QLinux (Lagrange 协议端) 渠道 — 默认启用, 配置显式关闭才禁用
-        from core.runtime.qlinux.manager import QLinuxManager
         from core.foundation.config import cfg as _cfg
+        from core.runtime.qlinux.manager import QLinuxManager
         try:
             _qlinux_cfg = _cfg.get('settings', 'qlinux', {}) or {}
             if bool(_qlinux_cfg.get('enabled', True)):
@@ -306,6 +308,7 @@ class Application:
             lambda log_type, entry: self.push_web_log(log_type, entry),
         )
         self._event_dispatcher = EventDispatcher(self._process_event)
+        self._event_pipeline = EventPipeline(self._adapter, self._event_dispatcher)
 
         # 7) Web 面板由应用编排层装配，HTTP 传输层只维护网络生命周期。
         self._mount_web_panel()
@@ -414,7 +417,9 @@ class Application:
                 with contextlib.suppress(Exception):
                     await self.detach_hook_bridge(pid)
             await self._shutdown_step('QQ 连接组件', self._process_injector.close(), timeout=15)
-        if self._event_dispatcher:
+        if self._event_pipeline:
+            await self._shutdown_step('统一事件管线', self._event_pipeline.shutdown(), timeout=15)
+        elif self._event_dispatcher:
             await self._shutdown_step('事件调度器', self._event_dispatcher.shutdown(), timeout=15)
         if self._config_watcher:
             await self._shutdown_step('配置监视', self._config_watcher.shutdown(), timeout=3)
@@ -476,25 +481,25 @@ class Application:
                     if isinstance(result[0], Exception):
                         log.warning('事件日志记录失败: %s', result[0])
 
-    async def ingest_event(self, payload: dict, default_self_id: str = '') -> bool:
-        """所有内置及网络来源共用的唯一 OneBot 事件入口。"""
+    async def ingest_event(
+        self,
+        payload: dict,
+        default_self_id: str = '',
+        source: str = Channel.ONEBOT,
+    ) -> bool:
+        """所有四种渠道共用的唯一 OneBot 事件入口。"""
         if not self._adapter:
             return False
-        event = self._adapter.parse_event(payload, default_self_id)
-        if event is None:
+        if self._event_pipeline is None and self._event_dispatcher is not None:
+            # 兼容测试/嵌入式调用方手动装配旧版 dispatcher 的场景。
+            self._event_pipeline = EventPipeline(self._adapter, self._event_dispatcher)
+        if self._event_pipeline is None:
             return False
-        if not self._event_dispatcher:
-            return False
-        self_id = str(getattr(event, 'self_id', '') or '')
-        conversation_id = str(
-            getattr(event, 'group_id', '')
-            or getattr(event, 'target_id', '')
-            or getattr(event, 'user_id', '')
-            or getattr(event, 'peer_id', '')
-            or ''
+        accepted = await self._event_pipeline.ingest(
+            payload,
+            default_self_id,
+            source=str(source or Channel.ONEBOT),
         )
-        ordering_key = f'{self_id}:{conversation_id}'
-        accepted = await self._event_dispatcher.submit(ordering_key, event)
         if not accepted:
             now = asyncio.get_running_loop().time()
             if now - self._last_queue_warning >= 10:
@@ -524,7 +529,7 @@ class Application:
             return copy.deepcopy(cfg.get('settings', key, default))
 
         return {
-            'server.host': snapshot('server.host', '0.0.0.0'),
+            'server.host': snapshot('server.host', '127.0.0.1'),
             'server.port': snapshot('server.port', 5201),
             'web.framework_name': snapshot('web.framework_name', PRODUCT_NAME),
             'web.favicon_url': snapshot('web.favicon_url', ''),

@@ -365,7 +365,6 @@ class QQManager:
             )
             raise RuntimeError(f'Windows QQ 静默安装失败: {exc}') from exc
         # QQ 安装程序可能在进程退出后才完成文件落盘，给标准安装目录和
-        # 为腾讯公共安装目录留出一个短暂的探测窗口。
         executable = None
         for _ in range(10):
             executable = self.get_qq_executable(version_key)
@@ -665,11 +664,7 @@ class QQManager:
             return False
 
     async def uninstall_qq(self, version_key: str | None = None) -> dict[str, Any]:
-        """移除由本管理器创建的 QQ 安装。
-
-        仅检测到的系统 QQ 不会被删除。Linux 安装包只有在原始安装记录能证明
-        其归框架管理时，才会通过系统包管理器卸载。
-        """
+        """移除由本管理器创建的 QQ 安装。"""
         key = version_key or self.detect_platform()
         if not key or key not in QQ_VERSIONS:
             raise ValueError('当前系统没有可卸载的 QQ 版本')

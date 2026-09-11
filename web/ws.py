@@ -109,11 +109,7 @@ class WSBroadcast:
         self._drain_task = None
 
     def shutdown(self):
-        """服务器关闭时主动断开所有面板连接，避免阻塞 aiohttp runner.shutdown()
-
-        WebSocket：发送关闭帧（代码 1001，服务离开）。
-        SSE：清空队列集合，处理器会在下一次队列操作时自然退出。
-        """
+        """服务器关闭时主动断开所有面板连接，避免阻塞 aiohttp runner.shutdown()"""
         for ws in list(self._clients):
             with contextlib.suppress(Exception, RuntimeError):
                 asyncio.get_running_loop().create_task(ws.close(code=1001, message='服务关闭'.encode()))
@@ -202,11 +198,7 @@ async def _handle_client_msg(ws: web.WebSocketResponse, data: dict):
 
 
 async def handle_sse(request: web.Request) -> web.StreamResponse:
-    """SSE 降级端点。
-
-    当 WebSocket 因 Nginx 未配置 upgrade 等原因不可用时,
-    前端自动降级到 SSE, 走普通 HTTP 无需特殊代理配置。
-    """
+    """SSE 降级端点。"""
     if not auth.validate_token(request) or not auth.is_same_origin(request):
         return web.Response(status=401, text='未授权')
 

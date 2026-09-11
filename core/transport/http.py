@@ -14,10 +14,12 @@ from core.foundation.branding import public_text
 from core.foundation.config import cfg
 from core.foundation.logging import SYSTEM, get_logger
 from core.protocols.onebot.connection import ConnType
+from core.protocols.onebot.contract import Channel
 
 log = get_logger(SYSTEM, 'HTTP')
 
 _MAX_REQUEST_SIZE = 132 * 1024 * 1024
+_MAX_ONEBOT_EVENT_SIZE = 32 * 1024 * 1024
 
 
 def _local_port(request: web.Request):
@@ -148,7 +150,7 @@ class HttpServer:
         """启动 HTTP 服务器，端口短暂占用时在限定时间内重试。"""
         if self._app is None:
             raise RuntimeError('HTTP 应用尚未初始化')
-        host = cfg.get('settings', 'server.host', '0.0.0.0')
+        host = cfg.get('settings', 'server.host', '127.0.0.1')
         port = cfg.get('settings', 'server.port', 5201)
 
         self._runner = web.AppRunner(self._app, shutdown_timeout=3)
@@ -211,14 +213,18 @@ class HttpServer:
         if not adapter.expected_http_secret(port, path) and not _is_loopback_peer(request.remote):
             return web.Response(status=401, text='非本机 OneBot HTTP 接入必须配置签名密钥')
 
+        if request.content_length and request.content_length > _MAX_ONEBOT_EVENT_SIZE:
+            return web.Response(status=413, text='OneBot 事件过大')
         body = await request.read()
+        if len(body) > _MAX_ONEBOT_EVENT_SIZE:
+            return web.Response(status=413, text='OneBot 事件过大')
         if not body:
             return web.Response(status=400)
 
         payload, status = adapter.decode_http_event(body, dict(request.headers), port=port, path=path)
         if payload is None:
             return web.Response(status=status)
-        if not await self._app_instance.ingest_event(payload):
+        if not await self._app_instance.ingest_event(payload, source=Channel.ONEBOT):
             return web.Response(status=503, text='事件接入队列不可用')
         return web.Response(status=204)
 
@@ -267,7 +273,7 @@ class HttpServer:
                     echo = data.get('echo')
                     if echo is not None and adapter.resolve_api_response(echo, data):
                         continue
-                    if not await self._app_instance.ingest_event(data, self_id):
+                    if not await self._app_instance.ingest_event(data, self_id, source=Channel.ONEBOT):
                         log.warning('拒绝无效或无法入队的 OneBot WebSocket 事件: 机器人 %s', self_id)
                 elif msg.type == web.WSMsgType.ERROR:
                     break

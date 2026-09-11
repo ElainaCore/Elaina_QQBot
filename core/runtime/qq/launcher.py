@@ -191,7 +191,6 @@ class QQLauncher:
             '  const fs = require("fs");\n'
             '  const grabLogPath = process.env.ELAINAQQ_GRAB_LOG || "";\n'
             '  ipcMain.on("elainaqq:grab-file", (_event, text) => { try { if (grabLogPath) fs.appendFileSync(grabLogPath, String(text) + "\\n"); } catch (error) {} });\n'
-            '  ipcMain.on("elainaqq:grab-result", (_event, data) => { const line = JSON.stringify(data); console.log("[ElainaQQ][grab-result]", line); try { if (grabLogPath) fs.appendFileSync(grabLogPath, line + "\\n"); } catch (error) {} });\n'
             '  const watchPath = grabLogPath.replace(/grab_result\\.jsonl$/, "grab_task.json");\n'
             '  let lastTaskMtime = 0;\n'
             '  const broadcastTask = (raw) => { try { const task = JSON.parse(raw); const ec = require("electron").webContents.getAllWebContents(); ec.forEach((wc) => { try { wc.send("elainaqq:grab-go", task); } catch (e4) {} }); } catch (e5) {} };\n'
@@ -269,15 +268,7 @@ class QQLauncher:
         return None
 
     def apply_windows_sign_patch(self) -> None:
-        """跳过 QQNT.dll 的 resources 清单验签（仅限 hook-runtime 副本调用）。
-
-        QQ 9.9.35+ 的 application.json 是 RSA 签名清单，装 loader 必改 package.json
-        → 验签失败 → 弹「QQ 损坏」。QQNT.dll 内 `test al,al; jne skip`（file offset
-        0x514317）改为 `or al,1` 可无条件走 skip 分支：与旧方案 mov al,1 相比，
-        or 会同时清 ZF，不依赖 call 后的残留标志位。
-        只在原版字节特征匹配时打补丁；首次补丁前备份原 DLL（.elainaqq-bak）。
-        幂等：已补丁（0C 01 0F 85）时直接返回；特征不匹配（QQ 更新）则告警跳过。
-        """
+        """跳过 QQNT.dll 的 resources 清单验签（仅限 hook-runtime 副本调用）。"""
         if sys.platform != 'win32':
             return
         dll_path = self._windows_qqnt_dll()
@@ -319,15 +310,8 @@ class QQLauncher:
             return
         log.info('QQNT.dll 验签补丁已应用: %s', dll_path)
 
-    def hook_runtime(self) -> 'QQLauncher':
-        """Windows Hook 启动模式：复制 QQ 到框架隔离运行时并打验签补丁。
-
-        QQNT.dll 被运行中的 QQ 锁定，且不能改用户日常使用的 QQ 安装，
-        因此整个 QQ 目录复制到 data/qq/runtime/hook-runtime/<原名>/：
-        - 进程命令行含 hook-runtime，供 qq_takeover / manager 识别接管目标；
-        - loader 与验签补丁都只落在副本上；
-        - 源未变化时复用已有副本（marker 校验），仅首次/QQ 更新后全量复制。
-        """
+    def hook_runtime(self) -> QQLauncher:
+        """Windows Hook 启动模式：复制 QQ 到框架隔离运行时并打验签补丁。"""
         package_path = self.app_dir() / 'package.json'
         runtime_root = self._framework_root() / 'data' / 'qq' / 'runtime' / 'hook-runtime'
         target_dir = runtime_root / self.executable.parent.name
@@ -436,10 +420,8 @@ class QQLauncher:
             grab_preload = self.app_dir() / 'elainaqq-grab-preload.cjs'
             if grab_preload.is_file() and os.environ.get('ELAINAQQ_GRAB_DISABLE') != '1':
                 self.launch_env['ELAINAQQ_GRAB_PRELOAD'] = str(grab_preload)
-                self.launch_env['ELAINAQQ_GRAB_NICKNAME'] = os.environ.get(
-                    'ELAINAQQ_GRAB_NICKNAME', '伊')
+                self.launch_env['ELAINAQQ_GRAB_NICKNAME'] = os.environ.get('ELAINAQQ_GRAB_NICKNAME', '')
                 # QQ 可安装在任意盘符/深度（如 D:\QQNT\QQ.exe）；grab 日志与抢包任务
-                # 统一放框架 data/log/，与 loader 的 grab_task.json 监听路径保持一致。
                 grab_log = self._framework_root() / 'data' / 'log' / 'grab_result.jsonl'
                 grab_log.parent.mkdir(parents=True, exist_ok=True)
                 self.launch_env['ELAINAQQ_GRAB_LOG'] = str(grab_log)

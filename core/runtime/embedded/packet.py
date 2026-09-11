@@ -379,7 +379,6 @@ def build_group_ptt_url_packet(group_id: Any, index: bytes) -> PacketRequest:
         _message_field(3, _varint_field(1, 2)),
     ))
     # QQ sends the PTT index through DownloadExt.video (field 2),
-    # despite consuming the response as a PTT URL.
     video = _varint_field(1, 0) + _varint_field(2, 0)
     download = _bytes_field(1, index) + _message_field(2, video)
     body = _bytes_field(1, request_head) + _bytes_field(3, download)

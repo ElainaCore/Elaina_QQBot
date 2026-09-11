@@ -4,6 +4,8 @@ import json
 import re
 from typing import Any
 
+from core.protocols.onebot.contract import normalize_message_kind
+
 _CQ_PATTERN = re.compile(r'\[CQ:([^,\]]+)((?:,[^\]]*)?)\]')
 _ACTION_SUFFIX = re.compile(r'_(?:async|rate_limited)$', re.IGNORECASE)
 _SEND_ACTIONS = frozenset({'send_msg', 'send_group_msg', 'send_private_msg'})
@@ -52,7 +54,7 @@ def parse_cq_message(value: str) -> list[dict]:
 
 
 def normalize_message(message: Any, *, auto_escape: bool = False) -> list[dict]:
-    """返回本机与网络机器人共用的标准 OneBot 数组消息。"""
+    """返回四种渠道共用的标准 OneBot 数组消息。"""
     if isinstance(message, str):
         return [{'type': 'text', 'data': {'text': message}}] if auto_escape else parse_cq_message(message)
     if isinstance(message, dict):
@@ -72,7 +74,16 @@ def normalize_message(message: Any, *, auto_escape: bool = False) -> list[dict]:
         if segment_type in {'voice', 'audio'}:
             segment_type = 'record'
         data = segment.get('data')
-        normalized.append({'type': segment_type, 'data': dict(data) if isinstance(data, dict) else {}})
+        if isinstance(data, dict):
+            normalized_data = dict(data)
+        elif data is None:
+            normalized_data = {}
+        else:
+            # 少数协议端把 json/xml 的内容直接放在 data 字段；转换为
+            normalized_data = {'data': data}
+        if segment_type == 'text' and 'text' in normalized_data:
+            normalized_data['text'] = str(normalized_data['text'])
+        normalized.append({'type': segment_type, 'data': normalized_data})
     return normalized
 
 
@@ -98,10 +109,14 @@ def normalize_action_request(action: str, params: dict | None) -> tuple[str, dic
             normalized_params['message'],
             auto_escape=_as_bool(normalized_params.get('auto_escape')),
         )
-    if normalized_action == 'send_msg':
-        message_type = str(normalized_params.get('message_type') or '').lower()
-        if message_type in {'friend', 'user', 'c2c', 'dm', 'private'}:
-            normalized_params['message_type'] = 'private'
-        elif message_type == 'group':
-            normalized_params['message_type'] = 'group'
+    if normalized_action in {'send_group_msg', 'send_group_forward_msg'}:
+        normalized_params['message_type'] = 'group'
+    elif normalized_action in {'send_private_msg', 'send_private_forward_msg'}:
+        normalized_params['message_type'] = 'private'
+    elif normalized_action == 'send_msg':
+        requested_type = normalized_params.get('message_type')
+        if requested_type in (None, ''):
+            requested_type = 'group' if normalized_params.get('group_id') is not None else 'private'
+        message_type = normalize_message_kind(requested_type)
+        normalized_params['message_type'] = message_type
     return normalized_action, normalized_params

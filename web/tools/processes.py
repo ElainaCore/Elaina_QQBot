@@ -87,7 +87,6 @@ def _is_main_qq_process(process: psutil.Process) -> bool:
         return parent is None or parent.name().lower() not in _QQ_PROCESS_NAMES
     except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
         # The process itself is visible and named QQ; an inaccessible or exited
-        # parent must not hide it from the user.
         return True
 
 

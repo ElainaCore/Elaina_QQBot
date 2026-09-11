@@ -11,6 +11,7 @@ import aiohttp
 from aiohttp import web
 
 from core.foundation.config import cfg
+from core.protocols.onebot.contract import Channel
 
 logger = logging.getLogger('ElainaQQ.onebot.connection')
 
@@ -38,7 +39,7 @@ def normalize(conn: dict) -> dict:
     c.setdefault('type', ConnType.WS_REVERSE)
     c.setdefault('name', c['type'])
     c['enable'] = bool(c.get('enable', False))
-    c.setdefault('host', cfg.get('settings', 'server.host', '0.0.0.0'))
+    c.setdefault('host', cfg.get('settings', 'server.host', '127.0.0.1'))
     c.setdefault('port', cfg.get('settings', 'server.port', 5201))
     c.setdefault('path', '/OneBotv11')
     c.setdefault('url', '')
@@ -79,7 +80,7 @@ class ConnectionManager:
         return self._configs
 
     def _main_addr(self):
-        return (cfg.get('settings', 'server.host', '0.0.0.0'), int(cfg.get('settings', 'server.port', 5201)))
+        return (cfg.get('settings', 'server.host', '127.0.0.1'), int(cfg.get('settings', 'server.port', 5201)))
 
     # ── 启动 / 停止 ──
     async def start(self):
@@ -358,7 +359,7 @@ class ConnectionManager:
                 if sid and conn.get('_self_id') != sid:
                     self._rekey_forward(conn, sid, ws)
                     self._set_status(conn['name'], connected=True, error='', self_id=sid)
-                if not await self._app.ingest_event(data, sid):
+                if not await self._app.ingest_event(data, sid, source=Channel.ONEBOT):
                     logger.warning('拒绝无效或无法入队的 OneBot 正向 WebSocket 事件: %s', conn['name'])
                     continue
             elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):

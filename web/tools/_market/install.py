@@ -105,7 +105,7 @@ def _directory_has_python_source(directory: str) -> bool:
     """判断插件目录中是否还有可执行源码，不扫描持久化配置目录。"""
     if not os.path.isdir(directory):
         return False
-    for current, directories, files in os.walk(directory):
+    for _current, directories, files in os.walk(directory):
         directories[:] = [
             name
             for name in directories
@@ -272,8 +272,7 @@ def _install_py(content, plugin_name, url):
 
 
 def _resolve_subdir(flist, root_prefix, subdir_path):
-    """解析仓库内子目录的提取前缀 (含末尾 /); subdir_path 可为目录或目录下的文件路径。
-    找不到返回 None。"""
+    """解析仓库内子目录的提取前缀 (含末尾 /); subdir_path 可为目录或目录下的文件路径。"""
     p = (subdir_path or '').strip('/').replace('\\', '/')
     if not p:
         return root_prefix
@@ -291,9 +290,7 @@ def _resolve_subdir(flist, root_prefix, subdir_path):
 
 
 def _extract_zip_subset(content, plugin_name, subdir_path=''):
-    """从仓库 zip 解压到 plugins/<name>/。
-    - subdir_path: 仅解压该子目录 (剥离子目录前缀); 为空则整仓库
-    自动去除 GitHub archive 根目录 (repo-branch/)。"""
+    """从仓库 zip 解压到 plugins/<name>/。"""
     plugins_dir = _plugins_dir()
     safe = _safe_name(plugin_name) or 'unknown'
     dest_dir = os.path.join(plugins_dir, safe)
@@ -368,11 +365,7 @@ def _clean_module_dir(dest_dir):
 
 
 async def _install_module(github_url, module_name, branch='main', mirror=None):
-    """安装/更新模块
-    两种模式自动判断:
-      1. 官方模块: 仓库含 modules/<name>/ → 只提取该子目录
-      2. 第三方模块: 整个仓库就是模块 → 全部装到 modules/<name>/
-    """
+    """安装/更新模块"""
     safe = _safe_name(module_name) or 'unknown'
     url = _github_to_archive(github_url, branch)
     log.info(f'模块安装: {safe} ← {url}')
@@ -484,10 +477,7 @@ def _install_named_source(content: bytes, destination: str) -> None:
 
 
 async def _install_single(github_url, plugin_name, path='', branch='main', alone=True, mirror=None):
-    """独立插件安装。
-    - alone=True (默认): 单文件下载到共享 plugins/alone/<name>.py
-    - alone=False: 装到专属目录 plugins/<name>/, 支持多文件 (path 子目录 / 单文件)
-    返回 (result, reload_target)。"""
+    """独立插件安装。"""
     safe = _safe_name(plugin_name) or 'plugin'
 
     # 共享 alone 目录: 仅单文件

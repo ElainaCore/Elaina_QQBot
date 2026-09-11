@@ -1,5 +1,6 @@
 // ElainaQQ grab preload（LiteLoaderQQNT-Grab-RedBag 同款路线，渲染进程）
-// 订阅 nodeIKernelMsgListener/onRecvMsg -> wallet 元素 -> grabRedBag
+// 订阅 nodeIKernelMsgListener/onRecvMsg -> 观察 wallet 元素（只记录，不领取）。
+// 领取决策走插件策略链路；本文件仅提供插件显式下发的 grab-go / scan 任务执行器。
 const { ipcRenderer } = require('electron');
 
 const DOWN_MAIN2 = 'RM_IPCFROM_MAIN2';
@@ -56,29 +57,8 @@ function handleRecvMsg(payload) {
       if (el.elementType === 9 && el.walletElement) { wallEl = el.walletElement; break; }
     }
     if (!wallEl || !wallEl.billNo) return;
-    if (grabbedBills.has(wallEl.billNo)) return;
-    grabbedBills.add(wallEl.billNo);
-    if (grabbedBills.size > 512) grabbedBills.delete(grabbedBills.keys().next().value);
-
-    const grabRedBagReq = {
-      recvUin: msg.chatType === 1 ? (msg.peerUin || msg.peerUid) : msg.peerUid,
-      recvType: msg.chatType,
-      peerUid: msg.peerUid,
-      name: nickName,
-      pcBody: wallEl.pcBody || '',
-      wishing: (wallEl.receiver && wallEl.receiver.title) || '',
-      msgSeq: msg.msgSeq,
-      index: wallEl.stringIndex || '',
-    };
-    log('[grab] new packet', wallEl.billNo, JSON.stringify(grabRedBagReq));
-    invokeNative('ntApi', 'nodeIKernelMsgService/grabRedBag', false, { grabRedBagReq })
-      .then((result) => {
-        log('[grab] result', JSON.stringify(result));
-        const line = JSON.stringify({ at: new Date().toISOString(), billNo: wallEl.billNo, result });
-        try { ipcRenderer.send('elainaqq:grab-file', line); } catch {}
-        try { ipcRenderer.send('elainaqq:grab-result', { billNo: wallEl.billNo, result }); } catch {}
-      })
-      .catch((e) => log('[grab] invoke error', String(e)));
+    // 渲染层只观察记录；领取决策走插件策略链路（框架桥事件 -> 插件监听器 -> grab API / grab-go 任务）。
+    log('[grab] wallet observed', wallEl.billNo);
   } catch (e) {
     log('[grab] handler error', String(e));
   }
@@ -250,9 +230,6 @@ async function start() {
     invokeNative('ntApi', 'nodeIKernelMsgService/isSessionSpaceActivated', false, {}).then(
       (r) => log('[grab] probe activated:', JSON.stringify(r)?.slice(0, 200)),
       (e) => log('[grab] probe activated ERR:', String(e)));
-    invokeNative('ntApi', 'nodeIKernelBuddyService/isBuddy', false, 'u_y06KxnavnmGFxUrVSmR5VA').then(
-      (r) => log('[grab] probe buddy:', JSON.stringify(r)?.slice(0, 200)),
-      (e) => log('[grab] probe buddy ERR:', String(e)));
   }, 8000);
   // 探针 v3：记录所有到达的 IPC 事件通道（60 秒窗口）
   try {

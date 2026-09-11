@@ -18,8 +18,8 @@ from web.tools import (
     onebot_conn,
     plugin_mgr,
     processes,
-    qq_versions,
     qlinux,
+    qq_versions,
     system,
     update,
 )
@@ -249,6 +249,8 @@ async def handle_login(request: web.Request):
     body = await json_body(request)
 
     password = str(body.get('password', ''))
+    if len(password) > 1024:
+        return error('密码长度不能超过 1024 个字符', status=400)
     from core.foundation.config import cfg
 
     admin_pwd = str(cfg.get('settings', 'web.admin_password', '') or '')
@@ -344,7 +346,6 @@ async def handle_ext_route(request: web.Request):
         if denied is not None:
             return denied
     # 插件面板路由也属于该插件的执行上下文。路由中直接发送消息，
-    # 或在路由中创建的后台任务，都应能被出站 API 中间件按插件识别。
     from core.plugins.context import plugin_scope
     from core.protocols.onebot.api import api_call_source
 

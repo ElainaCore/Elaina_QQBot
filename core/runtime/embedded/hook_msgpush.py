@@ -1,57 +1,16 @@
-"""MsgPush 原始包 protobuf 解码。
-
-字段号全部与 SnowLuma 桥接运行时（``index.mjs`` protobuf_decode_* 系列函数）
-逐一对齐，不凭记忆推断：
-
-- ``PushMsg``            顶层: f1=message(PushMsgBody), f3=status(u64)
-- ``PushMsgBody``        f1=ResponseHead, f2=ContentHead, f3=MessageBody
-- ``ContentHead``        f1=msgType, f2=subType, f3=c2cCmd, f4=msgId,
-                         f5=sequence, f6=timestamp, f11=ntMsgSeq, f12=newId
-- ``ResponseHead``       f1=fromUin, f2=fromUid, f5=toUin, f8=grp(ResponseGrp)
-- ``ResponseGrp``        f1=groupUin, f2=memberName, f4=memberCard, f7=groupName
-- ``MessageBody``        f1=RichText, f2=msgContent
-- ``RichText``           f2=elems[](Elem), f3=notOnlineFile, f4=ptt
-- ``Elem``               f1=text f2=face f4=notOnlineImage f5=transElem
-                         f6=marketFace f8=customFace f12=richMsg f13=groupFile
-                         f16=extraInfo f19=videoFile f37=generalFlags
-                         f45=srcMsg f51=lightApp f53=commonElem
-- ``TextElem``           f1=str f2=link f3=attr6Buf f4=attr7Buf f11=buf
-                         f12=pbReserve(MentionExtra)
-- ``MentionExtra``       f3=type f4=uin f5=field5 f9=uid
-- ``FaceElem``           f1=index
-- ``NotOnlineImage``     f1=filePath f2=fileLen f7=picMd5 f8=picHeight
-                         f9=picWidth f10=resId f14=bigUrl f15=origUrl f29=pbRes
-- ``CustomFace``         f2=filePath f13=md5 f16=origUrl f22=width f23=height
-                         f25=size
-- ``Ptt``                f1=fileType f2=fileId(u64) f3=fileUuid(bytes)
-                         f4=fileMd5 f5=fileName f6=fileSize f10=groupFileKey
-                         f14=fileKey f19=time f29=format
-- ``NotOnlineFile``      f1=fileType f3=fileUuid f4=fileMd5 f5=fileName
-                         f6=fileSize f9=subcmd f57=fileHash
-- ``VideoFile``          f1=fileUuid f2=fileMd5 f3=fileName f4=fileFormat
-                         f5=fileTime f6=fileSize f7=thumbWidth f8=thumbHeight
-- ``GroupFileElem``      f1=filename f2=fileSize f3=fileId
-- ``MarketFace``         f4=faceName f7=faceId f8=tabId f10=key
-- ``RichMsg``            f1=template1 f2=serviceId
-- ``LightAppElem``       f1=data f2=msgResid
-- ``CommonElem``         f1=serviceType f2=pbElem f3=businessType
-- ``SrcMsg``             f1=origSeqs(rep varint) f2=senderUin f3=time
-                         f5=elemsRaw
-- ``FileExtra``(msgContent) f1=file(NotOnlineFile)
-"""
+"""MsgPush 原始包 protobuf 解码。"""
 
 from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 from typing import Any
 
 log = logging.getLogger('ElainaQQ.embedded_qq.msgpush')
 
-# ---------------------------------------------------------------------------
 # protobuf wire format
-# ---------------------------------------------------------------------------
 
 _MAX_DEPTH = 64
 
@@ -74,11 +33,7 @@ def read_varint(data: bytes, offset: int, end: int) -> tuple[int, int]:
 
 def iter_fields(data: bytes, offset: int = 0, end: int | None = None,
                 depth: int = 0) -> list[tuple[int, int, bytes]]:
-    """返回 [(field_number, wire_type, raw_value)]。
-
-    wire 0/1/2/5 常规处理；wire 3/4 (start/end group) 递归跳过，
-    兼容个别包体里的 group 编码而不抛错。
-    """
+    """返回 [(field_number, wire_type, raw_value)]。"""
     out: list[tuple[int, int, bytes]] = []
     end = len(data) if end is None else end
     while offset < end:
@@ -175,9 +130,7 @@ def pb_int_list(data: bytes, number: int) -> list[int]:
             if num == number and wire == 0]
 
 
-# ---------------------------------------------------------------------------
 # PushMsg 顶层
-# ---------------------------------------------------------------------------
 
 
 @dataclass(slots=True)
@@ -215,10 +168,7 @@ class MsgContext:
 
 
 def parse_push(body: bytes, self_uin: int = 0) -> list[MsgContext]:
-    """解析 ``trpc.msg.olpush.OlPushService.MsgPush`` 包体。
-
-    顶层为单数 ``message``（field 1），实践中重复出现时逐条解析。
-    """
+    """解析 ``trpc.msg.olpush.OlPushService.MsgPush`` 包体。"""
     contexts: list[MsgContext] = []
     for message in pb_list(body, 1) or []:
         try:
@@ -261,9 +211,7 @@ def _parse_message(message: bytes, self_uin: int) -> MsgContext | None:
     return ctx
 
 
-# ---------------------------------------------------------------------------
 # 元素解码
-# ---------------------------------------------------------------------------
 
 
 def decode_elements(body: bytes) -> list[dict[str, Any]]:
@@ -474,11 +422,7 @@ def _wallet_int(data: bytes, number: int, default: int = 0) -> int:
 
 
 def _decode_wallet(wallet: bytes) -> dict[str, Any] | None:
-    """WalletElem（Elem.f24）：f1=WalletItem{f3=红包详情, f9=billNo, f10=key}。
-
-    字段号从真实样本核实：详情 f2=redtype f3=祝福语 f4=提示 f5=标题
-    f14=red?id=<billNo> 领取链接。
-    """
+    """WalletElem（Elem.f24）：f1=WalletItem{f3=红包详情, f9=billNo, f10=key}。"""
     try:
         item = _wallet_get(wallet, 1)
         if not isinstance(item, bytes) or not item:

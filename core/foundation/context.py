@@ -41,7 +41,7 @@ class BaseContext:
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
         try:
             with open(config_path, 'w', encoding='utf-8') as f:
-                yaml.dump(defaults, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+                yaml.safe_dump(defaults, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
         except Exception:
             pass
         return dict(defaults)
