@@ -312,9 +312,9 @@ async def handle_uninstall_qq(request: web.Request):
 async def handle_cleanup_qq(request: web.Request):
     """清理框架下载的 QQ 安装包和断点续传临时文件。"""
     try:
-        body = await json_body(request)
-    except Exception:
-        body = {}
+        body = {} if request.content_length == 0 else await json_body(request)
+    except Exception as exc:
+        return web.json_response({'success': False, 'error': str(exc), 'message': str(exc)}, status=400)
     try:
         manager = _manager()
         result = await manager.cleanup_qq(body.get('version_key'))

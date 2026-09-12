@@ -43,6 +43,11 @@ class QLinuxManager:
         self._registered_uins: set[str] = set()
         self._message_cache: dict[tuple[str, int], dict] = {}
         self._shutting_down = False
+        # Runner 进程可能因协议升级或底层网络异常短暂退出。动作请求
+        # 不能把这次瞬时故障直接暴露给对比任务；恢复锁保证并发请求只
+        # 重建一次 runner。
+        self._runner_recovery_lock = asyncio.Lock()
+        self._watchdog_task: asyncio.Task | None = None
         self._load_accounts()
 
     # ---------- 配置 ----------
@@ -66,6 +71,59 @@ class QLinuxManager:
         if self._rpc is None:
             raise RuntimeError('QLinux runner 未启动')
         return self._rpc
+
+    @staticmethod
+    def _is_runner_process_error(exc: BaseException) -> bool:
+        """判断异常是否表示 runner 通道失效，而非 runner 返回的业务错误。
+
+        RunnerRPC 将 JSON-RPC 的 ``error`` 字段也包装成 RuntimeError，因此
+        不能对所有 RuntimeError 都重启；例如 ``bot 1 not exists`` 只应作为
+        普通接口失败返回。
+        """
+        if isinstance(exc, (BrokenPipeError, ConnectionError)):
+            return True
+        text = str(exc or "").strip().lower()
+        return any(token in text for token in (
+            'runner 未运行',
+            'runner 标准输入不可用',
+            'runner 进程意外退出',
+            'runner 已停止',
+            'runner standard input',
+            'runner process exited',
+        ))
+
+    async def _recover_runner(self, failed_rpc: RunnerRPC) -> None:
+        """重建失效 runner，并恢复已持久化的 bot 实例。"""
+        async with self._runner_recovery_lock:
+            # 其他并发请求可能已经完成了恢复。
+            if self._rpc is not failed_rpc and self._rpc and self._rpc.alive:
+                return
+            self._mark_accounts_offline('QLinux runner 通道已断开')
+            if self._rpc is failed_rpc:
+                self._rpc = None
+            with contextlib.suppress(Exception):
+                await failed_rpc.stop()
+            await self.ensure_started()
+
+    async def _call_runner(
+        self,
+        method: str,
+        params: dict | None = None,
+        *,
+        timeout: float = 60,
+        retry_on_restart: bool = True,
+    ):
+        """调用 runner；进程级失败时自动恢复并仅重试一次。"""
+        await self.ensure_started()
+        rpc = self._rpc_or_raise()
+        try:
+            return await rpc.call(method, params, timeout=timeout)
+        except (RuntimeError, BrokenPipeError, ConnectionError) as exc:
+            if not retry_on_restart or not self._is_runner_process_error(exc):
+                raise
+            log.warning('QLinux runner 请求失败，准备恢复后重试: %s (%s)', method, exc)
+            await self._recover_runner(rpc)
+            return await self._rpc_or_raise().call(method, params, timeout=timeout)
 
     # ---------- 账号持久化 ----------
 
@@ -122,14 +180,20 @@ class QLinuxManager:
                 self._data_dir / 'bots',
                 self._sign_server(),
                 self._on_runner_event,
+                self._on_runner_exit,
             )
             await self._rpc.start()
+            self._watchdog_task = asyncio.create_task(
+                self._runner_watchdog(self._rpc), name='qlinux-runner-watchdog'
+            )
             log.info('QLinux runner 就绪')
             # 恢复已有账号。仅创建 runner 侧 Bot 不会开始收包，必须再调用
             for bot_id in list(self._accounts):
                 try:
                     acc = self._accounts[bot_id]
-                    await self._create_bot_on_runner(bot_id)
+                    # 当前仍处于 _start_runner() 内，不能调用会再次等待
+                    # ensure_started() 的统一封装，否则 runner 恢复时会自等待。
+                    await self._rpc.call('bot.create', {'bot_id': bot_id}, timeout=30)
                     if acc.get('status') in {'online', 'connecting', 'reconnecting', 'resume_pending'}:
                         acc['status'] = 'reconnecting'
                         self._save_accounts()
@@ -157,6 +221,11 @@ class QLinuxManager:
             if account.get('status') in {'online', 'connecting', 'reconnecting'}
         }
         self._shutting_down = True
+        watchdog = self._watchdog_task
+        self._watchdog_task = None
+        if watchdog and not watchdog.done():
+            watchdog.cancel()
+            await asyncio.gather(watchdog, return_exceptions=True)
         if rpc.alive:
             stop_tasks = [
                 asyncio.create_task(
@@ -180,6 +249,75 @@ class QLinuxManager:
             self._shutting_down = False
             if self._rpc is rpc:
                 self._rpc = None
+
+    async def _runner_watchdog(self, rpc: RunnerRPC) -> None:
+        """Periodically probe an otherwise idle runner.
+
+        A dead/unresponsive runner can have no pending RPC, so the normal
+        request-level recovery path would never run.  The watchdog turns an
+        idle EOF/hung process into the same single-flight recovery path.
+        """
+        try:
+            while not self._shutting_down and self._rpc is rpc:
+                await asyncio.sleep(30)
+                if self._shutting_down or self._rpc is not rpc:
+                    return
+                try:
+                    await rpc.call('ping', timeout=15)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    log.warning('QLinux runner 探活失败，准备恢复: %s', exc)
+                    await self._recover_runner(rpc)
+                    return
+        except asyncio.CancelledError:
+            return
+
+    async def _on_runner_exit(self, rpc: RunnerRPC) -> None:
+        """runner stdout EOF/读取异常后立即恢复；看门狗仅作兜底。"""
+        if self._shutting_down:
+            return
+        try:
+            await self._recover_runner(rpc)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception('QLinux runner 退出后自动恢复失败')
+
+    def _unbind_account(self, bot_id: str) -> None:
+        """撤销账号的本地 OneBot 动作与身份别名。"""
+        acc = self._accounts.get(bot_id)
+        if not acc:
+            return
+        uin = str(acc.get('uin') or '').strip()
+        adapter = getattr(self._app, 'adapter', None)
+        if adapter is not None:
+            # Do not rely on _registered_uins here.  A stale binding can
+            # survive a process crash/reload even when this manager's
+            # bookkeeping set has already been cleared.
+            if uin:
+                adapter.unregister_local_bot(uin)
+            adapter.unregister_identity_alias(bot_id)
+        if uin:
+            self._registered_uins.discard(uin)
+
+    def _mark_accounts_offline(self, reason: str = '') -> None:
+        """runner 通道丢失后立即清理所有旧在线状态。"""
+        changed = False
+        for bot_id, acc in self._accounts.items():
+            if acc.get('status') in {'online', 'connecting', 'reconnecting', 'password_login'}:
+                acc['status'] = 'offline'
+                if reason:
+                    acc['last_error'] = reason
+                changed = True
+            self._unbind_account(bot_id)
+            self._login_active.discard(bot_id)
+        for fut in self._login_waits.values():
+            if not fut.done():
+                fut.cancel()
+        self._login_waits.clear()
+        if changed:
+            self._save_accounts()
 
     # ---------- runner 事件入口 ----------
 
@@ -215,6 +353,7 @@ class QLinuxManager:
                     acc.pop('last_error', None)
                 else:
                     acc['last_error'] = error or '未知登录错误'
+                    self._unbind_account(bot_id)
                 self._save_accounts()
             fut = self._login_waits.pop(bot_id, None)
             if fut and not fut.done():
@@ -229,6 +368,7 @@ class QLinuxManager:
                 if acc:
                     acc['status'] = 'login_failed'
                     acc['last_error'] = event.get('error') or '登录后注册在线失败'
+                    self._unbind_account(bot_id)
                     self._save_accounts()
             self._login_active.discard(bot_id)
             return
@@ -251,13 +391,8 @@ class QLinuxManager:
             acc = self._accounts.get(bot_id)
             if acc and not self._shutting_down:
                 acc['status'] = 'offline'
+                self._unbind_account(bot_id)
                 self._save_accounts()
-                uin = str(acc.get('uin') or '')
-                adapter = getattr(self._app, 'adapter', None)
-                if adapter is not None and uin in self._registered_uins:
-                    adapter.unregister_local_bot(uin)
-                    self._registered_uins.discard(uin)
-                    adapter.unregister_identity_alias(bot_id)
         elif etype == 'qr.state':
             acc = self._accounts.get(bot_id)
             if acc and event.get('state') in ('Confirmed',):
@@ -344,7 +479,7 @@ class QLinuxManager:
         self._login_waits[bot_id] = fut
         self._login_active.add(bot_id)
         try:
-            result = await self._rpc.call('bot.login.qr', {'bot_id': bot_id}, timeout=10)
+            result = await self._call_runner('bot.login.qr', {'bot_id': bot_id}, timeout=10)
         except Exception:
             self._login_waits.pop(bot_id, None)
             self._login_active.discard(bot_id)
@@ -367,7 +502,7 @@ class QLinuxManager:
         self._login_waits[bot_id] = fut
         self._login_active.add(bot_id)
         try:
-            result = await self._rpc.call(
+            result = await self._call_runner(
                 'bot.login.password', {'bot_id': bot_id, 'uin': uin, 'password': password},
                 timeout=15)
         except Exception:
@@ -377,21 +512,22 @@ class QLinuxManager:
         return result
 
     async def submit_captcha(self, bot_id: str, ticket: str, randstr: str = '') -> dict:
-        rpc = self._rpc_or_raise()
-        return await rpc.call(
-            'bot.submit.captcha', {'bot_id': bot_id, 'ticket': ticket, 'randstr': randstr})
+        return await self._call_runner(
+            'bot.submit.captcha',
+            {'bot_id': bot_id, 'ticket': ticket, 'randstr': randstr},
+        )
 
     async def submit_sms(self, bot_id: str, code: str) -> dict:
-        rpc = self._rpc_or_raise()
-        return await rpc.call('bot.submit.sms', {'bot_id': bot_id, 'code': code})
+        return await self._call_runner('bot.submit.sms', {'bot_id': bot_id, 'code': code})
 
     async def stop_account(self, bot_id: str) -> dict:
+        await self.ensure_started()
         self._rpc_or_raise()
         self._login_active.discard(bot_id)
         login_wait = self._login_waits.pop(bot_id, None)
         if login_wait and not login_wait.done():
             login_wait.cancel()
-        result = await self._rpc_or_raise().call('bot.stop', {'bot_id': bot_id})
+        result = await self._call_runner('bot.stop', {'bot_id': bot_id})
         acc = self._accounts.get(bot_id)
         if acc:
             acc['status'] = 'stopped'
@@ -432,13 +568,16 @@ class QLinuxManager:
     # ---------- OneBot 动作映射 (插件 call_api 走到这里) ----------
 
     async def handle_action(self, bot_id: str, action: str, params: dict) -> dict | None:
-        self._rpc_or_raise()
         try:
+            # runner 可能在两次动作之间退出；先走统一启动/恢复路径，
+            # 避免 `_rpc` 暂时为空时绕过自动重启。
+            await self.ensure_started()
+            self._rpc_or_raise()
             if action in {'send_group_msg', 'send_private_msg'}:
                 segs = params.get('message', [])
                 target_key = 'group_uin' if action == 'send_group_msg' else 'friend_uin'
                 param_key = 'group_id' if action == 'send_group_msg' else 'user_id'
-                result = await self._rpc.call('msg.send.segments', {
+                result = await self._call_runner('msg.send.segments', {
                     'bot_id': bot_id, target_key: int(params.get(param_key, 0)),
                     'segments': await self._ob_to_segments(segs)})
                 sequence = int((result or {}).get('sequence', 0) or 0)
@@ -460,11 +599,11 @@ class QLinuxManager:
                     rpc_params['group_uin'] = int(params.get('group_id', 0))
                 else:
                     rpc_params['friend_uin'] = int(params.get('user_id', 0))
-                result = await self._rpc.call('msg.send.forward', rpc_params)
+                result = await self._call_runner('msg.send.forward', rpc_params)
                 sequence = int((result or {}).get('sequence', 0) or 0)
                 return action_ok({'message_id': sequence, 'seq': sequence})
             if action == 'get_login_info':
-                result = await self._rpc.call('bot.info', {'bot_id': bot_id})
+                result = await self._call_runner('bot.info', {'bot_id': bot_id})
                 acc = self._accounts.get(bot_id, {})
                 result = dict(result or {})
                 result.setdefault('user_id', int(acc.get('uin', 0) or 0))
@@ -475,21 +614,21 @@ class QLinuxManager:
                 online = acc.get('status') == 'online'
                 return action_ok({'online': online, 'good': online, 'stat': {'packet_received': 0}})
             if action == 'get_group_list':
-                result = await self._rpc.call('bot.group.list', {
+                result = await self._call_runner('bot.group.list', {
                     'bot_id': bot_id, 'no_cache': bool(params.get('no_cache', False))})
                 return action_ok(result or [])
             if action == 'get_group_info':
-                result = await self._rpc.call('bot.group.info', {
+                result = await self._call_runner('bot.group.info', {
                     'bot_id': bot_id, 'group_uin': int(params.get('group_id', 0)),
                     'no_cache': bool(params.get('no_cache', False))})
                 return action_ok(result)
             if action == 'get_group_member_list':
-                result = await self._rpc.call('bot.group.member.list', {
+                result = await self._call_runner('bot.group.member.list', {
                     'bot_id': bot_id, 'group_uin': int(params.get('group_id', 0)),
                     'no_cache': bool(params.get('no_cache', False))})
                 return action_ok(result or [])
             if action == 'get_group_member_info':
-                result = await self._rpc.call('bot.group.member.info', {
+                result = await self._call_runner('bot.group.member.info', {
                     'bot_id': bot_id,
                     'group_uin': int(params.get('group_id', 0)),
                     'member_uin': int(params.get('user_id', 0)),
@@ -497,11 +636,11 @@ class QLinuxManager:
                 })
                 return action_ok(result)
             if action == 'get_friend_list':
-                result = await self._rpc.call('bot.friend.list', {
+                result = await self._call_runner('bot.friend.list', {
                     'bot_id': bot_id, 'no_cache': bool(params.get('no_cache', False))})
                 return action_ok(result or [])
             if action == 'get_stranger_info':
-                result = await self._rpc.call('bot.stranger.info', {
+                result = await self._call_runner('bot.stranger.info', {
                     'bot_id': bot_id, 'user_uin': int(params.get('user_id', 0))})
                 return action_ok(result)
             if action in {
@@ -513,7 +652,7 @@ class QLinuxManager:
                     action = 'group_poke' if params.get('group_id') else 'friend_poke'
                 method, rpc_params = self._qlinux_admin_action(action, params)
                 rpc_params['bot_id'] = bot_id
-                result = await self._rpc.call(method, rpc_params)
+                result = await self._call_runner(method, rpc_params)
                 return action_ok(result or {})
             if action == 'get_msg':
                 try:
@@ -531,7 +670,7 @@ class QLinuxManager:
                     sequence = int(str(message_id).rsplit(':', 1)[-1] or 0)
                 cached = self._message_cache.get((str(self._accounts.get(bot_id, {}).get('uin', '')), sequence), {})
                 group_uin = params.get('group_id') or cached.get('group_id')
-                result = await self._rpc.call('msg.recall', {
+                result = await self._call_runner('msg.recall', {
                     'bot_id': bot_id, 'group_uin': group_uin, 'sequence': sequence})
                 return action_ok(result or {'message_id': sequence})
             return action_failed(f'QLinux 暂不支持动作: {action}', 1400)
@@ -622,13 +761,14 @@ class QLinuxManager:
     # ---------- runner 侧 bot 创建 ----------
 
     async def _create_bot_on_runner(self, bot_id: str) -> None:
-        rpc = self._rpc_or_raise()
-        await rpc.call('bot.create', {'bot_id': bot_id}, timeout=30)
+        await self._call_runner('bot.create', {'bot_id': bot_id}, timeout=30)
 
 
 def _fetch_b64_sync(url: str) -> str:
     """在线程池中执行的图片 URL → base64 下载。"""
     import base64 as _b64
+    import ipaddress
+    import socket
     import urllib.request
     from urllib.parse import urlsplit
 
@@ -636,8 +776,32 @@ def _fetch_b64_sync(url: str) -> str:
     parsed = urlsplit(str(url or ''))
     if parsed.scheme not in {'http', 'https'} or not parsed.hostname:
         raise ValueError('图片 URL 必须使用 HTTP 或 HTTPS')
+    try:
+        addresses = {
+            item[4][0]
+            for item in socket.getaddrinfo(
+                parsed.hostname,
+                parsed.port or (443 if parsed.scheme == 'https' else 80),
+                type=socket.SOCK_STREAM,
+            )
+        }
+    except OSError as exc:
+        raise ValueError('图片地址无法解析') from exc
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError as exc:
+            raise ValueError('图片地址解析结果无效') from exc
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+            raise ValueError('图片地址不允许访问内网或本机地址')
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            raise ValueError('图片地址不允许重定向')
+
     req = urllib.request.Request(url, headers={'User-Agent': 'ElainaQQ/QLinux'})
-    with urllib.request.urlopen(req, timeout=15) as response:  # nosec B310
+    opener = urllib.request.build_opener(_NoRedirect)
+    with opener.open(req, timeout=15) as response:  # nosec B310
         declared = int(response.headers.get('Content-Length') or 0)
         if declared > max_size:
             raise ValueError('图片超过 16 MB 限制')

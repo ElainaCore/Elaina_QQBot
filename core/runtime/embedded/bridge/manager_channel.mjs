@@ -29,8 +29,9 @@ function controlFailure(error) {
 }
 
 export class EmbeddedManagerChannel {
-  constructor({ botId, managerUrl, logger = console.error }) {
+  constructor({ botId, managerUrl, managerToken, logger = console.error }) {
     this.botId = String(botId || "");
+    this.managerToken = String(managerToken || "");
     this.debugFile = process.env["ELAINAQQ_DATA_DIR"]
       ? process.env["ELAINAQQ_DATA_DIR"] + "/attach-debug.log"
       : "";
@@ -95,9 +96,12 @@ export class EmbeddedManagerChannel {
       try {
         const url = new URL(apiPath, this.managerUrl);
         const payload = body === null ? "" : stringifyJson(body);
-        const headers = body === null ? {} : {
+        const headers = {
+          "X-Elaina-Bridge-Token": this.managerToken,
+          ...(body === null ? {} : {
           "Content-Type": "application/json",
           "Content-Length": Buffer.byteLength(payload),
+          }),
         };
         const request = http.request({
           agent: this.agent,

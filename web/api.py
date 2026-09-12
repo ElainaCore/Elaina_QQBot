@@ -1,6 +1,7 @@
 """Web 面板 API 路由"""
 
 import asyncio
+import hmac
 import logging
 
 from aiohttp import web
@@ -194,32 +195,35 @@ def set_context(app_instance, base_dir: str):
 # ======================== 内联路由处理 ========================
 
 
-def _local_embedded_manager(request: web.Request):
-    if request.remote not in {'127.0.0.1', '::1', None}:
+def _local_embedded_manager(request: web.Request, bot_id: str):
+    manager = getattr(_app, 'embedded_qq', None)
+    bot = getattr(manager, 'bots', {}).get(str(bot_id or '').strip()) if manager else None
+    supplied = request.headers.get('X-Elaina-Bridge-Token', '')
+    if not bot or not supplied or not hmac.compare_digest(supplied, bot.bridge_token):
         return None
-    return getattr(_app, 'embedded_qq', None)
+    return manager
 
 
 async def handle_embedded_event(request: web.Request):
-    manager = _local_embedded_manager(request)
-    if not manager:
-        return error('仅允许本机 ElainaQQ QQ 运行时', status=403)
     try:
         payload = await json_body(request)
     except Exception:
         return error('请求格式错误', status=400)
+    manager = _local_embedded_manager(request, str(payload.get('bot_id') or ''))
+    if not manager:
+        return error('桥接令牌无效', status=403)
     if not await manager.handle_event(payload):
         return error('内置 QQ 未初始化', status=503)
     return ok()
 
 
 async def handle_embedded_control_poll(request: web.Request):
-    manager = _local_embedded_manager(request)
-    if not manager:
-        return error('仅允许本机 ElainaQQ QQ 运行时', status=403)
     bot_id = str(request.query.get('bot_id') or '').strip()
     if not bot_id:
         return error('缺少 bot_id', status=400)
+    manager = _local_embedded_manager(request, bot_id)
+    if not manager:
+        return error('桥接令牌无效', status=403)
     command = await manager.next_control_command(bot_id)
     if command is None:
         return web.Response(status=204)
@@ -227,14 +231,14 @@ async def handle_embedded_control_poll(request: web.Request):
 
 
 async def handle_embedded_control_result(request: web.Request):
-    manager = _local_embedded_manager(request)
-    if not manager:
-        return error('仅允许本机 ElainaQQ QQ 运行时', status=403)
     try:
         payload = await json_body(request)
     except Exception:
         return error('请求格式错误', status=400)
     bot_id = str(payload.get('bot_id') or '').strip()
+    manager = _local_embedded_manager(request, bot_id)
+    if not manager:
+        return error('桥接令牌无效', status=403)
     if not bot_id or not manager.resolve_control_command(bot_id, payload):
         return error('命令不存在或已过期', status=404)
     return ok()

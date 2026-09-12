@@ -55,7 +55,7 @@ def _set_path(target: dict, path: str, value):
         target[section] = {}
     allowed = {
         'server': {'host', 'port'},
-        'web': {'trust_forwarded_headers', 'framework_name', 'favicon_url'},
+        'web': {'trust_forwarded_headers', 'trusted_proxies', 'framework_name', 'favicon_url'},
         'owner': {'ids'},
         'embedded_qq': {'enabled', 'bridge_port_start', 'command', 'qq_path', 'windows_hook_launch', 'packet_backend', 'packet_verbose', 'packet_o3_hook', 'data_dir', 'headless', 'single_process', 'rss_target_mb', 'swap_reclaim', 'self_message_enabled'},
         'logging': {'dir', 'insert_interval', 'max_batch_size', 'max_queue_entries', 'retention_days', 'wal_mode'},
@@ -110,6 +110,15 @@ def _set_path(target: dict, path: str, value):
         if isinstance(value, bool):
             raise ValueError(f'{path} 必须是数字')
         value = float(value)
+    elif (section, key) == ('web', 'trusted_proxies'):
+        if not isinstance(value, (str, list)):
+            raise ValueError(f'{path} 必须是逗号分隔字符串或数组')
+        if isinstance(value, list):
+            if len(value) > 32 or any(not isinstance(item, str) or len(item) > 128 for item in value):
+                raise ValueError(f'{path} 数量或长度超限')
+            value = [item.strip() for item in value if item.strip()]
+        else:
+            value = value.strip()
     elif (section, key) in string_fields and not isinstance(value, str):
         raise ValueError(f'{path} 必须是字符串')
 

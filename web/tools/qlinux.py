@@ -45,6 +45,8 @@ async def handle_qlinux_create(request: web.Request) -> web.Response:
     bot_id = str(body.get('bot_id') or '').strip()
     if not bot_id or not bot_id.replace('-', '').replace('_', '').isalnum():
         return error('bot_id 必须是字母/数字/下划线/连字符')
+    if len(bot_id) > 80:
+        return error('bot_id 长度不能超过 80 个字符')
     if bot_id in {a['bot_id'] for a in mgr.list_accounts()}:
         return error('账号 ID 已存在')
     acc = await mgr.create_account(bot_id)
@@ -80,10 +82,17 @@ async def handle_qlinux_login_password(request: web.Request) -> web.Response:
         return error('QLinux 渠道未启用', status=404)
     body = await json_body(request)
     bot_id = str(body.get('bot_id') or '').strip()
-    uin = int(body.get('uin') or 0)
+    try:
+        uin = int(body.get('uin') or 0)
+    except (TypeError, ValueError):
+        return error('uin 必须是数字', status=400)
     password = str(body.get('password') or '')
-    if not bot_id or not uin or not password:
-        return error('bot_id / uin / password 必填')
+    if len(bot_id) > 80 or not bot_id or uin <= 0 or not password:
+        return error('bot_id / uin / password 参数无效', status=400)
+    if len(password) > 1024:
+        return error('密码长度不能超过 1024 个字符', status=400)
+    if bot_id not in {a['bot_id'] for a in mgr.list_accounts()}:
+        return error('账号不存在', status=404)
     result = await mgr.login_password(bot_id, uin, password)
     return ok({'started': bool(result.get('started', True)), 'bot_id': bot_id},
               message='登录流程已发起, 可能需要验证码')
@@ -113,11 +122,20 @@ async def handle_qlinux_submit(request: web.Request) -> web.Response:
     bot_id = str(body.get('bot_id') or '').strip()
     submit_type = str(body.get('type') or '')
     try:
+        if bot_id not in {a['bot_id'] for a in mgr.list_accounts()}:
+            return error('账号不存在', status=404)
         if submit_type == 'captcha':
+            ticket = str(body.get('ticket') or '')
+            randstr = str(body.get('randstr') or '')
+            if not ticket or len(ticket) > 4096 or len(randstr) > 1024:
+                return error('验证码参数无效', status=400)
             result = await mgr.submit_captcha(
-                bot_id, str(body.get('ticket') or ''), str(body.get('randstr') or ''))
+                bot_id, ticket, randstr)
         elif submit_type == 'sms':
-            result = await mgr.submit_sms(bot_id, str(body.get('code') or ''))
+            code = str(body.get('code') or '')
+            if not code or len(code) > 32:
+                return error('短信验证码无效', status=400)
+            result = await mgr.submit_sms(bot_id, code)
         else:
             return error('type 必须是 captcha 或 sms')
     except Exception as e:  # noqa: BLE001

@@ -98,7 +98,16 @@ async def handle_get_bots(request: web.Request):
         qlinux_ids.update(_bot_identities(account))
         uin = str(account.get('uin') or '').strip()
         bot_id = str(account.get('bot_id') or '').strip()
-        connected = bool(ad and uin and uin in ad.local_actions)
+        status = str(account.get('status') or '').lower()
+        runner_alive = bool(
+            manager is not None
+            and getattr(getattr(manager, '_rpc', None), 'alive', False)
+        )
+        connected = (
+            status == 'online'
+            and runner_alive
+            and bool(ad and uin and uin in ad.local_actions)
+        )
         bots.append(
             {
                 **account,

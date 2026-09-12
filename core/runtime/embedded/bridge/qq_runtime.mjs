@@ -4,6 +4,8 @@ import { createHash, randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import dns from 'node:dns/promises';
+import net from 'node:net';
 import {
   BuddyListener,
   GlobalAdapter,
@@ -4357,6 +4359,7 @@ class QQInstance {
       const encoded = value.startsWith("base64://") ? value.slice(9) : value.slice(value.indexOf(",") + 1);
       const data = Buffer.from(encoded, "base64");
       if (!data.length) throw new Error("base64 文件内容为空");
+      if (data.length > 16 * 1024 * 1024) throw new Error("base64 文件超过 16 MB 限制");
       fs.writeFileSync(tempPath, data);
       return { path: tempPath, temporary: true };
     }
@@ -4370,11 +4373,17 @@ class QQInstance {
       if (os.platform() === "win32" && /^\/[A-Za-z]:/.test(localPath)) localPath = localPath.slice(1);
     }
     localPath = path.resolve(localPath);
-    if (!fs.existsSync(localPath) || !fs.statSync(localPath).isFile()) throw new Error(`文件不存在: ${localPath}`);
-    return { path: localPath, temporary: false };
+    if (!fs.existsSync(localPath) || !fs.statSync(localPath).isFile()) throw new Error("文件不存在");
+    const realPath = fs.realpathSync(localPath);
+    const roots = [process.env["ELAINAQQ_DATA_DIR"], os.tmpdir()]
+      .filter(Boolean).map((item) => path.resolve(String(item)));
+    const allowed = roots.some((root) => realPath === root || realPath.startsWith(root + path.sep));
+    if (!allowed) throw new Error("仅允许读取账号数据目录或临时目录中的文件");
+    return { path: realPath, temporary: false };
   }
   async downloadFile(url, destination, redirects = 0, headers = {}) {
     if (redirects > 5) throw new Error("下载图片重定向次数过多");
+    url = (await this.assertSafeRemoteUrl(url)).toString();
     const client = url.startsWith("https:") ? (await import('https')).default : (await import('http')).default;
     await new Promise((resolve, reject) => {
       const request = client.get(url, { headers }, (response) => {
@@ -4390,7 +4399,23 @@ class QQInstance {
           reject(new Error(`下载图片失败: HTTP ${status}`));
           return;
         }
+        const maxSize = 16 * 1024 * 1024;
+        const declared = Number(response.headers["content-length"] || 0);
+        if (declared > maxSize) {
+          response.resume();
+          reject(new Error("下载图片超过 16 MB 限制"));
+          return;
+        }
         const output = fs.createWriteStream(destination);
+        let received = 0;
+        response.on("data", (chunk) => {
+          received += chunk.length;
+          if (received > maxSize) {
+            const error = new Error("下载图片超过 16 MB 限制");
+            request.destroy(error);
+            output.destroy(error);
+          }
+        });
         response.pipe(output);
         output.on("finish", () => output.close(() => resolve()));
         output.on("error", reject);
@@ -4398,6 +4423,26 @@ class QQInstance {
       request.setTimeout(3e4, () => request.destroy(new Error("下载图片超时")));
       request.on("error", reject);
     });
+  }
+  async assertSafeRemoteUrl(rawUrl) {
+    const parsed = new URL(String(rawUrl));
+    if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("仅允许 HTTP 或 HTTPS 地址");
+    const records = await dns.lookup(parsed.hostname, { all: true, verbatim: true });
+    if (!records.length) throw new Error("远程地址无法解析");
+    for (const record of records) {
+      const address = String(record.address || "");
+      if (!net.isIP(address)) throw new Error("远程地址解析结果无效");
+      let blocked = false;
+      if (net.isIPv4(address)) {
+        const p = address.split(".").map(Number);
+        blocked = p[0] === 0 || p[0] === 10 || p[0] === 127 || (p[0] === 169 && p[1] === 254) || (p[0] === 172 && p[1] >= 16 && p[1] <= 31) || (p[0] === 192 && p[1] === 168) || (p[0] === 100 && p[1] >= 64 && p[1] <= 127) || p[0] >= 224;
+      } else {
+        const normalized = address.toLowerCase();
+        blocked = normalized === "::1" || normalized.startsWith("fc") || normalized.startsWith("fd") || normalized.startsWith("fe8") || normalized.startsWith("fe9") || normalized.startsWith("fea") || normalized.startsWith("feb") || normalized.startsWith("::ffff:10.") || normalized.startsWith("::ffff:127.") || normalized.startsWith("::ffff:192.168.");
+      }
+      if (blocked) throw new Error("远程地址不允许访问内网或本机地址");
+    }
+    return parsed;
   }
   async queryGroupList(params = {}) {
     const service = this.session?.getGroupService?.();
@@ -7038,6 +7083,7 @@ let instance = null;
 const managerChannel = new EmbeddedManagerChannel({
   botId: BOT_ID,
   managerUrl: MANAGER_URL,
+  managerToken: process.env["ELAINAQQ_MANAGER_TOKEN"] || "",
   logger: (...args) => logErr(BOT_ID, ...args),
 });
 function embeddedBotConfig() {

@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import hmac
 import inspect
 import itertools
 import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -90,6 +92,7 @@ def _device_name(bot_id: str) -> str:
 class EmbeddedBot:
     bot_id: str
     bridge_port: int = 0
+    bridge_token: str = field(default_factory=lambda: secrets.token_urlsafe(32), repr=False)
     qq_version_key: str = ''
     qq_path: str = ''
     uin: str = ''
@@ -111,6 +114,7 @@ class EmbeddedBot:
         return {
             'bot_id': self.bot_id,
             'bridge_port': self.bridge_port,
+            'bridge_token': self.bridge_token,
             'qq_version_key': self.qq_version_key,
             'qq_path': self.qq_path,
             'uin': self.uin,
@@ -248,6 +252,7 @@ class EmbeddedQQManager:
             self.bots[bot_id] = EmbeddedBot(
                 bot_id=bot_id,
                 bridge_port=self._parse_bridge_port(item.get('bridge_port')),
+                bridge_token=str(item.get('bridge_token') or secrets.token_urlsafe(32)),
                 # 不在框架启动时探测/校验 QQ 版本。只有真正启动 HookQQ
                 qq_version_key=str(item.get('qq_version_key') or item.get('version_key') or ''),
                 qq_path=str(item.get('qq_path') or ''),
@@ -602,6 +607,8 @@ class EmbeddedQQManager:
                 'ELAINAQQ_EMBEDDED': '1',
                 'ELAINAQQ_BOT_ID': bot.bot_id,
                 'ELAINAQQ_MANAGER_URL': manager_url,
+                'ELAINAQQ_MANAGER_TOKEN': bot.bridge_token,
+                'ELAINAQQ_BASE_DIR': str(self._base_dir),
                 'ELAINAQQ_DATA_DIR': str(data_dir),
                 'ELAINAQQ_BOT_UIN': bot.uin,
                 'ELAINAQQ_ONEBOT_ACTIONS': json.dumps(get_supported_actions(), ensure_ascii=True),
@@ -676,7 +683,13 @@ class EmbeddedQQManager:
         """为单个内置 QQ 启动仅限本机访问的控制桥接服务。"""
         if bot.bot_id in self._bridge_runners:
             return
+        def authorize(request: web.Request) -> None:
+            supplied = request.headers.get('X-Elaina-Bridge-Token', '')
+            if not supplied or not hmac.compare_digest(supplied, bot.bridge_token):
+                raise web.HTTPUnauthorized(text='桥接令牌无效')
+
         async def read_payload(request: web.Request) -> dict[str, Any]:
+            authorize(request)
             try:
                 payload = await request.json()
             except (ValueError, UnicodeDecodeError) as exc:
@@ -718,6 +731,7 @@ class EmbeddedQQManager:
             return web.json_response({'success': True})
 
         async def poll_control(request: web.Request) -> web.Response:
+            authorize(request)
             requested = str(request.query.get('bot_id') or '')
             if requested and requested != bot.bot_id:
                 raise web.HTTPForbidden(text='账号连接无效')
@@ -727,6 +741,7 @@ class EmbeddedQQManager:
             return web.json_response(command)
 
         async def poll_priority_control(request: web.Request) -> web.Response:
+            authorize(request)
             requested = str(request.query.get('bot_id') or '')
             if requested and requested != bot.bot_id:
                 raise web.HTTPForbidden(text='账号连接无效')

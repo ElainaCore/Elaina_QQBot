@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import inspect
 import logging
 import os
 import platform
@@ -41,6 +42,12 @@ _FALLBACK_MIRRORS = [
 
 _DEFAULT_SIGN_SERVER = 'https://esign.linsur.cn/'
 _MAX_RUNNER_ARCHIVE_SIZE = 256 * 1024 * 1024
+# Runner RPC uses one JSON object per line.  A large group-member response
+# can easily exceed asyncio.StreamReader's 64 KiB default line limit; when the
+# limit is exceeded readline() raises LimitOverrunError and the reader task
+# incorrectly treats the still-running runner as dead.
+_MAX_RUNNER_LINE_SIZE = 64 * 1024 * 1024
+_MAX_RUNNER_FRAME_SIZE = 128 * 1024 * 1024
 
 
 def _runner_asset() -> str:
@@ -81,8 +88,25 @@ class RunnerDownloader:
     def exe_path(self) -> Path:
         return self._bin_dir / _runner_exe_name()
 
+    @property
+    def version_path(self) -> Path:
+        """Marker written next to the binary after a successful extraction.
+
+        The runner executable is cached across framework upgrades.  Checking
+        only its size (the old behaviour) allows a previous protocol build to
+        be reused forever, which is especially problematic when RPC contracts
+        change.  A small version marker makes the cache key explicit while
+        keeping the executable itself untouched.
+        """
+        return self._bin_dir / '.runner-version'
+
     def has_runner(self) -> bool:
-        return self.exe_path.is_file() and self.exe_path.stat().st_size > 1_000_000
+        if not (self.exe_path.is_file() and self.exe_path.stat().st_size > 1_000_000):
+            return False
+        try:
+            return self.version_path.read_text(encoding='utf-8').strip() == RUNNER_VERSION
+        except (OSError, UnicodeError):
+            return False
 
     async def ensure_runner(self) -> Path:
         """确保 runner 二进制存在; 缺失则下载并解压。"""
@@ -128,15 +152,25 @@ class RunnerDownloader:
         last_err: Exception | None = None
         for final_url in urls:
             try:
+                # Never validate or mark a stale executable left by a
+                # previous protocol build when a download/extraction fails.
+                self.exe_path.unlink(missing_ok=True)
+                self.version_path.unlink(missing_ok=True)
                 await self._download(final_url, archive_path)
                 self._extract(archive_path)
                 self._make_executable()
-                if not self.has_runner():
+                if not (self.exe_path.is_file() and self.exe_path.stat().st_size > 1_000_000):
                     raise RuntimeError('压缩包中未找到有效的 runner 二进制')
+                # Replace the marker atomically so an interrupted write cannot
+                # make a partially downloaded runner look usable on restart.
+                marker_tmp = self.version_path.with_suffix('.tmp')
+                marker_tmp.write_text(RUNNER_VERSION, encoding='utf-8')
+                marker_tmp.replace(self.version_path)
                 log.info('QLinux runner 下载完成: %s', self.exe_path)
                 return
             except Exception as e:  # noqa: BLE001 — 逐镜像尝试
                 archive_path.unlink(missing_ok=True)
+                self.version_path.unlink(missing_ok=True)
                 log.warning('下载失败 (%s): %s', final_url, e)
                 last_err = e
 
@@ -180,16 +214,19 @@ class RunnerRPC:
     """单例 runner 子进程: 承载全部 bot 实例。"""
 
     def __init__(self, exe_path: Path, data_root: Path, sign_server: str,
-                 event_handler: Callable[[dict], None]):
+                 event_handler: Callable[[dict], None],
+                 on_exit: Callable[['RunnerRPC'], object] | None = None):
         self._exe_path = exe_path
         self._data_root = data_root
         self._sign_server = sign_server
         self._event_handler = event_handler  # 事件回调 (由 RunnerManager 提供)
+        self._on_exit = on_exit
         self._proc: asyncio.subprocess.Process | None = None
         self._pending: dict[str, asyncio.Future] = {}
         self._id_counter = 0
         self._reader_task: asyncio.Task | None = None
         self._alive = False
+        self._stopping = False
         self._lock = asyncio.Lock()
 
     @property
@@ -202,6 +239,7 @@ class RunnerRPC:
         async with self._lock:
             if self.alive:
                 return
+            self._stopping = False
             env = dict(os.environ)
             env['SIGN_SERVER_URL'] = self._sign_server
             env['RUNNER_DATA_ROOT'] = str(self._data_root)
@@ -213,6 +251,7 @@ class RunnerRPC:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=None,  # runner 自身日志透传到框架日志
                 env=env,
+                limit=_MAX_RUNNER_LINE_SIZE,
             )
             self._alive = True
             self._reader_task = asyncio.create_task(self._read_loop(), name='qlinux-runner-reader')
@@ -224,6 +263,7 @@ class RunnerRPC:
                 raise
 
     async def stop(self) -> None:
+        self._stopping = True
         self._alive = False
         reader_task = self._reader_task
         self._reader_task = None
@@ -266,42 +306,72 @@ class RunnerRPC:
     async def _read_loop(self) -> None:
         if self._proc is None or self._proc.stdout is None:
             raise RuntimeError('runner 标准输出不可用')
+        stdout = self._proc.stdout
+        buffer = bytearray()
+        dropped_bytes = 0
         try:
             while True:
-                raw = await self._proc.stdout.readline()
-                if not raw:
+                chunk = await stdout.read(64 * 1024)
+                if not chunk:
                     break
-                line = raw.decode('utf-8', errors='replace').strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    log.warning('QLinux runner 输出非 JSON: %s', line[:200])
-                    continue
-                if 'event' in data:
+                buffer.extend(chunk)
+                if len(buffer) > _MAX_RUNNER_FRAME_SIZE:
+                    newline = buffer.find(b'\n')
+                    if newline < 0:
+                        dropped_bytes += len(buffer)
+                        buffer.clear()
+                        continue
+                    dropped_bytes += newline + 1
+                    del buffer[: newline + 1]
+                while True:
+                    newline = buffer.find(b'\n')
+                    if newline < 0:
+                        break
+                    raw = bytes(buffer[:newline])
+                    del buffer[: newline + 1]
+                    line = raw.decode('utf-8', errors='replace').strip()
+                    if not line:
+                        continue
                     try:
-                        self._event_handler(data)
-                    except Exception:  # noqa: BLE001
-                        log.exception('QLinux 事件处理异常')
-                elif 'id' in data:
-                    fut = self._pending.pop(str(data['id']), None)
-                    if fut and not fut.done():
-                        if 'error' in data:
-                            fut.set_exception(RuntimeError(data['error']))
-                        else:
-                            fut.set_result(data.get('result'))
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        log.warning('QLinux runner 输出非 JSON: %s', line[:200])
+                        continue
+                    if 'event' in data:
+                        try:
+                            self._event_handler(data)
+                        except Exception:  # noqa: BLE001
+                            log.exception('QLinux 事件处理异常')
+                    elif 'id' in data:
+                        fut = self._pending.pop(str(data['id']), None)
+                        if fut and not fut.done():
+                            if 'error' in data:
+                                fut.set_exception(RuntimeError(data['error']))
+                            else:
+                                fut.set_result(data.get('result'))
+            if buffer.strip():
+                log.warning('QLinux runner stdout 在 EOF 前收到未完整帧 (%d bytes)', len(buffer))
+            if dropped_bytes:
+                log.warning('QLinux runner 丢弃超限 stdout 数据: %d bytes', dropped_bytes)
         except asyncio.CancelledError:
             pass
         except Exception:  # noqa: BLE001
             log.exception('QLinux runner 读取循环异常')
         finally:
             self._alive = False
-            log.warning('QLinux runner 进程退出 (code=%s)', self._proc.returncode if self._proc else '?')
+            code = self._proc.returncode if self._proc else None
+            log.warning('QLinux runner stdout 读取循环结束 (process_code=%s)', code)
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(RuntimeError('runner 进程意外退出'))
             self._pending.clear()
+            if not self._stopping and self._on_exit:
+                try:
+                    callback_result = self._on_exit(self)
+                    if inspect.isawaitable(callback_result):
+                        asyncio.create_task(callback_result)
+                except Exception:  # noqa: BLE001
+                    log.exception('QLinux runner 退出恢复回调失败')
 
 
 # ==================== 事件 → OneBot v11 映射 ====================

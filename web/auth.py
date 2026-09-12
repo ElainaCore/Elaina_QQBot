@@ -6,6 +6,7 @@ import concurrent.futures
 import contextlib
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import threading
@@ -51,6 +52,8 @@ def init(base_dir: str):
     _instance_file = os.path.join(_data_dir, 'instance_id')
     _COOKIE_SECRET = _load_or_create_secret()
     SESSION_COOKIE = f'{_SESSION_COOKIE_PREFIX}_{_load_or_create_instance_id()}'
+    for path in (_ip_file, _session_file, _instance_file):
+        _secure_auth_file(path)
     _load_ip_data()
     _load_session_data()
 
@@ -90,6 +93,15 @@ def _load_or_create_instance_id() -> str:
     instance_id = uuid.uuid4().hex
     _write_text_sync(_instance_file, instance_id)
     return instance_id
+
+
+def _secure_auth_file(path: str) -> None:
+    if os.name != 'nt':
+        try:
+            if os.path.exists(path):
+                os.chmod(path, 0o600)
+        except OSError:
+            pass
 
 
 # ==================== 密码摘要 ====================
@@ -167,10 +179,13 @@ def _write_text_sync(path, text):
         temporary = f'{path}.{os.getpid()}.tmp'
         try:
             with open(temporary, 'w', encoding='utf-8') as file:
+                if os.name != 'nt':
+                    os.chmod(temporary, 0o600)
                 file.write(text)
                 file.flush()
                 os.fsync(file.fileno())
             os.replace(temporary, path)
+            _secure_auth_file(path)
         except Exception:
             with contextlib.suppress(OSError):
                 os.remove(temporary)
@@ -217,9 +232,38 @@ def _trust_forwarded() -> bool:
         return False
 
 
+def _trusted_proxy_networks() -> list[ipaddress._BaseNetwork]:
+    try:
+        from core.foundation.config import cfg
+        raw = cfg.get('settings', 'web.trusted_proxies', '')
+    except Exception:
+        raw = ''
+    values = raw if isinstance(raw, list) else str(raw or '').replace(';', ',').split(',')
+    values = [str(item).strip() for item in values if str(item).strip()]
+    if not values:
+        values = ['127.0.0.0/8', '::1/128']
+    networks = []
+    for value in values[:32]:
+        try:
+            networks.append(ipaddress.ip_network(value, strict=False))
+        except ValueError:
+            continue
+    return networks
+
+
+def _is_trusted_forwarder(request: web.Request) -> bool:
+    if not _trust_forwarded():
+        return False
+    try:
+        peer = ipaddress.ip_address(_peer_ip(request))
+    except ValueError:
+        return False
+    return any(peer in network for network in _trusted_proxy_networks())
+
+
 def get_real_ip(request: web.Request) -> str:
     """获取客户端真实 IP; 转发头可伪造, 默认只信任连接对端, 反代后需开启 web.trust_forwarded_headers"""
-    if _trust_forwarded():
+    if _is_trusted_forwarder(request):
         forwarded = request.headers.get('X-Forwarded-For')
         if forwarded and forwarded.split(',')[0].strip():
             return forwarded.split(',')[0].strip()
@@ -403,7 +447,7 @@ def get_request_token(request: web.Request) -> str:
 
 
 def set_session_cookie(response: web.StreamResponse, request: web.Request, token: str) -> None:
-    forwarded_proto = request.headers.get('X-Forwarded-Proto', '').split(',')[0].strip().lower() if _trust_forwarded() else ''
+    forwarded_proto = request.headers.get('X-Forwarded-Proto', '').split(',')[0].strip().lower() if _is_trusted_forwarder(request) else ''
     response.set_cookie(
         SESSION_COOKIE,
         token,
