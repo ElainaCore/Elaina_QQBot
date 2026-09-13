@@ -10,7 +10,7 @@ from typing import Any
 
 log = logging.getLogger('ElainaQQ.embedded_qq.msgpush')
 
-# protobuf wire format
+# protobuf 线格式。
 
 _MAX_DEPTH = 64
 

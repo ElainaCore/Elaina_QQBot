@@ -34,7 +34,7 @@ def normalize_action_response(response: Any, *, action: str = '') -> dict[str, A
         return action_failed('机器人未连接或接口不可用', 1404)
 
     normalized = dict(response)
-    # Local protocol bridges historically returned the action payload itself
+    # 本地桥直接返回动作数据，网络传输返回 OneBot 包装响应。
     if not any(key in normalized for key in ('status', 'retcode', 'data')):
         error_text = normalized.get('error') or normalized.get('error_message') or normalized.get('errMsg')
         if error_text:
@@ -52,7 +52,7 @@ def normalize_action_response(response: Any, *, action: str = '') -> dict[str, A
     except (TypeError, ValueError):
         retcode = 1500
 
-    # QQNT 原生接口可能被包装成外层 OneBot success，但把真正的错误放在
+    # QQNT 原生接口可能把真实错误放在 data.retcode 或 data.message 中。
     nested = None
     for candidate in (normalized.get('data'), normalized.get('rsp'), normalized.get('payload')):
         if isinstance(candidate, dict):

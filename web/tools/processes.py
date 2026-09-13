@@ -76,7 +76,7 @@ def _managed_records(manager) -> tuple[list[dict[str, Any]], dict[int, dict[str,
 
 
 def _is_main_qq_process(process: psutil.Process) -> bool:
-    """Identify a top-level QQ process using only public process metadata."""
+    """仅依据公开进程信息识别顶层 QQ 进程。"""
     try:
         if process.name().lower() not in _QQ_PROCESS_NAMES:
             return False
@@ -86,12 +86,12 @@ def _is_main_qq_process(process: psutil.Process) -> bool:
         parent = process.parent()
         return parent is None or parent.name().lower() not in _QQ_PROCESS_NAMES
     except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-        # The process itself is visible and named QQ; an inaccessible or exited
+        # 进程可见且名称为 QQ，无法访问或已退出时仍视为主进程。
         return True
 
 
 def _loaded_pipe_pids() -> frozenset[int]:
-    """Read SnowLuma-compatible pipe names without loading the Node addon."""
+    """读取 SnowLuma 兼容管道名称，不加载 Node 插件。"""
     if os.name != 'nt':
         return frozenset()
     try:
@@ -102,7 +102,7 @@ def _loaded_pipe_pids() -> frozenset[int]:
 
 
 def _external_qq_processes(managed_by_pid: dict[int, dict[str, Any]], injector) -> list[dict[str, Any]]:
-    """Discover QQ with psutil; this function never starts the native helper."""
+    """使用 psutil 查找 QQ，不启动原生辅助程序。"""
     external: list[dict[str, Any]] = []
     owned_pids = injector.owned_pids if injector is not None else frozenset()
     loaded_pids = _loaded_pipe_pids() | owned_pids
@@ -222,7 +222,7 @@ def _injection_error_response(exc: Exception) -> web.Response:
 
 
 async def handle_load_process(request: web.Request) -> web.Response:
-    """Inject the native runtime into QQ; this does not create a Hook bridge."""
+    """向 QQ 注入原生运行时，不创建 Hook 桥。"""
     try:
         pid, _, executable = _requested_external_qq(request.match_info.get('pid', ''))
         injector = getattr(_app, 'process_injector', None)
@@ -260,7 +260,7 @@ async def handle_refresh_process(request: web.Request) -> web.Response:
 
 
 async def handle_inject_process(request: web.Request) -> web.Response:
-    """Inject a running QQ process and establish its message bridge."""
+    """向运行中的 QQ 注入并建立消息桥。"""
     try:
         pid, _, executable = _requested_external_qq(request.match_info.get('pid', ''))
         injector = getattr(_app, 'process_injector', None)
@@ -278,7 +278,7 @@ async def handle_inject_process(request: web.Request) -> web.Response:
 
 
 async def handle_attach_process(request: web.Request) -> web.Response:
-    """Legacy alias for :func:`handle_inject_process`."""
+    """兼容旧版的进程注入别名。"""
     return await handle_inject_process(request)
 
 

@@ -6,7 +6,6 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
-import inspect
 import itertools
 import json
 import logging
@@ -28,7 +27,8 @@ from aiohttp import web
 
 from core.foundation.branding import public_text
 from core.foundation.config import cfg
-from core.protocols.onebot.api import api_call_source, get_supported_actions
+from core.protocols.onebot.api import get_supported_actions
+from core.protocols.onebot.contract import Channel
 from core.protocols.onebot.protocol import action_failed, action_ok, normalize_action_response
 from core.runtime.embedded.output_filter import (
     crash_dump_end,
@@ -143,8 +143,6 @@ class EmbeddedQQManager:
         self._priority_control_pollers: set[str] = set()
         self._control_futures: dict[str, tuple[str, asyncio.Future[dict[str, Any]]]] = {}
         self._red_packet_bot_aliases: dict[str, str] = {}
-        self._red_packet_listeners: dict[str, Any] = {}
-        self._red_packet_tasks: dict[str, set[asyncio.Task]] = {}
         self._hook_red_packets: dict[str, dict[str, Any]] = {}
         self._grab_agent_sessions: dict[int, Any] = {}
         self._grab_agent_lock = asyncio.Lock()
@@ -1189,6 +1187,11 @@ class EmbeddedQQManager:
                 bill_no,
                 send_password_after=bool(params.get('send_password_after')),
             )
+        if action == 'query_red_packet':
+            return await self.query_red_packet(
+                str(params.get('self_id') or bot_id or ''),
+                str(params.get('bill_no') or ''),
+            )
         if action in {'get_group_list', 'set_poll_groups'}:
             return await self._control_call(bot_id, {'type': action, **params})
         if action in {'nc_get_rkey', 'get_rkey', 'get_rkey_server'}:
@@ -1356,57 +1359,20 @@ class EmbeddedQQManager:
             return action_failed(str(error), 1400)
         return await self._oidb_void_action(bot_id, 'set_group_special_title', packet)
 
-    def register_red_packet_listener(self, owner: str, callback) -> None:
-        """注册内置 QQ 原生红包回调；同一 owner 热重载时自动替换。"""
-        owner = str(owner or '').strip()
-        if not owner or not callable(callback):
-            raise ValueError('红包监听需要有效的 owner 和回调方法')
-        self.unregister_red_packet_listener(owner)
-        self._red_packet_listeners[owner] = callback
-
-    def unregister_red_packet_listener(self, owner: str) -> None:
-        owner = str(owner or '').strip()
-        self._red_packet_listeners.pop(owner, None)
-        for task in self._red_packet_tasks.pop(owner, set()):
-            if not task.done():
-                task.cancel()
-
-    async def _run_red_packet_listener(
-        self,
-        owner: str,
-        callback,
-        self_id: str,
-        packet: dict[str, Any],
-    ) -> None:
-        try:
-            with api_call_source(owner):
-                result = callback(self_id, packet)
-                if inspect.isawaitable(result):
-                    await result
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception('内置 QQ 红包监听异常: %s [%s]', owner, self_id)
-
     async def handle_red_packet(self, payload: dict[str, Any]) -> bool:
-        """执行内置 QQ 的原生红包能力回调，不向 OneBot 注入私有事件。"""
+        """接收内置桥红包并送入统一 OneBot 事件管线。"""
         bot_id = str(payload.get('bot_id') or '').strip()
         bot = self.bots.get(bot_id)
         packet = payload.get('red_packet')
-        if bot is None and not self.app._hook_bridges:
-            # 注入模式（Windows）没有 Node 子进程 bot，但红包监听器仍需工作。
-            return False
         if not isinstance(packet, dict):
             return False
         if bot is not None:
             bot.last_seen = time.time()
         self_id = str(payload.get('self_id') or bot.uin or bot_id)
+        if not self_id:
+            return False
         self._red_packet_bot_aliases[self_id] = bot_id
-        if isinstance(packet, dict) and packet.get('bill_no'):
-            # 历史重放/外部触发的红包也进入 agent 上下文缓存
-            cached = dict(packet)
-            cached.setdefault('grab_source', 'bridge')  # node 框桥推送，有完整 pcBody 上下文
-            self._hook_red_packets[str(packet['bill_no'])] = cached
+        self._cache_red_packet(packet, grab_source='bridge')
         log.info(
             '[%s] 检测到红包: bill_no=%s type=%s group=%s sender=%s',
             self_id,
@@ -1415,18 +1381,11 @@ class EmbeddedQQManager:
             packet.get('group_id') or packet.get('peer_uin'),
             packet.get('sender_name') or packet.get('sender_id'),
         )
-        listeners = tuple(self._red_packet_listeners.items())
-        for index, (owner, callback) in enumerate(listeners):
-            task = asyncio.create_task(
-                self._run_red_packet_listener(
-                    owner, callback, self_id, packet if index == 0 else dict(packet),
-                ),
-                name=f'red-packet-{owner}-{self_id}',
-            )
-            tasks = self._red_packet_tasks.setdefault(owner, set())
-            tasks.add(task)
-            task.add_done_callback(tasks.discard)
-        return True
+        return await self.app.ingest_event(
+            self._red_packet_event(self_id, packet),
+            self_id,
+            source=Channel.EMBEDDED,
+        )
 
     def _red_packet_bot_id(self, self_id: str) -> str:
         self_id = str(self_id or '').strip()
@@ -1442,30 +1401,57 @@ class EmbeddedQQManager:
         return ''
 
     async def dispatch_hook_red_packet(self, self_id: str, packet: dict[str, Any]) -> None:
-        """Windows 注入模式：把 hook 桥解析出的红包派发给监听器。"""
+        """Windows 注入模式：把 hook 桥解析出的红包送入统一事件管线。"""
         self_id = str(self_id or '').strip()
         if not self_id or not isinstance(packet, dict) or not packet.get('bill_no'):
             return
         self._red_packet_bot_aliases[self_id] = self_id
-        bill_no = str(packet['bill_no'])
-        if isinstance(self._hook_red_packets, dict):
-            cached = dict(packet)
-            cached.setdefault('grab_source', 'agent')  # DLL 接管桥：只有 raw_wallet，无 pcBody
-            self._hook_red_packets[bill_no] = cached
-            # 控制缓存规模
-            while len(self._hook_red_packets) > 500:
-                self._hook_red_packets.pop(next(iter(self._hook_red_packets)))
-        listeners = tuple(self._red_packet_listeners.items())
-        for index, (owner, callback) in enumerate(listeners):
-            task = asyncio.create_task(
-                self._run_red_packet_listener(
-                    owner, callback, self_id, packet if index == 0 else dict(packet),
-                ),
-                name=f'red-packet-hook-{owner}-{self_id}',
-            )
-            tasks = self._red_packet_tasks.setdefault(owner, set())
-            tasks.add(task)
-            task.add_done_callback(tasks.discard)
+        self._cache_red_packet(packet, grab_source='agent')
+        await self.app.ingest_event(
+            self._red_packet_event(self_id, packet),
+            self_id,
+            source=Channel.INJECTED,
+        )
+
+    def _cache_red_packet(self, packet: dict[str, Any], *, grab_source: str) -> None:
+        bill_no = str(packet.get('bill_no') or '').strip()
+        if not bill_no:
+            return
+        cached = dict(packet)
+        cached.setdefault('grab_source', grab_source)
+        self._hook_red_packets[bill_no] = cached
+        while len(self._hook_red_packets) > 500:
+            self._hook_red_packets.pop(next(iter(self._hook_red_packets)))
+
+    def remember_red_packet_event(self, event: Any) -> None:
+        """从统一事件对象保存红包领取所需上下文。"""
+        extra = getattr(event, 'extra', {})
+        packet = extra.get('red_packet') if isinstance(extra, dict) else None
+        if not isinstance(packet, dict):
+            return
+        source = 'agent' if str(getattr(event, 'source', '') or '') == str(Channel.INJECTED) else 'bridge'
+        self._cache_red_packet(packet, grab_source=source)
+
+    @staticmethod
+    def _red_packet_event(self_id: str, packet: dict[str, Any]) -> dict[str, Any]:
+        """构造渠道无关的标准 OneBot 红包通知事件。"""
+        packet = dict(packet)
+        group_id = packet.get('group_id') or None
+        user_id = packet.get('sender_id') or packet.get('peer_uid') or 0
+        try:
+            event_time = int(packet.get('time') or time.time())
+        except (TypeError, ValueError):
+            event_time = int(time.time())
+        return {
+            'post_type': 'notice',
+            'notice_type': 'red_packet',
+            'sub_type': 'receive',
+            'self_id': str(self_id),
+            'time': event_time,
+            'group_id': group_id,
+            'user_id': user_id,
+            '_extra': {'red_packet': packet},
+        }
 
     async def grab_red_packet(
         self, self_id: str, bill_no: str, *, send_password_after: bool = False,

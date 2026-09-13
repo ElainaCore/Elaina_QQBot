@@ -106,14 +106,14 @@ class MessageEvent(OneBotEvent):
 
     @property
     def member_role(self) -> str:
-        """Compatibility alias used by existing plugins for group messages."""
+        """兼容旧插件的群消息判断属性。"""
         if not self.is_group:
             return ''
         return _role(self.sender.get('role') or self.sender.get('permission'))
 
     @property
     def sender_role(self) -> str:
-        """Compatibility alias used by older plugin permission checks."""
+        """兼容旧插件的管理员判断属性。"""
         return self.member_role
 
     @property

@@ -93,10 +93,9 @@ class HookBridge:
     """接管一条已注入 DLL 的 QQ 主进程。"""
 
     def __init__(self, pid: int, on_event: EVENT_DISPATCHER | None = None,
-                 on_red_packet=None, on_disconnect: DISCONNECT_HANDLER | None = None) -> None:
+                 on_disconnect: DISCONNECT_HANDLER | None = None) -> None:
         self.pid = pid
         self.on_event = on_event
-        self.on_red_packet = on_red_packet
         self.on_disconnect = on_disconnect
         self.status = HookStatus(pid=pid)
         self._control = HookPipe(control_pipe_name(pid))
@@ -229,22 +228,25 @@ class HookBridge:
             return
         self_uin = int(self.status.uin) if self.status.uin.isdigit() else 0
         for ctx in msgpush.parse_push(frame.body, self_uin):
-            self._emit_red_packet(ctx)
+            for red_packet in self._red_packet_events(ctx):
+                self._schedule_dispatch(red_packet)
             payload = self._build_event(ctx)
             if payload is None:
                 continue
             if payload.get('post_type') in ('message', 'message_sent'):
                 self._remember(ctx, payload)
-            if self.on_event:
-                task = asyncio.get_running_loop().create_task(self._dispatch(payload))
-                self._dispatch_tasks.add(task)
-                task.add_done_callback(self._dispatch_tasks.discard)
+            self._schedule_dispatch(payload)
 
-    def _emit_red_packet(self, ctx: msgpush.MsgContext) -> None:
-        """消息元素含红包时派发给红包监听器（Windows 注入模式的检测通道）。"""
-        handler = self.on_red_packet
-        if handler is None:
+    def _schedule_dispatch(self, payload: dict[str, Any]) -> None:
+        if not self.on_event:
             return
+        task = asyncio.get_running_loop().create_task(self._dispatch(payload))
+        self._dispatch_tasks.add(task)
+        task.add_done_callback(self._dispatch_tasks.discard)
+
+    def _red_packet_events(self, ctx: msgpush.MsgContext) -> list[dict[str, Any]]:
+        """把红包元素转换为标准 OneBot notice.red_packet 事件。"""
+        events: list[dict[str, Any]] = []
         try:
             for elem in msgpush.decode_elements(ctx.body):
                 if elem.get('type') != 'red_packet':
@@ -265,19 +267,22 @@ class HookBridge:
                     'key': str(elem.get('key') or ''),
                     'msg_seq': ctx.sequence,
                     'raw_wallet': str(elem.get('raw_wallet') or ''),
+                    'grab_source': 'agent',
                 }
                 if packet['bill_no']:
-                    task = asyncio.get_running_loop().create_task(self._dispatch_red_packet(packet))
-                    self._dispatch_tasks.add(task)
-                    task.add_done_callback(self._dispatch_tasks.discard)
+                    events.append({
+                        'post_type': 'notice',
+                        'notice_type': 'red_packet',
+                        'sub_type': 'receive',
+                        'self_id': str(ctx.self_uin or self.status.uin or ''),
+                        'time': packet['time'],
+                        'group_id': packet['group_id'],
+                        'user_id': packet['sender_id'],
+                        '_extra': {'red_packet': packet},
+                    })
         except Exception:  # noqa: BLE001
             log.exception('红包元素派发失败')
-
-    async def _dispatch_red_packet(self, packet: dict) -> None:
-        try:
-            await self.on_red_packet(packet)  # type: ignore[misc]
-        except Exception:  # noqa: BLE001
-            log.exception('红包事件分发失败')
+        return events
 
     async def _dispatch(self, payload: dict) -> None:
         if payload.get('post_type') == 'message_sent' and not self.forward_self_messages:
@@ -389,7 +394,7 @@ class HookBridge:
         return payload
 
     def _event_system(self, ctx: msgpush.MsgContext) -> dict[str, Any] | None:
-        """Convert QQNT group system packets into standard OneBot events."""
+        """转换 QQNT 群系统包为标准 OneBot 事件。"""
         content = msgpush.pb_bytes(ctx.body, 2)
         group_id = msgpush.pb_int(content, 1, ctx.group_uin)
         if not group_id:

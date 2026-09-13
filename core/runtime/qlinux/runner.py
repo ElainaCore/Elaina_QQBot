@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import inspect
+import json
 import logging
 import os
 import platform
@@ -42,10 +42,7 @@ _FALLBACK_MIRRORS = [
 
 _DEFAULT_SIGN_SERVER = 'https://esign.linsur.cn/'
 _MAX_RUNNER_ARCHIVE_SIZE = 256 * 1024 * 1024
-# Runner RPC uses one JSON object per line.  A large group-member response
-# can easily exceed asyncio.StreamReader's 64 KiB default line limit; when the
-# limit is exceeded readline() raises LimitOverrunError and the reader task
-# incorrectly treats the still-running runner as dead.
+# Runner RPC 每行传输一个 JSON 对象，大型成员列表需要更大的读取上限。
 _MAX_RUNNER_LINE_SIZE = 64 * 1024 * 1024
 _MAX_RUNNER_FRAME_SIZE = 128 * 1024 * 1024
 
@@ -90,14 +87,7 @@ class RunnerDownloader:
 
     @property
     def version_path(self) -> Path:
-        """Marker written next to the binary after a successful extraction.
-
-        The runner executable is cached across framework upgrades.  Checking
-        only its size (the old behaviour) allows a previous protocol build to
-        be reused forever, which is especially problematic when RPC contracts
-        change.  A small version marker makes the cache key explicit while
-        keeping the executable itself untouched.
-        """
+        """返回成功解压后写入的 runner 版本标记路径。"""
         return self._bin_dir / '.runner-version'
 
     def has_runner(self) -> bool:
@@ -152,8 +142,7 @@ class RunnerDownloader:
         last_err: Exception | None = None
         for final_url in urls:
             try:
-                # Never validate or mark a stale executable left by a
-                # previous protocol build when a download/extraction fails.
+                # 下载或解压失败时清理旧版本，避免误判为可用。
                 self.exe_path.unlink(missing_ok=True)
                 self.version_path.unlink(missing_ok=True)
                 await self._download(final_url, archive_path)
@@ -161,8 +150,7 @@ class RunnerDownloader:
                 self._make_executable()
                 if not (self.exe_path.is_file() and self.exe_path.stat().st_size > 1_000_000):
                     raise RuntimeError('压缩包中未找到有效的 runner 二进制')
-                # Replace the marker atomically so an interrupted write cannot
-                # make a partially downloaded runner look usable on restart.
+                # 原子替换版本标记，避免中断写入造成误判。
                 marker_tmp = self.version_path.with_suffix('.tmp')
                 marker_tmp.write_text(RUNNER_VERSION, encoding='utf-8')
                 marker_tmp.replace(self.version_path)
@@ -215,7 +203,7 @@ class RunnerRPC:
 
     def __init__(self, exe_path: Path, data_root: Path, sign_server: str,
                  event_handler: Callable[[dict], None],
-                 on_exit: Callable[['RunnerRPC'], object] | None = None):
+                 on_exit: Callable[[RunnerRPC], object] | None = None):
         self._exe_path = exe_path
         self._data_root = data_root
         self._sign_server = sign_server
@@ -420,13 +408,13 @@ def _entities_to_ob(data: dict) -> list[dict]:
 
 
 def _ob_message_id(bot_id: str, sequence: int, group: bool) -> int:
-    """Return a normal OneBot v11 message id."""
+    """返回规范的 OneBot v11 消息编号。"""
     del bot_id, group
     return int(sequence or 0)
 
 
 def _normalize_onebot_payload(payload: dict, fallback_uin: str, bot_id: str) -> dict:
-    """Keep runner-forwarded OneBot events equivalent to native events."""
+    """保持 runner 转发事件与原生事件一致。"""
     payload = dict(payload)
     payload.setdefault('self_id', str(fallback_uin or bot_id))
     normalized = normalize_event(payload, str(fallback_uin or bot_id))

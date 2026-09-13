@@ -128,20 +128,15 @@ class Application:
         bridge: HookBridge
 
         async def ingest_hook_event(payload: dict) -> bool:
-            # Hook 事件的载荷不一定包含 self_id；使用握手得到的 QQ 号兜底，
+            # Hook 缺少 self_id 时使用握手账号。
             return await self.ingest_event(
                 payload,
                 str(bridge.status.uin or ''),
                 source=Channel.INJECTED,
             )
 
-        async def ingest_hook_red_packet(packet: dict) -> None:
-            # Windows 注入模式：从 MsgPush 网络层解析出的红包，直通红包监听器。
-            await self.embedded_qq.dispatch_hook_red_packet(
-                str(bridge.status.uin or ''), packet)
-
         async def on_hook_disconnect() -> None:
-            # QQ 退出后，注入账号不再是有效接入；清理本地动作注册，
+            # QQ 退出后清理注入账号。
             current = self._hook_bridges.get(pid)
             if current is bridge:
                 self._hook_bridges.pop(pid, None)
@@ -149,7 +144,6 @@ class Application:
                 log.info('QQ(pid=%s) 已退出，注入账号接入已清理', pid)
 
         bridge = HookBridge(pid, on_event=ingest_hook_event,
-                            on_red_packet=ingest_hook_red_packet,
                             on_disconnect=on_hook_disconnect)
         bridge.forward_self_messages = self._self_messages_enabled()
         if not await bridge.connect():
@@ -194,7 +188,24 @@ class Application:
             return
 
         async def _handler(action: str, params: dict, _bridge=bridge):
-            return await _bridge.handle_action(action, params)
+            result = await _bridge.handle_action(action, params)
+            if result is not None or self._embedded_qq is None:
+                return result
+            # 注入账号的红包动作转交内置管理器。
+            self_id = str(_bridge.status.uin or '')
+            if action == 'query_red_packet':
+                return await self._embedded_qq.query_red_packet(
+                    self_id,
+                    str(params.get('bill_no') or ''),
+                )
+            if action in {'grab_red_packet', 'qq_grab_red_packet'}:
+                return await self._embedded_qq.grab_red_packet(
+                    self_id,
+                    str(params.get('bill_no') or ''),
+                    send_password_after=bool(params.get('send_password_after')),
+                    context=params.get('context') if isinstance(params.get('context'), dict) else None,
+                )
+            return None
 
         adapter.register_local_bot(uin, _handler, channel=Channel.INJECTED)
         self._hook_bot_ids.add(uin)
@@ -464,6 +475,11 @@ class Application:
 
         # 同一事件链中的 API 调用始终回到产生事件的 QQ，避免多账号串号。
         with routed_self_id(str(event.self_id or '')):
+            # 统一事件处理阶段缓存红包上下文。
+            if (self._embedded_qq
+                    and getattr(event, 'post_type', '') == 'notice'
+                    and getattr(event, 'notice_type', '') == 'red_packet'):
+                self._embedded_qq.remember_red_packet_event(event)
             # 日志转换与插件分发并行启动；SQLite 仍由后台批量写入。
             log_task = None
             if self._event_log_recorder:

@@ -31,7 +31,7 @@ def _read_settings_sync(path: str):
 
 
 def _public_settings(parsed: dict) -> dict:
-    """Return a form-safe settings snapshot without hashes or API secrets."""
+    """返回不含密码摘要和 API 密钥的表单配置快照。"""
     result = copy.deepcopy(parsed) if isinstance(parsed, dict) else {}
     web_settings = result.get('web')
     if isinstance(web_settings, dict):

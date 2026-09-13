@@ -1,5 +1,6 @@
 """机器人列表 / 详情 (OneBot 适配)"""
 
+import asyncio
 import os
 import time
 from typing import Any
@@ -7,13 +8,13 @@ from typing import Any
 from aiohttp import web
 
 from core.foundation.config import cfg
+from core.plugins import get_api
 from web.protocol import error, json_body, ok
 from web.tools import _common
 
 _app = None
 _login_cache: dict[str, tuple[float, dict]] = {}
 _LOGIN_TTL = 60
-_BOT_IDENTITY_FIELDS = ('bot_id', 'bot_qq', 'qq', 'uin')
 
 
 def set_context(app_instance):
@@ -29,9 +30,8 @@ async def _login_info(self_id: str) -> dict:
         return c[1]
     info: dict[str, Any] = {}
     try:
-        from core.protocols.onebot.api import OneBotAPI
-
-        resp = await OneBotAPI(_common.adapter()).call_api('get_login_info', self_id=self_id)
+        async with asyncio.timeout(5):
+            resp = await get_api().call_api('get_login_info', self_id=self_id)
         if resp and resp.get('retcode') == 0:
             info = resp.get('data') or {}
     except Exception:
@@ -44,119 +44,26 @@ def _avatar(qq: str) -> str:
     return f'https://q1.qlogo.cn/g?b=qq&nk={qq}&s=100' if qq else ''
 
 
-def _conn_type(ad, self_id: str) -> str:
-    """依据适配器记录判断连接方式 (WebSocket 优先于 HTTP)"""
-    if self_id in ad.local_actions:
-        labels = {
-            'embedded': '内置 QQ',
-            'injected': 'QQ 注入',
-            'lagrange': 'QLinux',
-        }
-        return labels.get(ad.local_channels.get(self_id, ''), '本地渠道')
-    if self_id in ad.websockets:
-        return 'WebSocket'
-    rec = ad.bots.get(self_id) or {}
-    return 'WebSocket' if rec.get('type') == 'websocket' else 'HTTP'
-
-
-def _qlinux_accounts() -> list[dict]:
-    """返回 QLinux 的全部账号，包括当前离线账号。"""
-    manager = getattr(_app, 'qlinux', None)
-    if manager is None:
-        return []
-    try:
-        return manager.list_accounts()
-    except Exception:  # noqa: BLE001
-        return []
-
-
-def _bot_identities(item) -> set[str]:
-    """返回内置账号的临时编号、真实 QQ 等全部身份别名。"""
-    values = (item.get(key) for key in _BOT_IDENTITY_FIELDS) if isinstance(item, dict) else (getattr(item, key, '') for key in _BOT_IDENTITY_FIELDS)
-    return {str(value).strip() for value in values if value}
-
-
 async def handle_get_bots(request: web.Request):
     prune = getattr(_app, 'prune_hook_bridges', None)
     if callable(prune):
         await prune()
-    ad = _common.adapter()
-    bots = []
-    manager = getattr(_app, 'embedded_qq', None)
-    embedded_ids = set()
-    if manager:
-        embedded_bots = manager.list_bots()
-        bots.extend(embedded_bots)
-        # 登录过程中 bot_id 可能暂时不同于真实 QQ，所有别名都视为同一账号。
-        for item in embedded_bots:
-            embedded_ids.update(_bot_identities(item))
-        for bot in getattr(manager, 'bots', {}).values():
-            embedded_ids.update(_bot_identities(bot))
-    qlinux_accounts = _qlinux_accounts()
-    qlinux_ids = set()
-    for account in qlinux_accounts:
-        qlinux_ids.update(_bot_identities(account))
-        uin = str(account.get('uin') or '').strip()
-        bot_id = str(account.get('bot_id') or '').strip()
-        status = str(account.get('status') or '').lower()
-        runner_alive = bool(
-            manager is not None
-            and getattr(getattr(manager, '_rpc', None), 'alive', False)
-        )
-        connected = (
-            status == 'online'
-            and runner_alive
-            and bool(ad and uin and uin in ad.local_actions)
-        )
-        bots.append(
-            {
-                **account,
-                'bot_id': bot_id,
-                'bot_qq': uin or bot_id,
-                'name': account.get('nickname') or uin or bot_id,
-                'qq': uin,
-                'avatar': _avatar(uin),
-                'connected': connected,
-                'connection_type': 'QLinux',
-                'runtime_mode': 'QLinux',
-                'error': account.get('last_error') or '',
-                'enabled': True,
-            }
-        )
-    if ad:
-        for self_id in _common.connected_ids():
-            self_id = str(self_id)
-            if self_id in embedded_ids or self_id in qlinux_ids:
-                continue
-            conn_type = _conn_type(ad, self_id)
-            connected = self_id in ad.local_actions or self_id in ad.websockets or conn_type == 'WebSocket'
-            info = await _login_info(self_id) if connected else {}
-            name = info.get('nickname', '') or self_id
-            hook_status = next(
-                (
-                    status
-                    for status in getattr(_app, 'hook_bridges', lambda: [])()
-                    if str(status.get('uin') or '') == self_id
-                ),
-                {},
-            )
-            bots.append(
-                {
-                    'bot_qq': self_id,
-                    'name': name,
-                    'qq': self_id,
-                    'avatar': _avatar(self_id),
-                    'connected': connected,
-                    'connection_type': conn_type,
-                    'runtime_mode': conn_type,
-                    'pid': hook_status.get('pid'),
-                    'enabled': True,
-                }
-            )
+    api = get_api()
+    if api is None:
+        return ok(bots=[])
+
+    # API 是四种渠道唯一的账号来源。
+    bots = api.bot_accounts()
     for item in bots:
-        qq = str(item.get('bot_qq') or item.get('qq') or '')
-        item.setdefault('qq', qq)
-        item.setdefault('avatar', _avatar(qq))
+        self_id = str(item.get('self_id') or item.get('bot_qq') or item.get('qq') or '')
+        info = await _login_info(self_id)
+        item['name'] = str(info.get('nickname') or item.get('name') or self_id)
+        item['user_id'] = info.get('user_id') or item.get('user_id') or self_id
+        item['bot_qq'] = self_id
+        item['qq'] = self_id
+        item['avatar'] = _avatar(self_id)
+        item['connected'] = bool(item.get('connected', True))
+        item['enabled'] = item['connected']
     return ok(bots=bots)
 
 

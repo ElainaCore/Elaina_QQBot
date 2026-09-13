@@ -88,7 +88,7 @@ class FrameworkUpdater:
                 version = json.load(f).get('version')
                 if version and version != 'unknown':
                     value = str(version).strip()
-                    # Versions written by the old updater were short Git SHAs;
+                    # 旧更新器写入的是较短的 Git 提交标识。
                     if _version_key(value) or not re.fullmatch(r'[0-9a-fA-F]{7,40}', value):
                         return value
         except Exception:
@@ -96,7 +96,7 @@ class FrameworkUpdater:
         return self._read_project_version() or self._read_git_version() or 'unknown'
 
     def _read_project_version(self):
-        """Read the checked-in semantic version when Git metadata is absent."""
+        """Git 元数据缺失时读取仓库中的语义版本。"""
         try:
             pyproject = self.base_dir / 'pyproject.toml'
             text = pyproject.read_text(encoding='utf-8')
@@ -307,7 +307,7 @@ class FrameworkUpdater:
                     'error': None,
                 }
 
-            # Older installations may point at a repository without Releases.
+            # 旧安装可能指向没有 Releases 的仓库。
             commits = await self._fetch_api('/commits?per_page=10')
             if not commits or not isinstance(commits, list):
                 self._report('idle', '', 0)

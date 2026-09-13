@@ -146,9 +146,20 @@ def event_ordering_key(event: Any) -> str:
 
 
 def event_deduplication_key(event: Any) -> tuple[str, ...] | None:
-    """生成跨渠道去重键；没有稳定消息 id 的事件不去重。"""
+    """生成跨渠道去重键；消息和带 bill_no 的红包通知都去重。"""
 
     post_type = str(getattr(event, 'post_type', '') or '')
+    if post_type == EventKind.NOTICE and str(getattr(event, 'notice_type', '') or '') == 'red_packet':
+        extra = getattr(event, 'extra', {})
+        packet = extra.get('red_packet') if isinstance(extra, dict) else None
+        bill_no = packet.get('bill_no') if isinstance(packet, dict) else ''
+        if not bill_no:
+            return None
+        return (
+            str(getattr(event, 'self_id', '') or ''),
+            'notice.red_packet',
+            str(bill_no),
+        )
     if post_type not in {EventKind.MESSAGE, EventKind.MESSAGE_SENT}:
         return None
     message_id = getattr(event, 'message_id', 0)

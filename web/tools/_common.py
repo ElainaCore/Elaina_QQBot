@@ -30,33 +30,28 @@ def log_service():
 
 
 def connected_ids() -> list:
-    """已连接的 self_id 列表 (即机器人 QQ); 过滤正向连接的临时占位 id"""
+    """返回适配器统一维护的已连接账号标识。"""
     ad = adapter()
     if not ad:
         return []
+    if hasattr(ad, 'connected_self_ids'):
+        return list(ad.connected_self_ids())
+    # 兼容旧版适配器，避免公共工具在热升级期间中断。
     ids = set(ad.local_actions.keys()) | set(ad.websockets.keys()) | set(ad.bots.keys())
-    ids = {i for i in ids if not str(i).startswith('forward:')}
-    return sorted(ids)
+    return sorted(i for i in ids if not str(i).startswith('forward:'))
 
 
 def bot_ids() -> list:
-    """返回已连接账号与内置账号编号，供面板查询使用。"""
-    ids = set(connected_ids())
-    manager = getattr(_app, 'embedded_qq', None)
-    if manager:
-        ids.update(str(bot.uin or bot.bot_id) for bot in manager.bots.values())
-    return sorted(item for item in ids if item)
+    """返回适配器统一维护的账号标识，供面板查询使用。"""
+    return connected_ids()
 
 
 def resolve_bot_qq(value: str = '') -> str:
-    """将内置 QQ 的配置编号解析为实际 QQ，避免查询到错误的日志分库。"""
+    """通过适配器统一解析账号别名到真实 self_id。"""
     requested = str(value or '')
-    manager = getattr(_app, 'embedded_qq', None)
-    if manager:
-        for bot in manager.bots.values():
-            actual = str(bot.uin or bot.bot_id or '')
-            if requested in (str(bot.bot_id or ''), str(bot.uin or '')):
-                return actual
+    ad = adapter()
+    if ad is not None:
+        return str(ad.resolve_self_id(requested) or requested)
     return requested
 
 

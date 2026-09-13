@@ -137,6 +137,17 @@ user_id, group_id, message, raw_message, sender, content
 
 事件类型使用精确名称：`message`、`message_sent`、`notice.<type>`、`request.<type>` 和 `meta_event.<type>`。
 
+所有接入渠道（内置 QQ、QQ 注入、OneBot、QLinux）都从同一个事件入口进入，插件不应按 `source`/`channel` 分支。红包通知统一为 `notice.red_packet`，红包详细数据放在 `event.extra['red_packet']`：
+
+```python
+@handler(r'.*', event_types=['notice.red_packet'])
+async def red_packet(event, match):
+    packet = event.extra.get('red_packet', {})
+    bill_no = packet.get('bill_no')
+```
+
+`event.channel` 仅用于日志和诊断，不影响事件匹配；动作调用仍通过 `event.call_api()`/`get_api()` 自动按 `self_id` 路由。
+
 ## 排错
 
 1. 检查账号是否在线。

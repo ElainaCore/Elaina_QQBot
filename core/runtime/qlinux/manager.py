@@ -74,12 +74,7 @@ class QLinuxManager:
 
     @staticmethod
     def _is_runner_process_error(exc: BaseException) -> bool:
-        """判断异常是否表示 runner 通道失效，而非 runner 返回的业务错误。
-
-        RunnerRPC 将 JSON-RPC 的 ``error`` 字段也包装成 RuntimeError，因此
-        不能对所有 RuntimeError 都重启；例如 ``bot 1 not exists`` 只应作为
-        普通接口失败返回。
-        """
+        """判断异常是否表示 runner 通道失效。"""
         if isinstance(exc, (BrokenPipeError, ConnectionError)):
             return True
         text = str(exc or "").strip().lower()
@@ -251,12 +246,7 @@ class QLinuxManager:
                 self._rpc = None
 
     async def _runner_watchdog(self, rpc: RunnerRPC) -> None:
-        """Periodically probe an otherwise idle runner.
-
-        A dead/unresponsive runner can have no pending RPC, so the normal
-        request-level recovery path would never run.  The watchdog turns an
-        idle EOF/hung process into the same single-flight recovery path.
-        """
+        """定期探测空闲 runner 并触发统一恢复流程。"""
         try:
             while not self._shutting_down and self._rpc is rpc:
                 await asyncio.sleep(30)
@@ -292,9 +282,7 @@ class QLinuxManager:
         uin = str(acc.get('uin') or '').strip()
         adapter = getattr(self._app, 'adapter', None)
         if adapter is not None:
-            # Do not rely on _registered_uins here.  A stale binding can
-            # survive a process crash/reload even when this manager's
-            # bookkeeping set has already been cleared.
+            # 不依赖注册集合，进程崩溃或重载后仍要清理旧绑定。
             if uin:
                 adapter.unregister_local_bot(uin)
             adapter.unregister_identity_alias(bot_id)
@@ -407,7 +395,7 @@ class QLinuxManager:
 
     async def _ingest(self, payload: dict) -> None:
         try:
-            # Keep the same short-lived message lookup that native OneBot
+            # 保留与原生 OneBot 相同的短期消息缓存。
             message_id = payload.get('message_id')
             if message_id not in (None, ''):
                 try:
@@ -666,7 +654,7 @@ class QLinuxManager:
                 try:
                     sequence = int(message_id)
                 except (TypeError, ValueError):
-                    # Accept ids emitted by older QLinux runners too.
+                    # 兼容旧版 QLinux runner 生成的消息编号。
                     sequence = int(str(message_id).rsplit(':', 1)[-1] or 0)
                 cached = self._message_cache.get((str(self._accounts.get(bot_id, {}).get('uin', '')), sequence), {})
                 group_uin = params.get('group_id') or cached.get('group_id')

@@ -310,6 +310,32 @@ class OneBotAPI:
     def supported_actions() -> list[str]:
         return get_supported_actions()
 
+    def connected_self_ids(self) -> list[str]:
+        """返回适配器统一维护的可调用账号。"""
+        if self._adapter is None:
+            return []
+        selector = getattr(self._adapter, 'connected_self_ids', None)
+        if callable(selector):
+            return list(selector())
+        return []
+
+    def select_self_id(self, preferred: str | None = None) -> str:
+        """按统一 OneBot 路由选择账号；多账号时不会随机串线。"""
+        if self._adapter is None:
+            return ''
+        selector = getattr(self._adapter, 'select_self_id', None)
+        if callable(selector):
+            return str(selector(preferred) or '')
+        requested = str(preferred or '').strip()
+        return requested if requested in self.connected_self_ids() else ''
+
+    def bot_accounts(self) -> list[dict[str, Any]]:
+        """返回渠道无关的机器人目录，供 Web 与插件面板使用。"""
+        if self._adapter is None:
+            return []
+        provider = getattr(self._adapter, 'bot_accounts', None)
+        return list(provider()) if callable(provider) else []
+
     def __getattribute__(self, name):
         """让显式 API 封装统一接受 self_id/_self_id。"""
         attr = object.__getattribute__(self, name)

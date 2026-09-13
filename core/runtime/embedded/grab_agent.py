@@ -167,7 +167,7 @@ class GrabAgentSession:
         raise GrabAgentError('等待 agent 响应超时')
 
     def _read_event(self) -> dict | None:
-        # Transient reconnect: the agent's ev-pipe server needs a moment to
+        # 短暂重连时等待 agent 重建命名管道。
         for attempt in range(2):
             ev = self._read_event_once()
             if ev is not None or attempt == 1:
@@ -194,7 +194,7 @@ class GrabAgentSession:
                 return None
             body = (ctypes.c_char * n)()
             got2 = wt.DWORD(0)
-            # body may arrive in chunks; loop until complete
+            # body 可能分块到达，需要循环读取完整内容。
             while got2.value < n:
                 chunk = wt.DWORD(0)
                 dst = ctypes.cast(ctypes.byref(body, got2.value), wt.LPVOID)

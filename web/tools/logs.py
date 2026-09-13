@@ -25,7 +25,7 @@ async def _query_recent(log_type: str, bot_qq: str = '') -> list:
 
 
 def _raw_response(row: dict):
-    """Return the original structured payload when one was persisted."""
+    """返回已持久化的原始结构化数据。"""
     raw_data = row.get('raw_data', '')
     if raw_data not in ('', None):
         if isinstance(raw_data, str):

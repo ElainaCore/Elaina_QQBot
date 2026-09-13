@@ -74,6 +74,74 @@ class OneBotAdapter:
         actual = self.resolve_self_id(self_id)
         return any(self.resolve_self_id(candidate) == actual for candidate in allowed)
 
+    def connected_self_ids(self) -> list[str]:
+        """返回可用于 OneBot 动作的统一账号标识。"""
+        identities = {
+            str(self.resolve_self_id(self_id) or self_id)
+            for registry in (self.local_actions, self.websockets)
+            for self_id in registry
+            if not str(self_id).startswith('forward:')
+        }
+        for key, record in self.bots.items():
+            if str(key).startswith('forward:'):
+                continue
+            value = record.get('self_id') if isinstance(record, dict) else key
+            actual = str(self.resolve_self_id(value) or value or '').strip()
+            if actual:
+                identities.add(actual)
+        identities.update(
+            str(self.resolve_self_id(client.get('self_id')) or client.get('self_id'))
+            for client in self.http_clients.values()
+            if client.get('self_id')
+        )
+        return sorted(item for item in identities if item)
+
+    def select_self_id(self, preferred: str | None = None) -> str:
+        """选择统一 OneBot 动作路由；多账号时拒绝随机串线。"""
+        ids = self.connected_self_ids()
+        requested = str(preferred or '').strip()
+        if requested:
+            resolved = str(self.resolve_self_id(requested) or requested)
+            if resolved in ids:
+                return resolved
+        return ids[0] if len(ids) == 1 else ''
+
+    def bot_accounts(self) -> list[dict[str, Any]]:
+        """返回渠道无关的在线机器人目录，供 Web 和插件面板使用。"""
+        http_ids = {self._canonical(client.get('self_id')) for client in self.http_clients.values()}
+        accounts = []
+        for actual in self.connected_self_ids():
+            record = self._account_record(actual)
+            channel = self.local_channels.get(actual) or str(record.get('channel') or Channel.ONEBOT)
+            connection_type = ('local' if actual in self.local_actions else
+                               'websocket' if actual in self.websockets else
+                               'http' if actual in http_ids else str(record.get('type') or 'onebot'))
+            aliases = sorted(alias for alias, target in self.identity_aliases.items()
+                             if self._canonical(target) == actual and alias != actual)
+            accounts.append({
+                'self_id': actual,
+                'bot_id': aliases[0] if aliases else actual,
+                'bot_qq': actual,
+                'qq': actual,
+                'aliases': aliases,
+                'channel': channel,
+                'connection_type': connection_type,
+                'runtime_mode': channel,
+                'connected': True,
+                'name': str(record.get('name') or actual),
+            })
+        return accounts
+
+    def _canonical(self, value: Any) -> str:
+        return str(self.resolve_self_id(value) or value or '').strip()
+
+    def _account_record(self, self_id: str) -> dict[str, Any]:
+        for key, record in self.bots.items():
+            if str(key).startswith('forward:') or self._canonical(key) != self_id:
+                continue
+            return dict(record)
+        return {}
+
     def unregister_local_bot(self, self_id: str):
         self_id = str(self_id)
         self.local_actions.pop(self_id, None)
@@ -105,31 +173,13 @@ class OneBotAdapter:
 
     def default_self_id(self) -> str | None:
         """仅在所有出站连接属于同一账号时返回默认机器人。"""
-        identities = {
-            str(self.resolve_self_id(self_id) or self_id)
-            for registry in (self.local_actions, self.websockets)
-            for self_id in registry
-        }
-        identities.update(
-            str(self.resolve_self_id(client.get('self_id')) or client.get('self_id'))
-            for client in self.http_clients.values()
-            if client.get('self_id')
-        )
-        return next(iter(identities)) if len(identities) == 1 else None
+        identities = self.connected_self_ids()
+        return identities[0] if len(identities) == 1 else None
 
     def has_ambiguous_routes(self) -> bool:
         """判断未指定账号时是否存在无法安全选择的出站连接。"""
-        identities = {
-            str(self.resolve_self_id(self_id) or self_id)
-            for registry in (self.local_actions, self.websockets)
-            for self_id in registry
-        }
+        identities = set(self.connected_self_ids())
         anonymous_http = sum(1 for client in self.http_clients.values() if not client.get('self_id'))
-        identities.update(
-            str(self.resolve_self_id(client.get('self_id')) or client.get('self_id'))
-            for client in self.http_clients.values()
-            if client.get('self_id')
-        )
         return len(identities) > 1 or anonymous_http > 1 or (anonymous_http and identities)
 
     def expected_ws_token(self, port=None, path=None) -> str:
