@@ -83,17 +83,19 @@ class FrameworkUpdater:
         return list(DEFAULT_SKIP)
 
     def _load_version(self):
+        git_version = self._read_git_version()
+        if git_version:
+            return git_version
         try:
             with open(self.version_file, encoding='utf-8') as f:
                 version = json.load(f).get('version')
                 if version and version != 'unknown':
                     value = str(version).strip()
-                    # 旧更新器写入的是较短的 Git 提交标识。
-                    if _version_key(value) or not re.fullmatch(r'[0-9a-fA-F]{7,40}', value):
+                    if re.fullmatch(r'[0-9a-fA-F]{7,40}', value):
                         return value
         except Exception:
             pass
-        return self._read_project_version() or self._read_git_version() or 'unknown'
+        return 'unknown'
 
     def _read_project_version(self):
         """Git 元数据缺失时读取仓库中的语义版本。"""
@@ -291,6 +293,20 @@ class FrameworkUpdater:
     async def check_for_updates(self):
         try:
             self._report('checking', '正在检查更新...', 0)
+            commits = await self._fetch_api('/commits?per_page=10')
+            if commits and isinstance(commits, list):
+                latest = str(commits[0].get('sha') or '')[:8]
+                if re.fullmatch(r'[0-9a-fA-F]{8}', latest):
+                    current = self.current_version[:8] if re.fullmatch(r'[0-9a-fA-F]{7,40}', self.current_version) else self.current_version
+                    has_update = current != latest or self.current_version == 'unknown'
+                    self._report('idle', '', 0)
+                    return {
+                        'has_update': has_update,
+                        'latest_version': latest,
+                        'current_version': self.current_version,
+                        'changelog': commits[:10],
+                        'error': None,
+                    }
             release = await self._fetch_api('/releases/latest')
             if isinstance(release, dict) and release.get('tag_name'):
                 latest = _display_version(str(release['tag_name']))
@@ -307,24 +323,8 @@ class FrameworkUpdater:
                     'error': None,
                 }
 
-            # 旧安装可能指向没有 Releases 的仓库。
-            commits = await self._fetch_api('/commits?per_page=10')
-            if not commits or not isinstance(commits, list):
-                self._report('idle', '', 0)
-                return {'has_update': False, 'error': '无法获取更新信息'}
-
-            latest = commits[0].get('sha', '')[:8]
-            current = self.current_version[:8] if len(self.current_version) >= 8 else self.current_version
-            has_update = (current != latest and self.current_version != 'unknown') or self.current_version == 'unknown'
-
             self._report('idle', '', 0)
-            return {
-                'has_update': has_update,
-                'latest_version': latest,
-                'current_version': self.current_version,
-                'changelog': commits[:10],
-                'error': None,
-            }
+            return {'has_update': False, 'error': '无法获取更新信息'}
         except Exception as e:
             self._report('idle', '', 0)
             return {'has_update': False, 'error': str(e)}

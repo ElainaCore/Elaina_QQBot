@@ -43,6 +43,9 @@ class QLinuxManager:
         self._registered_uins: set[str] = set()
         self._message_cache: dict[tuple[str, int], dict] = {}
         self._shutting_down = False
+        # 被踢/断线后的自动重登: bot_id -> 重连任务。指数退避防止风控拉黑循环。
+        self._relogin_tasks: dict[str, asyncio.Task] = {}
+        self._relogin_attempts: dict[str, int] = {}
         # Runner 进程可能因协议升级或底层网络异常短暂退出。动作请求
         # 不能把这次瞬时故障直接暴露给对比任务；恢复锁保证并发请求只
         # 重建一次 runner。
@@ -192,10 +195,11 @@ class QLinuxManager:
                     if acc.get('status') in {'online', 'connecting', 'reconnecting', 'resume_pending'}:
                         acc['status'] = 'reconnecting'
                         self._save_accounts()
-                        # 兼容 v1.0.1 runner：login.qr 的实现本身调用
                         self._login_active.add(bot_id)
                         try:
-                            await self._rpc.call('bot.login.qr', {'bot_id': bot_id}, timeout=10)
+                            # 快速重登: 有效票据直接恢复会话, 失效才回退扫码。
+                            # 旧版本这里强制 login.qr, 每次框架重启都要重新扫码。
+                            await self._rpc.call('bot.login.resume', {'bot_id': bot_id}, timeout=10)
                         except Exception:
                             self._login_active.discard(bot_id)
                             raise
@@ -216,6 +220,10 @@ class QLinuxManager:
             if account.get('status') in {'online', 'connecting', 'reconnecting'}
         }
         self._shutting_down = True
+        # 取消所有排程中的自动重登 (关机时不应再拉起登录流程)
+        for task in self._relogin_tasks.values():
+            task.cancel()
+        self._relogin_tasks.clear()
         watchdog = self._watchdog_task
         self._watchdog_task = None
         if watchdog and not watchdog.done():
@@ -362,6 +370,7 @@ class QLinuxManager:
             return
         if etype == 'bot.online':
             self._login_active.discard(bot_id)
+            self._on_relogin_success(bot_id)
             acc = self._accounts.get(bot_id)
             if acc:
                 acc['status'] = 'online'
@@ -377,10 +386,20 @@ class QLinuxManager:
         elif etype == 'bot.offline':
             # Login() 在旧票据失效时会先发出 offline，再自动转入二维码登录。
             acc = self._accounts.get(bot_id)
+            reason = str(event.get('reason') or '')
+            tips = str(event.get('tips') or '')
             if acc and not self._shutting_down:
                 acc['status'] = 'offline'
+                if reason == 'Kicked':
+                    acc['last_error'] = f'被服务器踢下线: {tips or "未提供原因"}'
+                elif reason == 'Disconnected':
+                    acc['last_error'] = '网络连接断开'
                 self._unbind_account(bot_id)
                 self._save_accounts()
+                # 被踢/网络抖动大多非账号本身问题, 自动快速重登恢复。
+                # Logout (主动下线) 不自动重连。
+                if reason in ('Kicked', 'Disconnected'):
+                    self._schedule_relogin(bot_id, reason=reason or '被服务器踢下线')
         elif etype == 'qr.state':
             acc = self._accounts.get(bot_id)
             if acc and event.get('state') in ('Confirmed',):
@@ -508,9 +527,139 @@ class QLinuxManager:
     async def submit_sms(self, bot_id: str, code: str) -> dict:
         return await self._call_runner('bot.submit.sms', {'bot_id': bot_id, 'code': code})
 
+    # ---------- 被踢/断线自动恢复 ----------
+
+    _RELOGIN_MAX_ATTEMPTS = 3
+    _RELOGIN_BASE_DELAY = 8  # 秒, 指数退避基数
+
+    def _schedule_relogin(self, bot_id: str, reason: str = '') -> None:
+        """被踢/断线后先尝试快速重登。
+
+        注意: 服务器踢线时旧票据通常已作废, resume 大概率失败并回退到扫码。
+        这里保留短程重试是因为 Kicked 也可能来自多设备冲突 (票据仍有效)。
+        resume 失败 → _on_relogin_failed() 会自动转扫码并通知 owner。
+        """
+        if self._shutting_down or bot_id in self._relogin_tasks:
+            return
+        attempt = self._relogin_attempts.get(bot_id, 0)
+        if attempt >= self._RELOGIN_MAX_ATTEMPTS:
+            # 快速重登阶段结束 → 直接转扫码 + 通知 owner
+            self._enter_relogin_via_qr(bot_id, reason)
+            return
+        delay = self._RELOGIN_BASE_DELAY * (2 ** attempt)
+        self._relogin_attempts[bot_id] = attempt + 1
+        acc = self._accounts.get(bot_id)
+        if acc:
+            acc['status'] = 'reconnecting'
+            self._save_accounts()
+        task = asyncio.get_running_loop().create_task(
+            self._relogin_later(bot_id, delay), name=f'qlinux-relogin-{bot_id}')
+        self._relogin_tasks[bot_id] = task
+        log.info('QLinux 账号 %s 将在 %ds 后尝试快速重登 (第 %d 次, 原因: %s)', bot_id, delay, attempt + 1, reason or '未知')
+
+    async def _relogin_later(self, bot_id: str, delay: int) -> None:
+        try:
+            await asyncio.sleep(delay)
+            if self._shutting_down:
+                return
+            await self.ensure_started()
+            if bot_id not in self._accounts or bot_id in self._login_active:
+                return
+            self._login_active.add(bot_id)
+            try:
+                await self._call_runner('bot.login.resume', {'bot_id': bot_id}, timeout=15)
+                # resume 已发起: 若票据有效会收到 bot.online (重置计数);
+                # 票据无效 → Lagrange 自动回退扫码, 收到 qr.code → waiting_scan + 通知 owner。
+            except Exception:
+                log.exception('QLinux 账号 %s 快速重登失败', bot_id)
+                self._login_active.discard(bot_id)
+                self._schedule_relogin(bot_id)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._relogin_tasks.pop(bot_id, None)
+
+    def _enter_relogin_via_qr(self, bot_id: str, reason: str = '') -> None:
+        """快速重登无望 → 发起新的扫码登录并主动通知 owner。"""
+        acc = self._accounts.get(bot_id)
+        if acc:
+            acc['status'] = 'waiting_scan'
+            tip = f' ({reason})' if reason else ''
+            acc['last_error'] = f'需要重新扫码登录{tip}'
+            self._save_accounts()
+        log.warning('QLinux 账号 %s 需要重新扫码%s, 已发起新的扫码登录', bot_id, tip)
+        asyncio.get_running_loop().create_task(
+            self._notify_owner_relogin(bot_id, reason), name=f'qlinux-notify-{bot_id}')
+        asyncio.get_running_loop().create_task(
+            self.login_qr(bot_id), name=f'qlinux-autoqr-{bot_id}')
+
+    async def _notify_owner_relogin(self, bot_id: str, reason: str) -> None:
+        """被踢账号自己已下线, 必须借助其他在线账号向 owner 转发提醒。
+
+        路由优先级: 其他 OneBot 在线账号 (内嵌 QQ / 反向 WS / HTTP 接入)。
+        全部不在线时仅记录日志 — 没有可用出口, 面板状态是唯一提示。
+        """
+        try:
+            cfg = self._app.cfg
+            owner_ids = [str(u).strip() for u in (cfg.get('settings', 'owner.ids', []) or []) if str(u).strip()]
+            if not owner_ids:
+                log.info('QLinux %s 需要重新扫码但未配置 owner, 仅记录面板状态', bot_id)
+                return
+            adapter = getattr(self._app, 'adapter', None)
+            if adapter is None:
+                return
+            # 排除被踢账号自身, 找一个还在线的账号做出口
+            candidates = [sid for sid in adapter.connected_self_ids()
+                          if not self._is_qlinux_offline_account(sid)]
+            if not candidates:
+                log.warning('QLinux %s 被踢且无其他在线账号可转发提醒, 请直接看面板', bot_id)
+                return
+            acc = self._accounts.get(bot_id) or {}
+            uin = acc.get('uin') or bot_id
+            text = (
+                f'[QLinux] 账号 {bot_id} (QQ {uin}) 已被服务器踢下线'
+                + (f'：{reason}' if reason else '')
+                + '\n已自动发起新的扫码登录，请打开面板 → 接入中心 → QLinux 协议端 完成扫码。'
+            )
+            for owner in owner_ids:
+                for sender in candidates:
+                    try:
+                        result = await adapter.call_api(
+                            'send_private_msg',
+                            {'user_id': int(owner), 'message': text},
+                            self_id=sender,
+                        )
+                        if result is not None:
+                            log.info('QLinux 被踢提醒已通过账号 %s 发送给 owner %s', sender, owner)
+                            return
+                    except Exception:  # noqa: BLE001
+                        continue
+            log.warning('QLinux 被踢提醒发送失败 (所有出口均不可用)')
+        except Exception:
+            log.exception('QLinux 被踢通知流程异常')
+
+    def _is_qlinux_offline_account(self, self_id: str) -> bool:
+        """判断某 self_id 是否属于 QLinux 渠道且当前不在线 (不可用作通知出口)。"""
+        for bot_id, acc in self._accounts.items():
+            if str(acc.get('uin') or '') == str(self_id) and acc.get('status') != 'online':
+                return True
+            # identity alias (bot_id -> self_id)
+            adapter = getattr(self._app, 'adapter', None)
+            if adapter and adapter.resolve_self_id(bot_id) == str(self_id) and acc.get('status') != 'online':
+                return True
+        return False
+
+    def _on_relogin_success(self, bot_id: str) -> None:
+        self._relogin_attempts.pop(bot_id, None)
+
     async def stop_account(self, bot_id: str) -> dict:
         await self.ensure_started()
         self._rpc_or_raise()
+        # 手动下线: 取消排程中的自动重登, 否则 stop 完又被拉起
+        relogin = self._relogin_tasks.pop(bot_id, None)
+        if relogin and not relogin.done():
+            relogin.cancel()
+        self._relogin_attempts.pop(bot_id, None)
         self._login_active.discard(bot_id)
         login_wait = self._login_waits.pop(bot_id, None)
         if login_wait and not login_wait.done():
