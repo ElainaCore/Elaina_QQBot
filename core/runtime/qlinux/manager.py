@@ -719,6 +719,17 @@ class QLinuxManager:
                     'segments': await self._ob_to_segments(segs)})
                 sequence = int((result or {}).get('sequence', 0) or 0)
                 return action_ok({'message_id': sequence, 'seq': sequence})
+            if action == 'send_packet':
+                cmd = str(params.get('cmd') or '').strip()
+                data = params.get('data')
+                if not cmd or data in (None, ''):
+                    return action_failed('send_packet 缺少 cmd 或 data', 1400)
+                result = await self._call_runner('packet.send', {
+                    'bot_id': bot_id,
+                    'cmd': cmd,
+                    'data': str(data),
+                })
+                return action_ok(result or {})
             if action == 'send_msg':
                 message_type = str(params.get('message_type') or '')
                 if message_type == 'group' or (not message_type and params.get('group_id')):
@@ -810,7 +821,20 @@ class QLinuxManager:
                 result = await self._call_runner('msg.recall', {
                     'bot_id': bot_id, 'group_uin': group_uin, 'sequence': sequence})
                 return action_ok(result or {'message_id': sequence})
-            return action_failed(f'QLinux 暂不支持动作: {action}', 1400)
+            # 将未在此处特化的 OneBot 动作交给 runner 通用分发。
+            # 新版 QLinux runner 可能已支持扩展接口，不能在适配层提前拒绝。
+            try:
+                result = await self._call_runner('action', {
+                    'bot_id': bot_id,
+                    'action': action,
+                    'params': params,
+                })
+            except Exception as exc:
+                log.debug('QLinux runner 未实现动作 %s: %s', action, exc)
+                return action_failed(f'QLinux 暂不支持动作: {action}', 1400)
+            if isinstance(result, dict) and result.get('status') == 'failed':
+                return result
+            return action_ok(result if result is not None else {})
         except Exception as exc:  # noqa: BLE001
             log.warning('QLinux 动作失败: %s (%s)', action, exc)
             return action_failed(str(exc), 1500)
