@@ -198,6 +198,50 @@ def build_group_special_title_packet(group_id: Any, uid: Any, title: Any = '') -
     return PacketRequest('OidbSvcTrpcTcp.0x8FC_2', body, True)
 
 
+def build_inline_keyboard_click_packet(
+    group_id: Any,
+    bot_appid: Any,
+    button_id: Any,
+    callback_data: Any,
+    msg_seq: Any,
+) -> PacketRequest:
+    """构造 QQ 官方机器人内联键盘点击包。
+
+    NapCat/NTQQ 使用 ``OidbSvcTrpcTcp.0x112e_1``，外层字段 4
+    携带 appid、消息序号、按钮 id、回调数据、群号和群聊标记。
+    """
+    try:
+        group = int(str(group_id or '').strip())
+        sequence = int(str(msg_seq or '').strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError('群号或消息序号无效') from exc
+    appid = str(bot_appid or '').strip()
+    button = str(button_id or '1').strip()
+    callback = str(callback_data or '')
+    if group <= 0 or sequence < 0:
+        raise ValueError('群号或消息序号无效')
+    if not appid:
+        raise ValueError('bot_appid 不能为空')
+    if not callback:
+        raise ValueError('callback_data 不能为空')
+    inner = b''.join((
+        _string_field(3, appid),
+        _varint_field(4, sequence),
+        _string_field(5, button),
+        _string_field(6, callback),
+        _varint_field(7, 0),
+        _varint_field(8, group),
+        _varint_field(9, 1),
+    ))
+    body = b''.join((
+        _varint_field(1, 0x112E),
+        _varint_field(2, 1),
+        _bytes_field(4, inner),
+        _varint_field(12, 1),
+    ))
+    return PacketRequest('OidbSvcTrpcTcp.0x112e_1', body, True)
+
+
 def build_poke_packet(params: dict[str, Any] | None) -> PacketRequest:
     params = params if isinstance(params, dict) else {}
     target = str(params.get('target_id') or params.get('user_id') or '').strip()

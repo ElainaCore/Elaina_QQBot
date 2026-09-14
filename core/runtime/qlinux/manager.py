@@ -16,6 +16,7 @@ from core.runtime.qlinux.runner import (
     RunnerRPC,
     runner_event_to_onebot,
 )
+from core.runtime.embedded.packet import build_inline_keyboard_click_packet
 
 log = logging.getLogger('ElainaQQ.qlinux')
 
@@ -730,6 +731,22 @@ class QLinuxManager:
                     'data': str(data),
                 })
                 return action_ok(result or {})
+            if action == 'click_inline_keyboard_button':
+                packet = build_inline_keyboard_click_packet(
+                    params.get('group_id'),
+                    params.get('bot_appid'),
+                    params.get('button_id'),
+                    params.get('callback_data'),
+                    params.get('msg_seq') or params.get('message_seq') or params.get('real_seq'),
+                )
+                result = await self._call_runner('packet.send', {
+                    'bot_id': bot_id,
+                    'cmd': packet.cmd,
+                    'data': packet.data.hex(),
+                })
+                if isinstance(result, dict) and result.get('status') == 'failed':
+                    return result
+                return action_ok(result or {})
             if action == 'send_msg':
                 message_type = str(params.get('message_type') or '')
                 if message_type == 'group' or (not message_type and params.get('group_id')):
@@ -761,6 +778,20 @@ class QLinuxManager:
                 acc = self._accounts.get(bot_id, {})
                 online = acc.get('status') == 'online'
                 return action_ok({'online': online, 'good': online, 'stat': {'packet_received': 0}})
+            if action in {'get_cookies', 'get_credentials'}:
+                result = await self._call_runner('bot.cookies', {
+                    'bot_id': bot_id, 'domain': params.get('domain', 'qun.qq.com')})
+                return action_ok(result or {})
+            if action in {'get_client_key', 'get_credentials_key'}:
+                result = await self._call_runner('bot.client.key', {'bot_id': bot_id})
+                return action_ok(result or {})
+            if action in {'set_online_status', 'set_diy_online_status'}:
+                rpc = {'bot_id': bot_id, 'status': int(params.get('status', 0) or 0)}
+                if action == 'set_diy_online_status':
+                    rpc['face_id'] = int(params.get('face_id', 0) or 0)
+                    rpc['text'] = str(params.get('wording') or params.get('text') or '')
+                result = await self._call_runner('bot.status.set', rpc)
+                return action_ok(result or {})
             if action == 'get_group_list':
                 result = await self._call_runner('bot.group.list', {
                     'bot_id': bot_id, 'no_cache': bool(params.get('no_cache', False))})
@@ -791,6 +822,70 @@ class QLinuxManager:
                 result = await self._call_runner('bot.stranger.info', {
                     'bot_id': bot_id, 'user_uin': int(params.get('user_id', 0))})
                 return action_ok(result)
+            if action in {'get_group_msg_history', 'get_group_message_history'}:
+                result = await self._call_runner('msg.history.group', {
+                    'bot_id': bot_id,
+                    'group_uin': int(params.get('group_id', 0) or 0),
+                    'message_seq': int(params.get('message_seq', 0) or 0),
+                    'count': max(1, int(params.get('count', 20) or 20)),
+                })
+                return action_ok(result or [])
+            if action in {'get_friend_msg_history', 'get_private_msg_history'}:
+                result = await self._call_runner('msg.history.private', {
+                    'bot_id': bot_id,
+                    'user_uin': int(params.get('user_id', 0) or 0),
+                    'message_seq': int(params.get('message_seq', 0) or 0),
+                    'count': max(1, int(params.get('count', 20) or 20)),
+                })
+                return action_ok(result or [])
+            if action in {'get_friend_request_list', 'get_friend_system_msg', 'get_doubt_friends_add_request'}:
+                result = await self._call_runner('bot.friend.request.list', {'bot_id': bot_id})
+                return action_ok(result or [])
+            if action in {'set_group_sign', 'send_group_sign', 'group_clock_in'}:
+                result = await self._call_runner('bot.group.clockin', {
+                    'bot_id': bot_id, 'group_uin': int(params.get('group_id', 0) or 0)})
+                return action_ok(result or {})
+            if action in {'get_group_at_all_remain', 'get_group_at_all_remaining'}:
+                result = await self._call_runner('bot.group.atall', {
+                    'bot_id': bot_id, 'group_uin': int(params.get('group_id', 0) or 0)})
+                return action_ok(result or {})
+            if action in {'set_group_remark', 'set_group_description'}:
+                result = await self._call_runner('bot.group.remark', {
+                    'bot_id': bot_id, 'group_uin': int(params.get('group_id', 0)),
+                    'remark': str(params.get('remark') or params.get('description') or ''),
+                })
+                return action_ok(result or {})
+            if action in {'set_group_todo', 'complete_group_todo', 'cancel_group_todo'}:
+                group_uin = int(params.get('group_id', 0) or 0)
+                if action == 'set_group_todo':
+                    method = 'bot.group.todo.set'
+                    rpc = {'bot_id': bot_id, 'group_uin': group_uin,
+                           'sequence': int(params.get('message_id') or params.get('message_seq') or params.get('sequence') or 0)}
+                elif action == 'complete_group_todo':
+                    method, rpc = 'bot.group.todo.finish', {'bot_id': bot_id, 'group_uin': group_uin}
+                else:
+                    method, rpc = 'bot.group.todo.remove', {'bot_id': bot_id, 'group_uin': group_uin}
+                result = await self._call_runner(method, rpc)
+                return action_ok(result or {})
+            if action in {'get_group_todo', 'get_group_todo_list'}:
+                result = await self._call_runner('bot.group.todo.get', {
+                    'bot_id': bot_id, 'group_uin': int(params.get('group_id', 0) or 0)})
+                return action_ok(result or {})
+            if action in {'set_msg_emoji_like', 'set_group_reaction'}:
+                result = await self._call_runner('bot.group.reaction', {
+                    'bot_id': bot_id, 'group_uin': int(params.get('group_id', 0) or 0),
+                    'sequence': int(params.get('message_id') or params.get('msg_seq') or params.get('message_seq') or 0),
+                    'code': str(params.get('emoji_id') or params.get('code') or ''),
+                    'enable': bool(params.get('set', params.get('enable', True))),
+                })
+                return action_ok(result or {})
+            if action in {'set_friend_pin', 'set_group_pin'}:
+                method = 'bot.friend.pin' if action == 'set_friend_pin' else 'bot.group.pin'
+                key = 'friend_uin' if action == 'set_friend_pin' else 'group_uin'
+                value = int(params.get('user_id' if action == 'set_friend_pin' else 'group_id', 0) or 0)
+                result = await self._call_runner(method, {
+                    'bot_id': bot_id, key: value, 'enable': bool(params.get('enable', True))})
+                return action_ok(result or {})
             if action in {
                 'set_group_kick', 'set_group_ban', 'set_group_whole_ban',
                 'set_group_card', 'set_group_special_title', 'set_group_name',
