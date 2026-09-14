@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import hmac
 import itertools
+import inspect
 import json
 import logging
 import os
@@ -144,6 +145,9 @@ class EmbeddedQQManager:
         self._control_futures: dict[str, tuple[str, asyncio.Future[dict[str, Any]]]] = {}
         self._red_packet_bot_aliases: dict[str, str] = {}
         self._hook_red_packets: dict[str, dict[str, Any]] = {}
+        # 插件级红包监听器：name -> callback(self_id, packet)。
+        # 使用名称注册，便于插件热卸载时幂等移除，避免重复回调。
+        self._red_packet_listeners: dict[str, Any] = {}
         self._grab_agent_sessions: dict[int, Any] = {}
         self._grab_agent_lock = asyncio.Lock()
         self._bridge_runners: dict[str, web.AppRunner] = {}
@@ -1381,6 +1385,7 @@ class EmbeddedQQManager:
             packet.get('group_id') or packet.get('peer_uin'),
             packet.get('sender_name') or packet.get('sender_id'),
         )
+        await self._notify_red_packet_listeners(self_id, packet)
         return await self.app.ingest_event(
             self._red_packet_event(self_id, packet),
             self_id,
@@ -1407,11 +1412,45 @@ class EmbeddedQQManager:
             return
         self._red_packet_bot_aliases[self_id] = self_id
         self._cache_red_packet(packet, grab_source='agent')
+        await self._notify_red_packet_listeners(self_id, packet)
         await self.app.ingest_event(
             self._red_packet_event(self_id, packet),
             self_id,
             source=Channel.INJECTED,
         )
+
+    def register_red_packet_listener(self, name: str, callback: Any) -> None:
+        """注册红包监听器，供插件在加载时订阅原生红包事件。
+
+        ``callback`` 接收 ``(self_id, packet)``，可为同步函数或异步函数。
+        同名注册会覆盖旧回调，保证插件热重载不会产生重复领取。
+        """
+        key = str(name or '').strip()
+        if not key:
+            raise ValueError('红包监听器名称不能为空')
+        if not callable(callback):
+            raise TypeError('红包监听器必须是可调用对象')
+        self._red_packet_listeners[key] = callback
+        log.debug('已注册红包监听器: %s', key)
+
+    def unregister_red_packet_listener(self, name: str) -> None:
+        """注销红包监听器；重复注销按幂等操作处理。"""
+        key = str(name or '').strip()
+        if key:
+            self._red_packet_listeners.pop(key, None)
+            log.debug('已注销红包监听器: %s', key)
+
+    async def _notify_red_packet_listeners(self, self_id: str, packet: dict[str, Any]) -> None:
+        """通知插件监听器；单个插件失败不影响统一 OneBot 事件分发。"""
+        for name, callback in tuple(self._red_packet_listeners.items()):
+            try:
+                result = callback(self_id, dict(packet))
+                if inspect.isawaitable(result):
+                    await result
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - 插件隔离
+                log.exception('红包监听器执行失败: %s', name)
 
     def _cache_red_packet(self, packet: dict[str, Any], *, grab_source: str) -> None:
         bill_no = str(packet.get('bill_no') or '').strip()

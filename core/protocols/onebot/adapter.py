@@ -113,9 +113,17 @@ class OneBotAdapter:
         for actual in self.connected_self_ids():
             record = self._account_record(actual)
             channel = self.local_channels.get(actual) or str(record.get('channel') or Channel.ONEBOT)
-            connection_type = ('local' if actual in self.local_actions else
-                               'websocket' if actual in self.websockets else
-                               'http' if actual in http_ids else str(record.get('type') or 'onebot'))
+            # 本地动作只是传输实现，不能覆盖实际接入渠道。QLinux 账号虽然
+            # 也注册为 local action，但面板必须按 QLinux 处理，否则会被
+            # 误归类到内置 QQ，并将配置入口带到内置 QQ 页面。
+            if channel == Channel.LAGRANGE:
+                connection_type = 'QLinux'
+                runtime_mode = 'QLinux'
+            else:
+                connection_type = ('local' if actual in self.local_actions else
+                                   'websocket' if actual in self.websockets else
+                                   'http' if actual in http_ids else str(record.get('type') or 'onebot'))
+                runtime_mode = channel
             aliases = sorted(alias for alias, target in self.identity_aliases.items()
                              if self._canonical(target) == actual and alias != actual)
             accounts.append({
@@ -126,7 +134,7 @@ class OneBotAdapter:
                 'aliases': aliases,
                 'channel': channel,
                 'connection_type': connection_type,
-                'runtime_mode': channel,
+                'runtime_mode': runtime_mode,
                 'connected': True,
                 'name': str(record.get('name') or actual),
             })
