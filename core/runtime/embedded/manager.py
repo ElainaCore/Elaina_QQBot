@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import hmac
-import itertools
 import inspect
+import itertools
 import json
 import logging
 import os
@@ -19,7 +18,6 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +29,8 @@ from core.foundation.config import cfg
 from core.protocols.onebot.api import get_supported_actions
 from core.protocols.onebot.contract import Channel
 from core.protocols.onebot.protocol import action_failed, action_ok, normalize_action_response
+from core.runtime.embedded.device import device_name, stable_device_guid
+from core.runtime.embedded.models import EmbeddedBot
 from core.runtime.embedded.output_filter import (
     crash_dump_end,
     crash_dump_start,
@@ -73,58 +73,6 @@ from core.runtime.qq.launcher import QQLauncher
 from core.services.files import write_json
 
 log = logging.getLogger('ElainaQQ.embedded_qq')
-
-
-def _stable_device_guid(bot_id: str) -> str:
-    """从 bot_id 派生稳定的 36 位设备 GUID（格式 8-4-4-4-12）。"""
-    digest = hashlib.sha256(f'elainaqq-device:{bot_id}'.encode()).hexdigest()
-    raw = digest[:32]
-    return f'{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}'
-
-
-def _device_name(bot_id: str) -> str:
-    """每个账号一个独立设备名，避免多账号共享同一主机指纹。"""
-    host = os.uname().nodename if hasattr(os, 'uname') else (os.environ.get('COMPUTERNAME') or 'elainaqq')
-    safe_id = re.sub(r'[^A-Za-z0-9._-]', '_', bot_id).strip('._') or 'account'
-    return f'{host[:48]}-{safe_id}'
-
-
-@dataclass
-class EmbeddedBot:
-    bot_id: str
-    bridge_port: int = 0
-    bridge_token: str = field(default_factory=lambda: secrets.token_urlsafe(32), repr=False)
-    qq_version_key: str = ''
-    qq_path: str = ''
-    uin: str = ''
-    nickname: str = ''
-    force_quick_login: bool = False
-    enabled: bool = True
-    status: str = 'offline'
-    qr_code: str = ''
-    qr_url: str = ''
-    error: str = ''
-    created_at: float = field(default_factory=time.time)
-    last_seen: float = 0.0
-    process: asyncio.subprocess.Process | None = field(default=None, repr=False)
-    output_task: asyncio.Task | None = field(default=None, repr=False)
-    reclaim_task: asyncio.Task | None = field(default=None, repr=False)
-    launch_mode: str = field(default='', repr=False)
-
-    def persisted(self) -> dict[str, Any]:
-        return {
-            'bot_id': self.bot_id,
-            'bridge_port': self.bridge_port,
-            'bridge_token': self.bridge_token,
-            'qq_version_key': self.qq_version_key,
-            'qq_path': self.qq_path,
-            'uin': self.uin,
-            'nickname': self.nickname,
-            'force_quick_login': self.force_quick_login,
-            'enabled': self.enabled,
-            'created_at': self.created_at,
-            'last_seen': self.last_seen,
-        }
 
 
 class EmbeddedQQManager:
@@ -616,8 +564,8 @@ class EmbeddedQQManager:
                 'ELAINAQQ_ONEBOT_ACTIONS': json.dumps(get_supported_actions(), ensure_ascii=True),
                 'HOME': str(data_dir),
                 'ELAINAQQ_HEADLESS': '1' if self.headless else '0',
-                'ELAINAQQ_DEVICE_GUID': _stable_device_guid(bot.bot_id),
-                'ELAINAQQ_DEVICE_NAME': _device_name(bot.bot_id),
+                'ELAINAQQ_DEVICE_GUID': stable_device_guid(bot.bot_id),
+                'ELAINAQQ_DEVICE_NAME': device_name(bot.bot_id),
                 'ELAINAQQ_WINDOWS_HOOK_LAUNCH': (
                     '1' if os.name == 'nt'
                     and bool(cfg.get('settings', 'embedded_qq.windows_hook_launch', False))

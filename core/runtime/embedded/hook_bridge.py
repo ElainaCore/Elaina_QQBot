@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from core.protocols.onebot.cache import MessageCache
+from core.protocols.onebot.identity import hash_message_id, normalize_message_identity
 from core.runtime.embedded import hook_msgpush as msgpush
 from core.runtime.embedded import hook_send as sendpb
 from core.runtime.embedded.hook_pipe import (
@@ -58,13 +59,6 @@ EVENT_DISPATCHER = Callable[[dict], Awaitable[None]]
 DISCONNECT_HANDLER = Callable[[], Awaitable[None] | None]
 
 
-def hash_message_id(sequence: int, session_id: int, event_name: str) -> int:
-    """与 SnowLuma hashMessageIdInt32 完全一致的 int32 消息 ID。"""
-    key = f'{int(sequence)}:{int(session_id)}:{event_name}'.encode()
-    id_ = int.from_bytes(hashlib.sha1(key, usedforsecurity=False).digest()[:4], 'big', signed=True)
-    return id_ or 1
-
-
 @dataclass(slots=True)
 class HookStatus:
     pid: int = 0
@@ -107,7 +101,7 @@ class HookBridge:
         self.forward_self_messages = True  # 是否接收自身消息回显（embedded_qq.self_message_enabled）
         self._closed = False
         self._disconnect_notified = False
-        self._snapshot: dict[int, dict[str, Any]] = {}
+        self._snapshot = MessageCache(limit=512)
 
     # -- 生命周期 -----------------------------------------------------------
 
@@ -493,18 +487,31 @@ class HookBridge:
     # -- 请求缓存（供 get_msg / 回复目标）-----------------------------------
 
     def _remember(self, ctx: msgpush.MsgContext, payload: dict[str, Any]) -> None:
-        self._snapshot[abs(payload.get('message_id', 0))] = {
+        message_id = int(payload.get('message_id') or 0)
+        sequence = int(ctx.sequence or payload.get('message_seq') or payload.get('real_seq') or 0)
+        scope = str(payload.get('self_id') or ctx.self_uin or self.status.uin or '')
+        entry = normalize_message_identity(dict(payload), scope)
+        entry.update({
+            'message_id': message_id,
+            'message_seq': sequence,
+            'real_id': int(payload.get('real_id') or message_id),
+            'real_seq': sequence,
             'sequence': ctx.sequence,
             'nt_msg_seq': ctx.nt_msg_seq,
             'peer': ctx.peer_uin if ctx.msg_type != PKG_GROUP_MESSAGE else ctx.group_uin,
+            'group_id': ctx.group_uin if ctx.msg_type == PKG_GROUP_MESSAGE else None,
+            'user_id': payload.get('user_id'),
+            'message_type': payload.get('message_type'),
+            'message': payload.get('message', []),
+            'raw_message': payload.get('raw_message', ''),
+            'sender': payload.get('sender', {}),
             'is_group': ctx.msg_type == PKG_GROUP_MESSAGE,
             'time': payload.get('time', 0),
-        }
-        while len(self._snapshot) > 512:
-            self._snapshot.pop(next(iter(self._snapshot)))
+        })
+        self._snapshot.put(entry, scope)
 
     def lookup_message(self, message_id: int) -> dict[str, Any] | None:
-        return self._snapshot.get(abs(message_id))
+        return self._snapshot.get(message_id, str(self.status.uin or ''))
 
     # -- 发送侧（对照 SnowLuma MessageApi）------------------------------------
 
@@ -627,7 +634,7 @@ class HookBridge:
                 meta = self.lookup_message(message_id)
                 if not meta:
                     return None
-                return {'message_id': message_id, **meta}
+                return dict(meta)
             if action == 'send_packet':
                 # 通用 packet 透传：cmd + hex body → op=2 → 返回 hex 响应。
                 cmd = str(params.get('cmd') or '')

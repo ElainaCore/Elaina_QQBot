@@ -9,14 +9,23 @@ import logging
 import time
 from pathlib import Path
 
-from core.protocols.onebot.message import normalize_message
+from core.protocols.onebot.cache import MessageCache
+from core.protocols.onebot.event import normalize_event
+from core.protocols.onebot.identity import (
+    message_id as build_message_id,
+)
+from core.protocols.onebot.identity import (
+    normalize_message_identity,
+)
 from core.protocols.onebot.protocol import action_failed, action_ok
+from core.runtime.embedded.packet import build_inline_keyboard_click_packet
+from core.runtime.qlinux.actions import admin_action
+from core.runtime.qlinux.message_codec import to_segments
 from core.runtime.qlinux.runner import (
     RunnerDownloader,
     RunnerRPC,
     runner_event_to_onebot,
 )
-from core.runtime.embedded.packet import build_inline_keyboard_click_packet
 
 log = logging.getLogger('ElainaQQ.qlinux')
 
@@ -42,7 +51,7 @@ class QLinuxManager:
         # Lagrange 的 Login() 不是可重入操作。启动恢复和面板点击扫码可能
         self._login_active: set[str] = set()
         self._registered_uins: set[str] = set()
-        self._message_cache: dict[tuple[str, int], dict] = {}
+        self._message_cache = MessageCache()
         self._shutting_down = False
         # 被踢/断线后的自动重登: bot_id -> 重连任务。指数退避防止风控拉黑循环。
         self._relogin_tasks: dict[str, asyncio.Task] = {}
@@ -415,17 +424,17 @@ class QLinuxManager:
 
     async def _ingest(self, payload: dict) -> None:
         try:
+            payload = normalize_event(payload, str(payload.get('self_id') or '')) or dict(payload)
+            payload = normalize_message_identity(payload, str(payload.get('self_id') or ''))
+            sequence = int(payload.get('real_seq') or payload.get('message_seq') or payload.get('message_id') or 0)
+            payload.setdefault('sequence', sequence)
+            payload.setdefault('nt_msg_seq', 0)
+            payload.setdefault('peer', payload.get('group_id') or payload.get('user_id'))
+            payload.setdefault('is_group', payload.get('message_type') == 'group')
             # 保留与原生 OneBot 相同的短期消息缓存。
             message_id = payload.get('message_id')
             if message_id not in (None, ''):
-                try:
-                    key = (str(payload.get('self_id') or ''), int(message_id))
-                except (TypeError, ValueError):
-                    key = None
-                if key:
-                    self._message_cache[key] = dict(payload)
-                    while len(self._message_cache) > 2000:
-                        self._message_cache.pop(next(iter(self._message_cache)))
+                self._message_cache.put(payload, str(payload.get('self_id') or ''))
             from core.protocols.onebot.contract import Channel
 
             accepted = await self._app.ingest_event(
@@ -719,7 +728,15 @@ class QLinuxManager:
                     'bot_id': bot_id, target_key: int(params.get(param_key, 0)),
                     'segments': await self._ob_to_segments(segs)})
                 sequence = int((result or {}).get('sequence', 0) or 0)
-                return action_ok({'message_id': sequence, 'seq': sequence})
+                target_id = int(params.get(param_key, 0) or 0)
+                uin = int(self._accounts.get(bot_id, {}).get('uin', 0) or 0)
+                message_id = build_message_id(
+                    sequence,
+                    group_id=target_id if action == 'send_group_msg' else None,
+                    peer_id=target_id,
+                    self_id=uin,
+                )
+                return action_ok({'message_id': message_id, 'seq': sequence})
             if action == 'send_packet':
                 cmd = str(params.get('cmd') or '').strip()
                 data = params.get('data')
@@ -791,7 +808,15 @@ class QLinuxManager:
                     rpc_params['friend_uin'] = int(params.get('user_id', 0))
                 result = await self._call_runner('msg.send.forward', rpc_params)
                 sequence = int((result or {}).get('sequence', 0) or 0)
-                return action_ok({'message_id': sequence, 'seq': sequence})
+                target_id = int((params.get('group_id') if is_group else params.get('user_id')) or 0)
+                uin = int(self._accounts.get(bot_id, {}).get('uin', 0) or 0)
+                message_id = build_message_id(
+                    sequence,
+                    group_id=target_id if is_group else None,
+                    peer_id=target_id,
+                    self_id=uin,
+                )
+                return action_ok({'message_id': message_id, 'seq': sequence})
             if action == 'get_login_info':
                 result = await self._call_runner('bot.info', {'bot_id': bot_id})
                 acc = self._accounts.get(bot_id, {})
@@ -885,7 +910,7 @@ class QLinuxManager:
                 if action == 'set_group_todo':
                     method = 'bot.group.todo.set'
                     rpc = {'bot_id': bot_id, 'group_uin': group_uin,
-                           'sequence': int(params.get('message_id') or params.get('message_seq') or params.get('sequence') or 0)}
+                           'sequence': self._message_sequence(bot_id, params)}
                 elif action == 'complete_group_todo':
                     method, rpc = 'bot.group.todo.finish', {'bot_id': bot_id, 'group_uin': group_uin}
                 else:
@@ -899,7 +924,7 @@ class QLinuxManager:
             if action in {'set_msg_emoji_like', 'set_group_reaction'}:
                 result = await self._call_runner('bot.group.reaction', {
                     'bot_id': bot_id, 'group_uin': int(params.get('group_id', 0) or 0),
-                    'sequence': int(params.get('message_id') or params.get('msg_seq') or params.get('message_seq') or 0),
+                    'sequence': self._message_sequence(bot_id, params),
                     'code': str(params.get('emoji_id') or params.get('code') or ''),
                     'enable': bool(params.get('set', params.get('enable', True))),
                 })
@@ -927,16 +952,13 @@ class QLinuxManager:
                     message_id = int(params.get('message_id', 0))
                 except (TypeError, ValueError):
                     message_id = 0
-                cached = self._message_cache.get((str(self._accounts.get(bot_id, {}).get('uin', '')), message_id))
+                uin = str(self._accounts.get(bot_id, {}).get('uin', ''))
+                cached = self._message_cache.get(message_id, uin)
                 return action_ok(cached) if cached else action_failed('消息不存在', 1404)
             if action == 'delete_msg':
-                message_id = params.get('message_id', 0)
-                try:
-                    sequence = int(message_id)
-                except (TypeError, ValueError):
-                    # 兼容旧版 QLinux runner 生成的消息编号。
-                    sequence = int(str(message_id).rsplit(':', 1)[-1] or 0)
-                cached = self._message_cache.get((str(self._accounts.get(bot_id, {}).get('uin', '')), sequence), {})
+                scope = str(self._accounts.get(bot_id, {}).get('uin', ''))
+                sequence = self._message_sequence(bot_id, params)
+                cached = self._message_cache.get(sequence, scope) or {}
                 group_uin = params.get('group_id') or cached.get('group_id')
                 result = await self._call_runner('msg.recall', {
                     'bot_id': bot_id, 'group_uin': group_uin, 'sequence': sequence})
@@ -961,139 +983,24 @@ class QLinuxManager:
 
     @staticmethod
     def _qlinux_admin_action(action: str, params: dict) -> tuple[str, dict]:
-        """Translate common OneBot group actions to runner operations."""
-        if action == 'set_group_kick':
-            return 'bot.group.kick', {
-                'group_uin': int(params.get('group_id', 0)),
-                'member_uin': int(params.get('user_id', 0)),
-                'reject_add': bool(params.get('reject_add_request', False)),
-                'reason': str(params.get('reason') or ''),
-            }
-        if action == 'set_group_ban':
-            return 'bot.group.ban', {
-                'group_uin': int(params.get('group_id', 0)),
-                'member_uin': int(params.get('user_id', 0)),
-                'duration': max(0, int(params.get('duration', 1800))),
-            }
-        if action == 'set_group_whole_ban':
-            return 'bot.group.whole_ban', {
-                'group_uin': int(params.get('group_id', 0)),
-                'enable': bool(params.get('enable', True)),
-            }
-        if action == 'set_group_card':
-            return 'bot.group.card', {
-                'group_uin': int(params.get('group_id', 0)),
-                'member_uin': int(params.get('user_id', 0)),
-                'card': str(params.get('card') or ''),
-            }
-        if action == 'set_group_special_title':
-            return 'bot.group.special_title', {
-                'group_uin': int(params.get('group_id', 0)),
-                'member_uin': int(params.get('user_id', 0)),
-                'title': str(params.get('special_title') or ''),
-            }
-        if action == 'set_group_name':
-            return 'bot.group.name', {
-                'group_uin': int(params.get('group_id', 0)),
-                'name': str(params.get('group_name') or ''),
-            }
-        if action == 'set_group_leave':
-            return 'bot.group.leave', {'group_uin': int(params.get('group_id', 0))}
-        if action == 'group_poke':
-            return 'bot.group.poke', {
-                'group_uin': int(params.get('group_id', 0)),
-                'member_uin': int(params.get('user_id', 0)),
-            }
-        if action == 'friend_poke':
-            return 'bot.friend.poke', {'user_uin': int(params.get('user_id', 0))}
-        raise ValueError(f'QLinux 暂不支持动作: {action}')
+        return admin_action(action, params)
+
+    def _message_sequence(self, bot_id: str, params: dict) -> int:
+        """解析消息 ID 对应的原始序号。"""
+        requested = params.get('message_seq') or params.get('real_seq') or params.get('message_id') or params.get('sequence') or 0
+        try:
+            requested_id = int(requested)
+        except (TypeError, ValueError):
+            requested_id = int(str(requested).rsplit(':', 1)[-1] or 0)
+        scope = str(self._accounts.get(bot_id, {}).get('uin', ''))
+        cached = self._message_cache.get(requested_id, scope) or {}
+        return int(cached.get('real_seq') or cached.get('message_seq') or cached.get('sequence') or requested_id or 0)
 
     @staticmethod
     async def _ob_to_segments(message) -> list[dict]:
-        """OneBot v11 消息段 → runner segments。"""
-        out: list[dict] = []
-        for seg in normalize_message(message):
-            t = seg.get('type')
-            d = seg.get('data', {}) or {}
-            if t == 'text':
-                out.append({'type': 'text', 'data': d.get('text', '')})
-            elif t == 'at':
-                qq = str(d.get('qq', ''))
-                out.append({'type': 'at_all'} if qq == 'all' else {'type': 'at', 'qq': int(qq or 0)})
-            elif t == 'image':
-                # 支持 base64 直传或 URL (URL 拉取转 base64)
-                b64 = d.get('file', '')
-                if b64.startswith('base64://'):
-                    b64 = b64[len('base64://'):]
-                elif b64.startswith('http'):
-                    b64 = await asyncio.to_thread(_fetch_b64_sync, b64)
-                out.append({'type': 'image', 'data_base64': b64})
-            elif t == 'json':
-                out.append({'type': 'json', 'data': d.get('data', '')})
-            elif t in {'record', 'video', 'file', 'markdown', 'xml'}:
-                out.append({'type': t, 'data': dict(d)})
-            elif t == 'reply':
-                out.append({'type': 'reply', 'id': str(d.get('id') or d.get('seq') or '')})
-            else:
-                # runner 扩展段以统一 data 对象透传，不让新消息类型只在
-                out.append({'type': str(t or 'unknown'), 'data': dict(d)})
-        return out
+        return await to_segments(message)
 
     # ---------- runner 侧 bot 创建 ----------
 
     async def _create_bot_on_runner(self, bot_id: str) -> None:
         await self._call_runner('bot.create', {'bot_id': bot_id}, timeout=30)
-
-
-def _fetch_b64_sync(url: str) -> str:
-    """在线程池中执行的图片 URL → base64 下载。"""
-    import base64 as _b64
-    import ipaddress
-    import socket
-    import urllib.request
-    from urllib.parse import urlsplit
-
-    max_size = 16 * 1024 * 1024
-    parsed = urlsplit(str(url or ''))
-    if parsed.scheme not in {'http', 'https'} or not parsed.hostname:
-        raise ValueError('图片 URL 必须使用 HTTP 或 HTTPS')
-    try:
-        addresses = {
-            item[4][0]
-            for item in socket.getaddrinfo(
-                parsed.hostname,
-                parsed.port or (443 if parsed.scheme == 'https' else 80),
-                type=socket.SOCK_STREAM,
-            )
-        }
-    except OSError as exc:
-        raise ValueError('图片地址无法解析') from exc
-    for address in addresses:
-        try:
-            ip = ipaddress.ip_address(address)
-        except ValueError as exc:
-            raise ValueError('图片地址解析结果无效') from exc
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
-            raise ValueError('图片地址不允许访问内网或本机地址')
-
-    class _NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, req, fp, code, msg, headers, newurl):
-            raise ValueError('图片地址不允许重定向')
-
-    req = urllib.request.Request(url, headers={'User-Agent': 'ElainaQQ/QLinux'})
-    opener = urllib.request.build_opener(_NoRedirect)
-    with opener.open(req, timeout=15) as response:  # nosec B310
-        declared = int(response.headers.get('Content-Length') or 0)
-        if declared > max_size:
-            raise ValueError('图片超过 16 MB 限制')
-        chunks = []
-        size = 0
-        while True:
-            chunk = response.read(256 * 1024)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > max_size:
-                raise ValueError('图片超过 16 MB 限制')
-            chunks.append(chunk)
-        return _b64.b64encode(b''.join(chunks)).decode()

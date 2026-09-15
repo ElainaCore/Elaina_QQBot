@@ -21,6 +21,12 @@ import aiohttp
 from core.foundation.archives import safe_extract_tar, safe_extractall
 from core.protocols.onebot.contract import normalize_role
 from core.protocols.onebot.event import normalize_event
+from core.protocols.onebot.identity import (
+    message_id as build_message_id,
+)
+from core.protocols.onebot.identity import (
+    normalize_message_identity,
+)
 from core.protocols.onebot.message import normalize_message
 
 log = logging.getLogger('ElainaQQ.qlinux')
@@ -407,16 +413,9 @@ def _entities_to_ob(data: dict) -> list[dict]:
     return out
 
 
-def _ob_message_id(bot_id: str, sequence: int, group: bool) -> int:
-    """返回规范的 OneBot v11 消息编号。"""
-    del bot_id, group
-    return int(sequence or 0)
-
-
 def _normalize_onebot_payload(payload: dict, fallback_uin: str, bot_id: str) -> dict:
     """保持 runner 转发事件与原生事件一致。"""
-    payload = dict(payload)
-    payload.setdefault('self_id', str(fallback_uin or bot_id))
+    payload = normalize_message_identity(dict(payload), str(fallback_uin or bot_id))
     normalized = normalize_event(payload, str(fallback_uin or bot_id))
     return normalized or payload
 
@@ -455,8 +454,15 @@ def runner_event_to_onebot(event: dict) -> dict | None:
         group_id = contact.get('group_uin')
         is_group = group_id not in (None, '')
         sequence = int(d.get('sequence', 0) or 0)
-        message_id = _ob_message_id(bot_id, sequence, is_group)
         sender_uin = int(contact.get('uin', 0) or 0)
+        peer_uin = int(group_id or contact.get('uin', 0) or 0)
+        message_id = build_message_id(
+            sequence,
+            group_id=int(group_id) if is_group else None,
+            peer_id=peer_uin,
+            self_id=int(uin or 0) if str(uin).isdigit() else 0,
+            nt_msg_seq=int(d.get('nt_msg_seq', 0) or 0),
+        )
         role = normalize_role(contact.get('permission')) if is_group else 'member'
         payload = {
             'time': int(d.get('time') or _msg_time()),

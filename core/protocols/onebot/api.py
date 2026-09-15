@@ -1,14 +1,25 @@
 """OneBot v11 API 调用封装 (含常见扩展动作; 未封装的动作可直接用 call_api)"""
 
 import asyncio
-import contextvars
 import json
 import logging
 import uuid
-from contextlib import contextmanager
-from dataclasses import dataclass, field
 from typing import Any
 
+from core.protocols.onebot.context import (
+    ApiCallRequest,
+    api_call_source,  # noqa: F401
+    api_interceptors,
+    bypass_api_interceptors,  # noqa: F401
+    current_self_id,
+    current_source,
+    get_adapter,
+    interceptors_bypassed,
+    routed_self_id,
+    set_adapter,  # noqa: F401
+    set_api_interceptors,  # noqa: F401
+    set_main_loop,  # noqa: F401
+)
 from core.protocols.onebot.inline_keyboard import (
     GROUP_MESSAGE_COMMAND,
     build_group_message_request,
@@ -215,95 +226,11 @@ def get_supported_actions() -> list[str]:
     return sorted(SUPPORTED_ACTIONS)
 
 
-_main_loop = None
-_adapter_ref = None
-_routed_self_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    'onebot_self_id',
-    default=None,
-)
-_api_source: contextvars.ContextVar[tuple[str, dict[str, Any]]] = contextvars.ContextVar(
-    'onebot_api_source',
-    default=('', {}),
-)
-_skip_api_interceptors: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    'skip_onebot_api_interceptors',
-    default=False,
-)
-_api_interceptors: tuple[dict, ...] = ()
-
-
-@dataclass(slots=True)
-class ApiCallRequest:
-    """传给插件出站 API 中间件的可变调用对象。"""
-
-    action: str
-    params: dict
-    self_id: str | None
-    source_plugin: str = ''
-    context: dict[str, Any] = field(default_factory=dict)
-    local: bool = False
-
-
-def set_api_interceptors(interceptors) -> None:
-    """由插件管理器发布当前已启用的出站 API 中间件快照。"""
-    global _api_interceptors
-    _api_interceptors = tuple(interceptors or ())
-
-
-@contextmanager
-def api_call_source(plugin_name: str, event=None):
-    """记录当前处理器发起 API 调用时的插件和事件上下文。"""
-    context = {}
-    if event is not None:
-        for key in ('self_id', 'user_id', 'group_id', 'message_type', 'post_type'):
-            value = getattr(event, key, None)
-            if value is not None:
-                context[key] = value
-    token = _api_source.set((str(plugin_name or ''), context))
-    try:
-        yield
-    finally:
-        _api_source.reset(token)
-
-
-@contextmanager
-def bypass_api_interceptors():
-    """让插件执行不再进入出站中间件的原始 OneBot 调用。"""
-    token = _skip_api_interceptors.set(True)
-    try:
-        yield
-    finally:
-        _skip_api_interceptors.reset(token)
-
-
-@contextmanager
-def routed_self_id(self_id: str | None):
-    """为当前事件及其异步处理链固定 API 目标账号。"""
-    if self_id is None:
-        yield
-        return
-    token = _routed_self_id.set(str(self_id))
-    try:
-        yield
-    finally:
-        _routed_self_id.reset(token)
-
-
-def set_main_loop(loop):
-    global _main_loop
-    _main_loop = loop
-
-
-def set_adapter(adapter):
-    global _adapter_ref
-    _adapter_ref = adapter
-
-
 class OneBotAPI:
     """OneBot v11 API (内置常见扩展动作封装)"""
 
     def __init__(self, adapter=None):
-        self._adapter = adapter or _adapter_ref
+        self._adapter = adapter or get_adapter()
         self._routed_methods = {}
 
     @staticmethod
@@ -349,11 +276,8 @@ class OneBotAPI:
             self_id = kwargs.pop('self_id', kwargs.pop('_self_id', None))
             if self_id is None:
                 return await attr(*args, **kwargs)
-            token = _routed_self_id.set(str(self_id))
-            try:
+            with routed_self_id(str(self_id)):
                 return await attr(*args, **kwargs)
-            finally:
-                _routed_self_id.reset(token)
 
         cache[name] = routed
         return routed
@@ -370,7 +294,7 @@ class OneBotAPI:
         if route_id is None:
             route_id = params.pop('self_id', None)
         if self_id is None:
-            self_id = route_id if route_id is not None else _routed_self_id.get()
+            self_id = route_id if route_id is not None else current_self_id()
         if not self._adapter:
             return action_failed('OneBot 适配器未初始化', 1500)
         if self_id is None and self._adapter.has_ambiguous_routes():
@@ -378,7 +302,7 @@ class OneBotAPI:
         self_id = self._adapter.default_self_id() if self_id is None else self._adapter.resolve_self_id(self_id)
 
         action, params = normalize_action_request(action, params)
-        source_plugin, source_context = _api_source.get()
+        source_plugin, source_context = current_source()
         local_actions = getattr(self._adapter, 'local_actions', {})
         request = ApiCallRequest(
             action=action,
@@ -388,17 +312,18 @@ class OneBotAPI:
             context=dict(source_context),
             local=(str(self_id) in local_actions if self_id is not None else bool(local_actions)),
         )
-        if _api_interceptors and not _skip_api_interceptors.get():
+        if api_interceptors() and not interceptors_bypassed():
             result = await self._run_api_interceptors(request, 0)
         else:
             result = await self._call_transport(request)
         return normalize_action_response(result, action=action)
 
     async def _run_api_interceptors(self, request: ApiCallRequest, index: int):
-        if index >= len(_api_interceptors):
+        interceptors = api_interceptors()
+        if index >= len(interceptors):
             return await self._call_transport(request)
 
-        interceptor = _api_interceptors[index]
+        interceptor = interceptors[index]
         allowed = interceptor.get('_allowed_bots')
         if not self._adapter.allows_self_id(allowed, str(request.self_id or '')):
             return await self._run_api_interceptors(request, index + 1)
@@ -776,4 +701,4 @@ class OneBotAPI:
 
 
 def get_api() -> OneBotAPI:
-    return OneBotAPI(_adapter_ref)
+    return OneBotAPI(get_adapter())

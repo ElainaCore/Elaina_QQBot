@@ -22,6 +22,9 @@ from core.runtime.qq.archive import run_cpio_listing as _run_cpio_listing
 from core.runtime.qq.archive import validate_archive_listing as _validate_archive_listing
 from core.runtime.qq.archive import validate_deb_archive as _validate_deb_archive
 from core.runtime.qq.catalog import QQ_VERSIONS
+from core.runtime.qq.install_utils import is_root as _is_root
+from core.runtime.qq.install_utils import run_command as _run_command
+from core.runtime.qq.install_utils import write_download_chunk as _write_download_chunk
 from core.services.files import write_json
 
 log = logging.getLogger('ElainaQQ.qq_manager')
@@ -34,23 +37,6 @@ class QQDownloadError(RuntimeError):
         self.version_key = version_key
         self.failures = failures
         super().__init__('QQ 安装包下载失败，请稍后重试')
-
-
-def _is_root() -> bool:
-    return os.name != 'nt' and hasattr(os, 'geteuid') and os.geteuid() == 0
-
-
-def _run_command(command: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
-    log.info('正在执行 QQ 安装操作')
-    result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=timeout)
-    if result.returncode:
-        raise RuntimeError(f'QQ 安装操作失败（退出码 {result.returncode}）')
-    return result
-
-
-def _write_download_chunk(path: Path, content: bytes, append: bool) -> None:
-    with path.open('ab' if append else 'wb') as output:
-        output.write(content)
 
 
 class QQManager:
