@@ -109,7 +109,11 @@ def _button_id(fields: list[tuple[int, int, Any]]) -> str:
     return ''
 
 
-def _find_button(data: bytes, depth: int = 0) -> tuple[str, str] | None:
+def _find_button(
+    data: bytes,
+    depth: int = 0,
+    inherited_button_id: str = '',
+) -> tuple[str, str] | None:
     if depth > 32 or not data:
         return None
     try:
@@ -118,6 +122,11 @@ def _find_button(data: bytes, depth: int = 0) -> tuple[str, str] | None:
         return None
 
     local_button_id = _button_id(fields)
+    # ButtonExtra 的结构是 Button(id=1, action=3)，而 callback_data 位于
+    # action.data 的更深层字段。递归时携带最近一层的字符串 id，避免
+    # 进入 action 后把 type(=1/2) 误当成按钮 id。
+    if not local_button_id or (local_button_id.isdigit() and inherited_button_id):
+        local_button_id = inherited_button_id
     for _tag, wire_type, value in fields:
         if wire_type != 2:
             continue
@@ -128,7 +137,7 @@ def _find_button(data: bytes, depth: int = 0) -> tuple[str, str] | None:
     for _tag, wire_type, value in fields:
         if wire_type != 2:
             continue
-        found = _find_button(value, depth + 1)
+        found = _find_button(value, depth + 1, local_button_id)
         if found:
             button_id, callback_data = found
             return button_id or local_button_id, callback_data

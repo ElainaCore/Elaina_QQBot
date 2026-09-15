@@ -725,11 +725,25 @@ class QLinuxManager:
                 data = params.get('data')
                 if not cmd or data in (None, ''):
                     return action_failed('send_packet 缺少 cmd 或 data', 1400)
-                result = await self._call_runner('packet.send', {
+                packet_params = {
                     'bot_id': bot_id,
                     'cmd': cmd,
                     'data': str(data),
-                })
+                }
+                try:
+                    result = await self._call_runner('packet.send', packet_params)
+                except RuntimeError as exc:
+                    # 旧版 runner 没有 packet.send。升级 runner 文件后，
+                    # 已运行的子进程仍会继续使用旧程序集；自动重启一次，
+                    # 让原始 PB 读取和后续按钮点击立即切换到新实现。
+                    if 'unknown method: packet.send' not in str(exc).lower():
+                        raise
+                    stale_rpc = self._rpc
+                    if stale_rpc is None:
+                        raise
+                    log.warning('检测到旧版 QLinux runner，重启以启用 packet.send')
+                    await self._recover_runner(stale_rpc)
+                    result = await self._call_runner('packet.send', packet_params)
                 return action_ok(result or {})
             if action == 'click_inline_keyboard_button':
                 packet = build_inline_keyboard_click_packet(
@@ -739,11 +753,22 @@ class QLinuxManager:
                     params.get('callback_data'),
                     params.get('msg_seq') or params.get('message_seq') or params.get('real_seq'),
                 )
-                result = await self._call_runner('packet.send', {
+                packet_params = {
                     'bot_id': bot_id,
                     'cmd': packet.cmd,
                     'data': packet.data.hex(),
-                })
+                }
+                try:
+                    result = await self._call_runner('packet.send', packet_params)
+                except RuntimeError as exc:
+                    if 'unknown method: packet.send' not in str(exc).lower():
+                        raise
+                    stale_rpc = self._rpc
+                    if stale_rpc is None:
+                        raise
+                    log.warning('检测到旧版 QLinux runner，重启以启用按钮点击发包')
+                    await self._recover_runner(stale_rpc)
+                    result = await self._call_runner('packet.send', packet_params)
                 if isinstance(result, dict) and result.get('status') == 'failed':
                     return result
                 return action_ok(result or {})

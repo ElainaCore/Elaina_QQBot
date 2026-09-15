@@ -543,10 +543,15 @@ class OneBotAPI:
         message_id,
         real_seq=None,
         bot_appid='',
+        self_id=None,
     ) -> list[dict[str, str]]:
         """通过原始 protobuf 读取群消息中的官方机器人键盘。"""
         sequence = real_seq
-        detail = await self.call_api('get_msg', {'message_id': message_id})
+        detail = await self.call_api(
+            'get_msg',
+            {'message_id': message_id},
+            self_id=str(self_id) if self_id is not None else None,
+        )
         data = detail.get('data') if isinstance(detail, dict) else None
         if not isinstance(data, dict):
             data = detail if isinstance(detail, dict) else {}
@@ -564,7 +569,7 @@ class OneBotAPI:
         response = await self.call_api('send_packet', {
             'cmd': GROUP_MESSAGE_COMMAND,
             'data': packet,
-        })
+        }, self_id=str(self_id) if self_id is not None else None)
         if not isinstance(response, dict):
             raise RuntimeError('send_packet 未返回 OneBot 响应')
         if response.get('status') == 'failed':
