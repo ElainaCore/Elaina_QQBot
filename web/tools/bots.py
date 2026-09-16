@@ -49,11 +49,36 @@ async def handle_get_bots(request: web.Request):
     if callable(prune):
         await prune()
     api = get_api()
-    if api is None:
-        return ok(bots=[])
+    # The adapter only exposes accounts that are currently connected. Keep the
+    # embedded manager's persisted accounts as well, otherwise a newly-created
+    # offline QQ account disappears from the panel after the create request.
+    adapter_bots = api.bot_accounts() if api else []
+    manager = getattr(_app, 'embedded_qq', None)
+    embedded_bots = manager.list_bots() if manager else []
 
-    # API 是四种渠道唯一的账号来源。
-    bots = api.bot_accounts()
+    def account_keys(item: dict) -> set[str]:
+        return {
+            str(item.get(key) or '').strip()
+            for key in ('bot_id', 'self_id', 'bot_qq', 'qq', 'uin')
+            if str(item.get(key) or '').strip()
+        }
+
+    bots = []
+    remaining = list(adapter_bots)
+    for embedded in embedded_bots:
+        embedded_keys = account_keys(embedded)
+        match_index = next(
+            (index for index, item in enumerate(remaining) if embedded_keys & account_keys(item)),
+            None,
+        )
+        if match_index is None:
+            bots.append(dict(embedded))
+            continue
+        adapter_item = remaining.pop(match_index)
+        # Keep the embedded account identity and lifecycle fields while adding
+        # any live adapter fields (aliases, channel and connection state).
+        bots.append({**adapter_item, **embedded})
+    bots.extend(remaining)
     for item in bots:
         self_id = str(item.get('self_id') or item.get('bot_qq') or item.get('qq') or '')
         info = await _login_info(self_id)
