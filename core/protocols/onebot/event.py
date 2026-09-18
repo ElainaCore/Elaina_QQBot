@@ -191,7 +191,7 @@ def normalize_event(data: dict, default_self_id: str = '') -> dict | None:
     if not post_type:
         return None
     normalized['post_type'] = post_type
-    if default_self_id and not normalized.get('self_id'):
+    if default_self_id and _is_missing_identifier(normalized.get('self_id')):
         normalized['self_id'] = str(default_self_id)
     normalized['self_id'] = str(normalized.get('self_id') or '')
     normalized['time'] = _number(normalized.get('time'), int(time.time()))

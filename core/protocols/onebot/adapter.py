@@ -226,7 +226,9 @@ class OneBotAdapter:
         if not isinstance(data, dict):
             return None
         payload = dict(data)
-        supplied_self_id = payload.get('self_id') or default_self_id
+        supplied_self_id = payload.get('self_id')
+        if supplied_self_id in (None, '', 0, '0'):
+            supplied_self_id = default_self_id
         canonical_self_id = self.resolve_self_id(str(supplied_self_id)) if supplied_self_id else ''
         if canonical_self_id:
             payload['self_id'] = canonical_self_id
