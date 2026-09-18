@@ -51,16 +51,32 @@ FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     'meta_event_type': ('metaEventType',),
 }
 
+_IDENTIFIER_FIELDS = frozenset({
+    'self_id', 'message_id', 'message_seq', 'real_id', 'real_seq',
+    'user_id', 'group_id', 'operator_id', 'target_id',
+})
+
+
+def _missing_field(value: Any, canonical: str = '') -> bool:
+    """判断入口字段是否实际缺失；QQ 身份字段的 0 只是占位值。"""
+    if value in (None, ''):
+        return True
+    if canonical in _IDENTIFIER_FIELDS and value == 0:
+        return True
+    if canonical in _IDENTIFIER_FIELDS and isinstance(value, str) and value.strip() == '0':
+        return True
+    return False
+
 
 def first_field(data: dict[str, Any], canonical: str, *aliases: str) -> Any:
     """读取一个明确的规范字段，不做递归或模糊搜索。"""
 
     value = data.get(canonical)
-    if value not in (None, ''):
+    if not _missing_field(value, canonical):
         return value
     for alias in aliases:
         value = data.get(alias)
-        if value not in (None, ''):
+        if not _missing_field(value, canonical):
             return value
     return value
 
@@ -71,7 +87,7 @@ def copy_canonical_fields(data: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(data)
     for canonical, aliases in FIELD_ALIASES.items():
         value = first_field(normalized, canonical, *aliases)
-        if value not in (None, ''):
+        if not _missing_field(value, canonical):
             normalized[canonical] = value
     return normalized
 

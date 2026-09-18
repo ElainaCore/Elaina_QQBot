@@ -487,20 +487,40 @@ class HookBridge:
     # -- 请求缓存（供 get_msg / 回复目标）-----------------------------------
 
     def _remember(self, ctx: msgpush.MsgContext, payload: dict[str, Any]) -> None:
-        message_id = int(payload.get('message_id') or 0)
-        sequence = int(ctx.sequence or payload.get('message_seq') or payload.get('real_seq') or 0)
+        payload_message_id = int(payload.get('message_id') or 0)
+        sequence = int(
+            ctx.sequence or ctx.nt_msg_seq or ctx.msg_id
+            or payload.get('message_seq') or payload.get('real_seq') or 0
+        )
         scope = str(payload.get('self_id') or ctx.self_uin or self.status.uin or '')
-        entry = normalize_message_identity(dict(payload), scope)
+        identity_payload = dict(payload)
+        if sequence and not identity_payload.get('sequence'):
+            identity_payload['sequence'] = sequence
+        entry = normalize_message_identity(identity_payload, scope)
+        # normalize_message_identity 可能根据序号生成稳定 ID；不能再用
+        # 上游占位值 0 覆盖它，否则 get_msg/回复目标会丢失全部身份字段。
+        message_id = int(entry.get('message_id') or payload_message_id or 0)
+        message_seq = int(entry.get('message_seq') or sequence or message_id or 0)
+        real_id = int(entry.get('real_id') or message_id or 0)
+        real_seq = int(entry.get('real_seq') or message_seq or 0)
+        cached_user_id = entry.get('user_id')
+        user_id = cached_user_id if cached_user_id not in (None, '', 0, '0') else ctx.from_uin or 0
+        cached_group_id = entry.get('group_id')
+        group_id = (
+            ctx.group_uin
+            if ctx.msg_type == PKG_GROUP_MESSAGE and ctx.group_uin
+            else cached_group_id if cached_group_id not in (None, '', 0, '0') else None
+        )
         entry.update({
             'message_id': message_id,
-            'message_seq': sequence,
-            'real_id': int(payload.get('real_id') or message_id),
-            'real_seq': sequence,
+            'message_seq': message_seq,
+            'real_id': real_id,
+            'real_seq': real_seq,
             'sequence': ctx.sequence,
             'nt_msg_seq': ctx.nt_msg_seq,
             'peer': ctx.peer_uin if ctx.msg_type != PKG_GROUP_MESSAGE else ctx.group_uin,
-            'group_id': ctx.group_uin if ctx.msg_type == PKG_GROUP_MESSAGE else None,
-            'user_id': payload.get('user_id'),
+            'group_id': group_id,
+            'user_id': user_id,
             'message_type': payload.get('message_type'),
             'message': payload.get('message', []),
             'raw_message': payload.get('raw_message', ''),

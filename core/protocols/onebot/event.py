@@ -13,6 +13,7 @@ from core.protocols.onebot.contract import (
     normalize_message_kind,
     normalize_role,
 )
+from core.protocols.onebot.identity import normalize_message_identity
 from core.protocols.onebot.message import message_to_cq, normalize_message
 
 # 兼容旧插件从 event.py 导入枚举；新代码应从 contract.py 导入。
@@ -218,6 +219,26 @@ def normalize_event(data: dict, default_self_id: str = '') -> dict | None:
     }
     normalized.update(extra)
     normalized['_extra'] = extra
+    # 部分旧版注入桥会把身份字段放在 sender 或兼容命名下；先恢复
+    # 会话目标，再补齐消息序号，避免消息变成一条全是 0 的“幽灵事件”。
+    if post_type in {EventKind.MESSAGE, EventKind.MESSAGE_SENT}:
+        sender = normalized.get('sender') if isinstance(normalized.get('sender'), dict) else {}
+        extra_fields = normalized.get('_extra') if isinstance(normalized.get('_extra'), dict) else {}
+        if _is_missing_identifier(normalized.get('user_id')):
+            normalized['user_id'] = _first_nonempty(
+                sender.get('user_id'), sender.get('userId'), sender.get('uin'),
+                normalized.get('from_uin'), normalized.get('fromUin'),
+                extra_fields.get('from_uin'), extra_fields.get('fromUin'),
+            )
+        if normalize_message_kind(normalized.get('message_type')) == MessageKind.GROUP and _is_missing_identifier(normalized.get('group_id')):
+            normalized['group_id'] = _first_nonempty(
+                sender.get('group_id'), sender.get('groupId'), sender.get('group_uin'), sender.get('groupCode'),
+                normalized.get('groupCode'), normalized.get('peer_uin'), normalized.get('peerUin'),
+                normalized.get('peer_id'), normalized.get('peerId'),
+                extra_fields.get('groupCode'), extra_fields.get('peer_uin'), extra_fields.get('peerUin'),
+                extra_fields.get('peer_id'), extra_fields.get('peerId'),
+            )
+        normalized = normalize_message_identity(normalized, str(normalized.get('self_id') or default_self_id))
     for identifier in ('user_id', 'group_id', 'operator_id', 'target_id'):
         if normalized.get(identifier) not in (None, ''):
             normalized[identifier] = _number(normalized[identifier], 0)
@@ -273,6 +294,17 @@ def normalize_event(data: dict, default_self_id: str = '') -> dict | None:
         if not normalized.get('raw_message'):
             normalized['raw_message'] = message_to_cq(normalized['message'])
     return normalized
+
+
+def _is_missing_identifier(value: Any) -> bool:
+    return value in (None, '', 0, '0')
+
+
+def _first_nonempty(*values: Any) -> Any:
+    for value in values:
+        if not _is_missing_identifier(value):
+            return value
+    return 0
 
 
 def parse_event(data: dict, default_self_id: str = '') -> OneBotEvent | None:

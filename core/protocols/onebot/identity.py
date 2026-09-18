@@ -47,20 +47,28 @@ def message_id(
 def normalize_message_identity(payload: dict[str, Any], fallback_self_id: str = "") -> dict[str, Any]:
     """补齐 message_id、message_seq、real_id 与 real_seq。"""
     data = dict(payload)
-    if fallback_self_id and not data.get("self_id"):
+    if fallback_self_id and data.get("self_id") in (None, "", 0, "0"):
         data["self_id"] = str(fallback_self_id)
+
+    def first_value(*keys: str) -> Any:
+        for key in keys:
+            value = data.get(key)
+            if value not in (None, "", 0, "0"):
+                return value
+        return 0
+
     sequence = int(
-        data.get("real_seq")
-        or data.get("message_seq")
-        or data.get("sequence")
-        or data.get("message_id")
+        first_value(
+            "real_seq", "realSeq", "message_seq", "messageSeq", "sequence",
+            "msg_seq", "msgSeq", "message_id", "messageId", "msg_id", "msgId",
+        )
         or 0
     )
-    message_seq = int(data.get("message_seq") or sequence)
-    real_seq = int(data.get("real_seq") or message_seq)
-    message_value = int(data.get("message_id") or real_seq)
+    message_seq = int(first_value("message_seq", "messageSeq", "msg_seq", "msgSeq") or sequence)
+    real_seq = int(first_value("real_seq", "realSeq") or message_seq)
+    message_value = int(first_value("message_id", "messageId", "msg_id", "msgId") or real_seq)
     data["message_id"] = message_value
     data["message_seq"] = message_seq
-    data["real_id"] = int(data.get("real_id") or message_value)
+    data["real_id"] = int(first_value("real_id", "realId") or message_value)
     data["real_seq"] = real_seq
     return data

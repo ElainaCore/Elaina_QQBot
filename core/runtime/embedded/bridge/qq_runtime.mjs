@@ -1037,10 +1037,15 @@ class QQInstance {
     const waited = await this.waitForNativeEvent(
       "group_list",
       () => service.getGroupList(false),
-      (_updateType, groups) => Array.isArray(groups) || groups instanceof Map || (groups && typeof groups === "object"),
+      (...args) => {
+        const groups = args.find((value) => Array.isArray(value) || value instanceof Map) ?? args[1] ?? args[0];
+        return Array.isArray(groups) || groups instanceof Map || (groups && typeof groups === "object");
+      },
       (result) => extractNativeGroupList(result) !== undefined,
     );
-    const rawGroups = waited.direct !== null ? extractNativeGroupList(waited.direct) : waited.args[1];
+    const rawGroups = waited.direct !== null
+      ? extractNativeGroupList(waited.direct)
+      : (waited.args.find((value) => Array.isArray(value) || value instanceof Map) ?? waited.args[1] ?? waited.args[0]);
     const wanted = String(groupId);
     for (const group of collectionValues(rawGroups)) {
       if (!group || typeof group !== "object") continue;
@@ -4465,14 +4470,19 @@ class QQInstance {
     const waited = await this.waitForNativeEvent(
       "group_list",
       () => service.getGroupList(forced),
-      (_updateType, groups) => Array.isArray(groups) || groups instanceof Map || (groups && typeof groups === "object"),
+      (...args) => {
+        const groups = args.find((value) => Array.isArray(value) || value instanceof Map) ?? args[1] ?? args[0];
+        return Array.isArray(groups) || groups instanceof Map || (groups && typeof groups === "object");
+      },
       (result) => extractNativeGroupList(result) !== undefined,
     );
     if (waited.direct !== null) {
       checkNativeResult(waited.direct, "获取群列表失败");
     }
     this.debugFileLog?.("[GLIST] direct=" + (waited.direct !== null ? "yes" : "no") + " args=" + JSON.stringify(waited.args).slice(0, 200));
-    const rawGroups = waited.direct !== null ? extractNativeGroupList(waited.direct) : waited.args[1];
+    const rawGroups = waited.direct !== null
+      ? extractNativeGroupList(waited.direct)
+      : (waited.args.find((value) => Array.isArray(value) || value instanceof Map) ?? waited.args[1] ?? waited.args[0]);
     this.debugFileLog?.("[GLIST] rawGroups=" + JSON.stringify(rawGroups).slice(0, 300));
     return collectionValues(rawGroups)
       .filter((group) => group && typeof group === "object")

@@ -14,6 +14,7 @@ export function collectionValues(value) {
 
 export function extractNativeGroupList(result) {
   const candidates = [
+    Array.isArray(result) || result instanceof Map ? result : undefined,
     result?.groupList, result?.groups,
     result?.data?.groupList, result?.data?.groups,
     result?.result?.groupList, result?.result?.groups,
