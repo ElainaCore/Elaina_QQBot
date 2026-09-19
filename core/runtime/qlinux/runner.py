@@ -33,7 +33,7 @@ log = logging.getLogger('ElainaQQ.qlinux')
 
 # ==================== 默认配置 ====================
 
-RUNNER_VERSION = 'v1.0.8'
+RUNNER_VERSION = 'v1.0.9'
 # 发布仓库 (与框架更新同一镜像体系拉取)
 RUNNER_REPO = 'ElainaCore/lagrange-runner'
 
