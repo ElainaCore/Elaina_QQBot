@@ -170,6 +170,46 @@ function proxied(listener, _tag) {
   });
 }
 
+// QQNT 的 onRecvMsg 在不同版本中分别传过数组、msgList 包装对象、Map
+// 以及 (类型, 消息) 多参数。历史实现只处理第一种，升级后若收到其他
+// 形态会被当成空批次丢弃。统一在桥接层还原成消息数组，后面的事件管道
+// 只处理标准数组，避免把兼容逻辑散落到消息转换代码中。
+function normalizeIncomingMessageBatch(values) {
+  const result = [];
+  const seen = new Set();
+  const messageLike = (value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value) || value instanceof Map || value instanceof Set) return false;
+    return Array.isArray(value.elements) || [
+      "chatType", "peerUid", "peerUin", "msgId", "msg_id", "messageId", "msgSeq", "msgTime",
+      "senderUid", "senderUin", "msgType", "rawMessage", "message",
+    ].some((key) => value[key] !== undefined);
+  };
+  const visit = (value, depth = 0) => {
+    if (value == null || depth > 6) return;
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, depth + 1);
+      return;
+    }
+    if (value instanceof Map || value instanceof Set) {
+      for (const item of value.values()) visit(item, depth + 1);
+      return;
+    }
+    if (typeof value !== "object") return;
+    if (messageLike(value)) {
+      if (!seen.has(value)) {
+        seen.add(value);
+        result.push(value);
+      }
+      return;
+    }
+    for (const key of ["messages", "msgList", "messageList", "msgs", "data", "result"]) {
+      if (value[key] !== undefined) visit(value[key], depth + 1);
+    }
+  };
+  for (const value of values || []) visit(value);
+  return result;
+}
+
 class QQInstance {
   botConfig;
   qqInfo;
@@ -4977,6 +5017,16 @@ class QQInstance {
         clearQrRequest();
         const nick = String(result.nickName || result.nickname || result.nick || pendingLogin?.nickName || "");
         log(id, "[LOGIN] 登录成功，账号:", uin, "uid:", uid);
+        // 将本次成功登录标记为可自动恢复。部分 QQNT 版本不会在扫码
+        // 成功后自动更新该标记，导致下一次启动又回到二维码流程。
+        try {
+          const autoLoginResult = this.loginService?.setAutoLogin?.(uin, true);
+          if (autoLoginResult && typeof autoLoginResult.then === "function") {
+            autoLoginResult.catch((error) => logErr(id, "[LOGIN] 保存自动登录状态失败:", error?.message || error));
+          }
+        } catch (error) {
+          logErr(id, "[LOGIN] 保存自动登录状态失败:", error?.message || error);
+        }
         this.setStatus("authorizing", {
           loginUin: uin,
           qrcodeUrl: "",
@@ -5012,10 +5062,16 @@ class QQInstance {
           const uin = this.botConfig.uin;
           if (uin) {
             const historyList = await this.loginService.getLoginList();
-            const list = historyList?.LocalLoginInfoList || [];
+            const list = Array.isArray(historyList?.LocalLoginInfoList)
+              ? historyList.LocalLoginInfoList
+              : [];
             const loginInfo = list.find((item) => String(item.uin) === String(uin));
-            if (loginInfo && loginInfo.isQuickLogin !== false) {
-              log(id, "[LOGIN] 快速登录:", uin);
+            // QQNT 的 isQuickLogin 字段在不同版本含义不一致：有的版本
+            // 在成功扫码后仍返回 false，但 quickLoginWithUin 仍可用。
+            // 只要本地存在完整的历史登录记录就先尝试恢复会话，失败时
+            // 再回退二维码，避免每次重启都强制用户重新扫码。
+            if (loginInfo && loginInfo.uid) {
+              log(id, "[LOGIN] 尝试恢复历史登录:", uin, "isQuickLogin=", String(loginInfo.isQuickLogin));
               pendingLogin = loginInfo;
               quickLoginInProgress = true;
               try {
@@ -5507,12 +5563,11 @@ class QQInstance {
       self.handleSentMessageUpdates([message]);
     };
     listenerImpl.onRecvMsg = (...args) => {
-      const msgs = args.find((value) => Array.isArray(value) || value?.elements || value?.messages || value?.msgList);
-      void self.handleIncomingMessages(msgs ?? args[0], true);
+      // 保留历史 onRecvMsg(msgs) 语义，同时兼容新版 QQNT 的多参数回调。
+      void self.handleIncomingMessages(normalizeIncomingMessageBatch(args), true, true);
     };
     listenerImpl.onRecvOnlineFileMsg = (...args) => {
-      const msgs = args.find((value) => Array.isArray(value) || value?.elements || value?.messages || value?.msgList);
-      void self.handleIncomingMessages(msgs ?? args[0]);
+      void self.handleIncomingMessages(normalizeIncomingMessageBatch(args), false, true);
     };
     listenerImpl.onGroupFileInfoUpdate = (...args) => {
       self.emitNativeEvent("group_file_info", ...args);
@@ -5579,23 +5634,17 @@ class QQInstance {
       }
     }
   }
-  async handleIncomingMessages(msgs, rememberInvites = false) {
+  async handleIncomingMessages(msgs, rememberInvites = false, live = false) {
     const id = this.botConfig.id;
     const gate = this.incomingMessageGate;
     if (!gate) return;
-    const batch = Array.isArray(msgs)
-      ? msgs
-      : Array.isArray(msgs?.messages)
-        ? msgs.messages
-        : Array.isArray(msgs?.msgList)
-          ? msgs.msgList
-          : (msgs && typeof msgs === "object" ? [msgs] : []);
+    const batch = Array.isArray(msgs) ? msgs : normalizeIncomingMessageBatch([msgs]);
     this.debugFileLog?.(`[MSG] batch=${batch.length}`);
     const ignored = { history: 0, invalid_time: 0, duplicate: 0 };
     const jobs = [];
     for (const msg of batch) {
       if (rememberInvites) this.rememberGroupInviteArk(msg);
-      const decision = gate.inspect(msg);
+      const decision = gate.inspect(msg, { live });
       if (!decision.accept) {
         ignored[decision.reason] += 1;
         continue;

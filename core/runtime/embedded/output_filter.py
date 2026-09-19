@@ -14,6 +14,7 @@ _NOISE_MARKERS = (
     'CollectGraphicsInfo failed',
     'Exiting GPU process due to errors during initialization',
     '[QQ hotUpdate]',
+    '"onErrorVersions":',
     'not mini app.',
     '[preload] succeeded.',
     '状态变更: logging_in {"qrcodeUrl":',

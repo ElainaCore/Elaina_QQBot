@@ -750,17 +750,11 @@ class QLinuxManager:
                 try:
                     result = await self._call_runner('packet.send', packet_params)
                 except RuntimeError as exc:
-                    # 旧版 runner 没有 packet.send。升级 runner 文件后，
-                    # 已运行的子进程仍会继续使用旧程序集；自动重启一次，
-                    # 让原始 PB 读取和后续按钮点击立即切换到新实现。
+                    # runner 能正常响应但没有 packet.send 时，不能按通道
+                    # 故障重启；重启同一二进制只会让在线账号短暂掉线。
                     if 'unknown method: packet.send' not in str(exc).lower():
                         raise
-                    stale_rpc = self._rpc
-                    if stale_rpc is None:
-                        raise
-                    log.warning('检测到旧版 QLinux runner，重启以启用 packet.send')
-                    await self._recover_runner(stale_rpc)
-                    result = await self._call_runner('packet.send', packet_params)
+                    return action_failed('当前 QLinux runner 不支持原始发包，请升级 runner', 1405)
                 return action_ok(result or {})
             if action == 'click_inline_keyboard_button':
                 packet = build_inline_keyboard_click_packet(
@@ -780,12 +774,7 @@ class QLinuxManager:
                 except RuntimeError as exc:
                     if 'unknown method: packet.send' not in str(exc).lower():
                         raise
-                    stale_rpc = self._rpc
-                    if stale_rpc is None:
-                        raise
-                    log.warning('检测到旧版 QLinux runner，重启以启用按钮点击发包')
-                    await self._recover_runner(stale_rpc)
-                    result = await self._call_runner('packet.send', packet_params)
+                    return action_failed('当前 QLinux runner 不支持按钮发包，请升级 runner', 1405)
                 if isinstance(result, dict) and result.get('status') == 'failed':
                     return result
                 return action_ok(result or {})

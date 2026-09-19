@@ -11,17 +11,20 @@ export class IncomingMessageGate {
     this.seen = new Map();
   }
 
-  inspect(msg) {
+  inspect(msg, options = {}) {
     const isOnlineMessage = msg?.isOnlineMsg ?? msg?.is_online_msg ?? msg?.isOnline;
-    if (isOnlineMessage === false) return { accept: false, reason: "history" };
+    const explicitlyOffline = isOnlineMessage === false || String(isOnlineMessage).toLowerCase() === "false";
+    if (explicitlyOffline) return { accept: false, reason: "history" };
 
     const messageTime = normalizeMessageTime(
       msg?.msgTime ?? msg?.msg_time ?? msg?.messageTime ?? msg?.timestamp ?? msg?.time,
     );
-    if (!messageTime && isOnlineMessage !== true) {
+    // onRecvMsg 是 QQNT 的实时推送入口；部分版本不带时间字段，不能
+    // 因为字段缺失把整批实时消息过滤掉。历史轮询仍要求有效时间。
+    if (!messageTime && isOnlineMessage !== true && options.live !== true) {
       return { accept: false, reason: "invalid_time" };
     }
-    if (isOnlineMessage !== true && messageTime < this.startedAt) {
+    if (options.live !== true && isOnlineMessage !== true && messageTime > 0 && messageTime < this.startedAt) {
       return { accept: false, reason: "history" };
     }
 
