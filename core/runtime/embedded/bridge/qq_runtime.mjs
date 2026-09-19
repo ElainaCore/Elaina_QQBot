@@ -187,6 +187,7 @@ class QQInstance {
   sessionListener = null;
   selfInfo = null;
   msgListener = null;
+  msgListenerRegistered = false;
   buddyListener = null;
   buddyListenerHandle = null;
   groupListener = null;
@@ -213,6 +214,8 @@ class QQInstance {
   oneBotUinPending = /* @__PURE__ */ new Map();
   oneBotGroupUinPending = /* @__PURE__ */ new Map();
   oneBotHeartbeatTimer = null;
+  msgListenerRetryTimer = null;
+  eventListenerRetryTimer = null;
   pendingSentMessages = /* @__PURE__ */ new Set();
   pendingNativeEvents = /* @__PURE__ */ new Map();
   forwardSendTail = Promise.resolve();
@@ -353,11 +356,9 @@ class QQInstance {
         log(id, "session 初始化完成");
         this.packetRuntime.initializeAfterSession();
         log(id, "步骤6: 注册消息监听...");
-        this.registerMsgListener();
+        await this.registerMsgListener();
         this.registerEventListeners();
-        this.initializeGroupMemberSnapshots().catch((error) => {
-          logErr(id, "[事件] 初始化群成员快照失败:", error?.message || error);
-        });
+        // 群成员快照改为按需加载；启动阶段逐群预热会阻塞 QQNT 的服务线程。
         this.botConfig.uin = this.selfInfo.uin;
         this.botConfig.nickname = this.selfInfo.nick || this.selfInfo.uin;
         botUinMap.set(this.botConfig.id, this.selfInfo.uin);
@@ -489,6 +490,10 @@ class QQInstance {
     try {
       if (this.oneBotHeartbeatTimer) clearInterval(this.oneBotHeartbeatTimer);
       this.oneBotHeartbeatTimer = null;
+      if (this.msgListenerRetryTimer) clearTimeout(this.msgListenerRetryTimer);
+      if (this.eventListenerRetryTimer) clearTimeout(this.eventListenerRetryTimer);
+      this.msgListenerRetryTimer = null;
+      this.eventListenerRetryTimer = null;
       for (const pending of Array.from(this.pendingSentMessages)) {
         pending.reject(new OneBotActionError("QQ 会话已停止", 1500, "send_msg"));
       }
@@ -498,7 +503,7 @@ class QQInstance {
       this.pendingNativeEvents.clear();
       if (this.session && this.msgListener) {
         try {
-          this.session.getMsgService().removeKernelMsgListener(this.msgListener);
+          this.getMsgService()?.removeKernelMsgListener?.(this.msgListener);
         } catch {
         }
       }
@@ -510,7 +515,7 @@ class QQInstance {
       }
       if (this.session && this.groupListener) {
         try {
-          this.session.getGroupService?.().removeKernelGroupListener?.(this.groupListenerHandle ?? this.groupListener);
+          this.getGroupService()?.removeKernelGroupListener?.(this.groupListenerHandle ?? this.groupListener);
         } catch {
         }
       }
@@ -518,6 +523,7 @@ class QQInstance {
       this.buddyListenerHandle = null;
       this.groupListener = null;
       this.groupListenerHandle = null;
+      this.msgListenerRegistered = false;
       this.incomingMessageGate = null;
       this.incomingMessageTails.clear();
       this.oneBotGroupIncreaseCandidates.clear();
@@ -552,7 +558,53 @@ class QQInstance {
     this.oneBotHeartbeatTimer.unref?.();
   }
   getMsgService() {
-    return this.session?.getMsgService();
+    try {
+      const service = this.session?.getMsgService?.();
+      if (service) return service;
+    } catch {}
+    const wrapper = this.wrapper || globalThis.__ELAINAQQ_WRAPPER__;
+    for (const name of ["NodeIKernelMsgService", "NodeIQQNTMsgService"]) {
+      try {
+        const candidate = wrapper?.[name]?.get?.();
+        if (candidate) return candidate;
+      } catch {}
+    }
+    return null;
+  }
+  getGroupService() {
+    let service;
+    try {
+      service = this.session?.getGroupService?.();
+    } catch {}
+    if (service) return service;
+    // Hook/注入模式下部分 QQ 版本把服务挂在 wrapper 单例上，session
+    // 只保留方法壳；兼容这些版本，同时不影响正常 session 路径。
+    const wrapper = this.wrapper || globalThis.__ELAINAQQ_WRAPPER__;
+    for (const name of ["NodeIKernelGroupService", "NodeIQQNTGroupService"]) {
+      try {
+        const candidate = wrapper?.[name]?.get?.();
+        if (candidate) return candidate;
+      } catch {}
+    }
+    return null;
+  }
+  async waitForGroupService(timeoutMs = 15000) {
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+    let service = this.getGroupService();
+    while (!service && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      service = this.getGroupService();
+    }
+    return service;
+  }
+  async waitForMsgService(timeoutMs = 15000) {
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+    let service = this.getMsgService();
+    while (!service && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      service = this.getMsgService();
+    }
+    return service;
   }
   getPacketStatus() {
     return this.packetRuntime?.status() || {
@@ -1032,7 +1084,7 @@ class QQInstance {
   }
   /** 群号 → 群 uid（u_xxx）。NTQQ 历史消息接口需要 uid 而不是群号。 */
   async resolveGroupUid(groupId) {
-    const service = this.session?.getGroupService?.();
+    const service = this.getGroupService();
     if (!service?.getGroupList) return "";
     const waited = await this.waitForNativeEvent(
       "group_list",
@@ -1427,7 +1479,7 @@ class QQInstance {
     };
   }
   async fetchNativeGroupDetail(groupId, action = "get_group_info") {
-    const service = this.session?.getGroupService?.();
+    const service = this.getGroupService();
     const method = requireNativeMethod(service, "getGroupDetailInfo", "get_group_detail_info");
     const waited = await this.waitForNativeEvent(
       "group_detail",
@@ -1489,7 +1541,7 @@ class QQInstance {
     } catch {
     }
     try {
-      const converted = await this.session?.getGroupService?.().getUinByUids?.([uid]);
+      const converted = await this.getGroupService()?.getUinByUids?.([uid]);
       const uin = converted?.uins?.get?.(uid);
       if (uin && String(uin) !== "0") return this.rememberUin(uid, uin);
     } catch {
@@ -1597,7 +1649,7 @@ class QQInstance {
       result?.result?.notifies;
   }
   async loadGroupRequests(doubt, params = {}) {
-    const service = this.session?.getGroupService?.();
+    const service = this.getGroupService();
     const method = requireNativeMethod(service, "getSingleScreenNotifies", "get_group_system_msg");
     const waited = await this.waitForNativeEvent(
       "group_notifies",
@@ -1656,7 +1708,7 @@ class QQInstance {
       notify = [...normal, ...doubtful].find((item) => String(item.seq || item.flag) === flag);
     }
     if (!notify) throw new OneBotActionError("群请求不存在或已过期", 1404, "set_group_add_request");
-    const service = this.session?.getGroupService?.();
+    const service = this.getGroupService();
     const method = requireNativeMethod(service, "operateSysNotify", "set_group_add_request");
     checkNativeResult(await method(Boolean(notify._doubt), {
       operateType: this.asBoolean(params.approve, true) ? 1 : 2,
@@ -1671,7 +1723,7 @@ class QQInstance {
     return {};
   }
   async getGroupShutList(groupId) {
-    const service = this.session?.getGroupService?.();
+    const service = this.getGroupService();
     const method = requireNativeMethod(service, "getGroupShutUpMemberList", "get_group_shut_list");
     const waited = await this.waitForNativeEvent(
       "group_shut_list",
@@ -1694,7 +1746,7 @@ class QQInstance {
     }));
   }
   async setGroupAddOption(params) {
-    const service = this.session?.getGroupService?.();
+    const service = this.getGroupService();
     const method = requireNativeMethod(service, "modifyGroupDetailInfoV2", "set_group_add_option");
     const request = groupAddOptionRequest(
       String(params.group_id || ""),
@@ -1705,7 +1757,7 @@ class QQInstance {
     checkNativeResult(await method(request, 0), "设置群添加选项失败");
   }
   async setGroupRobotAddOption(params) {
-    const service = this.session?.getGroupService?.();
+    const service = this.getGroupService();
     const method = requireNativeMethod(service, "modifyGroupExtInfoV2", "set_group_robot_add_option");
     const request = groupRobotOptionRequest(
       String(params.group_id || ""),
@@ -1717,7 +1769,7 @@ class QQInstance {
   async setGroupManagement(action, params) {
     const groupId = String(params.group_id || "");
     if (!groupId) throw new OneBotActionError("群管理操作缺少 group_id", 1400, action);
-    const service = this.session?.getGroupService?.();
+    const service = this.getGroupService();
     const method = requireNativeMethod(service, "modifyGroupDetailInfoV2", action);
     if (action === "set_group_search") {
       const request = groupSearchRequest(
@@ -1768,7 +1820,7 @@ class QQInstance {
     const userIds = Array.isArray(ids) ? ids : [ids];
     if (!userIds.length) throw new OneBotActionError("缺少要移除的群成员", 1400, "set_group_kick_members");
     const uids = await Promise.all(userIds.map((userId) => this.resolveUid(String(userId))));
-    const service = this.session?.getGroupService?.();
+    const service = this.getGroupService();
     const method = requireNativeMethod(service, "kickMember", "set_group_kick_members");
     checkNativeResult(
       await method(groupId, uids, this.asBoolean(params.reject_add_request), String(params.reason || "")),
@@ -1777,7 +1829,7 @@ class QQInstance {
     return {};
   }
   async setGroupRemark(params) {
-    const service = this.session?.getGroupService?.();
+    const service = this.getGroupService();
     const method = requireNativeMethod(service, "modifyGroupRemark", "set_group_remark");
     checkNativeResult(await method(String(params.group_id), String(params.remark || "")), "设置群备注失败");
     return {};
@@ -1785,7 +1837,7 @@ class QQInstance {
   async setGroupPortrait(params) {
     const file = await this.materializeFile(String(params.file || params.image || ""));
     try {
-      const service = this.session?.getGroupService?.();
+      const service = this.getGroupService();
       const method = requireNativeMethod(service, "setHeader", "set_group_portrait");
       const result = await method(String(params.group_id), file.path);
       checkNativeResult(result, "设置群头像失败");
@@ -1796,7 +1848,7 @@ class QQInstance {
   }
   async getGroupHonorInfo(params) {
     const groupId = String(params.group_id || "");
-    const service = this.session?.getGroupService?.();
+    const service = this.getGroupService();
     const method = requireNativeMethod(service, "getGroupHonorList", "get_group_honor_info");
     const result = await method({ groupCodes: [groupId] });
     checkNativeResult(result, "获取群荣誉失败");
@@ -1804,7 +1856,7 @@ class QQInstance {
   }
   async getEssenceMessages(params) {
     const groupId = String(params.group_id || "");
-    const service = this.session?.getGroupService?.();
+    const service = this.getGroupService();
     const methodName = typeof service?.fetchGroupEssenceList === "function" ? "fetchGroupEssenceList" : "getGroupLatestEssenceList";
     const method = requireNativeMethod(service, methodName, "get_essence_msg_list");
     let result;
@@ -1843,7 +1895,7 @@ class QQInstance {
     const msgSeq = Number(params.msg_seq ?? raw?.msgSeq ?? event?.real_seq ?? 0);
     const msgRandom = Number(params.msg_random ?? raw?.msgRandom ?? 0);
     if (!groupId || !msgSeq) throw new OneBotActionError("精华消息缺少群号或消息序号", 1400);
-    const service = this.session?.getGroupService?.();
+    const service = this.getGroupService();
     const action = enable ? "set_essence_msg" : "delete_essence_msg";
     const method = requireNativeMethod(service, enable ? "addGroupEssence" : "removeGroupEssence", action);
     const result = await method({ groupCode: groupId, msgRandom, msgSeq });
@@ -2862,7 +2914,7 @@ class QQInstance {
     return result?.info?.userLikeInfos?.[0] || result?.info || result;
   }
   async getGroupNotice(params) {
-    const service = this.session?.getGroupService?.();
+    const service = this.getGroupService();
     const method = requireNativeMethod(service, "getGroupBulletin", "get_group_notice");
     const result = await method(String(params.group_id));
     const feeds = result?.feeds || result?.data?.feeds || result?.bulletins || result || [];
@@ -2886,7 +2938,7 @@ class QQInstance {
     if (!groupId || !noticeId) {
       throw new OneBotActionError("删除群公告缺少 group_id 或 notice_id", 1400, "_del_group_notice");
     }
-    const service = this.session?.getGroupService?.();
+    const service = this.getGroupService();
     const method = requireNativeMethod(service, "deleteGroupBulletin", "_del_group_notice");
     const pskey = await this.getDomainPskey("qun.qq.com");
     const result = await method(groupId, pskey, noticeId);
@@ -2895,7 +2947,7 @@ class QQInstance {
   }
   async sendGroupNotice(params) {
     const groupId = String(params.group_id || "");
-    const service = this.session?.getGroupService?.();
+    const service = this.getGroupService();
     const method = requireNativeMethod(service, "publishGroupBulletin", "send_group_notice");
     const pskey = await this.getDomainPskey("qun.qq.com");
     const result = await method(groupId, pskey, {
@@ -3805,7 +3857,7 @@ class QQInstance {
     if (!id) throw new OneBotActionError("contact 消息段缺少 id", 1400, "send_msg");
     let result;
     if (contactType === "group") {
-      const method = requireNativeMethod(this.session?.getGroupService?.(), "getGroupRecommendContactArkJson", "send_msg");
+      const method = requireNativeMethod(this.getGroupService(), "getGroupRecommendContactArkJson", "send_msg");
       result = await method(id);
     } else if (contactType === "qq" || contactType === "private") {
       const method = requireNativeMethod(this.session?.getBuddyService?.(), "getBuddyRecommendContactArkJson", "send_msg");
@@ -4450,7 +4502,9 @@ class QQInstance {
     return parsed;
   }
   async queryGroupList(params = {}) {
-    const service = this.session?.getGroupService?.();
+    // QQNT 某些版本在 session.init 返回后才异步挂载 GroupService；
+    // 不能把这个短暂窗口误报成“没有群”。
+    const service = await this.waitForGroupService();
     try {
       const sessionMethods = Object.getOwnPropertyNames(Object.getPrototypeOf(this.session) || {})
         .filter((n) => /service/i.test(n)).join(",");
@@ -4459,7 +4513,7 @@ class QQInstance {
     let svcErr = "";
     let svc2 = null;
     try {
-      svc2 = this.session?.getGroupService ? this.session.getGroupService() : undefined;
+      svc2 = this.getGroupService();
     } catch (error) {
       svcErr = String(error?.message || error);
     }
@@ -4494,7 +4548,7 @@ class QQInstance {
     return oneBotGroup({ ...data, groupCode: data.groupCode || groupId }, groupId);
   }
   async queryGroupMemberList(groupId, params = {}) {
-    const service = this.session?.getGroupService?.();
+    const service = this.getGroupService();
     if (!service?.getAllMemberList) return [];
     const forced = this.asBoolean(params.no_cache, false);
     const waited = await this.waitForNativeEvent(
@@ -4534,7 +4588,7 @@ class QQInstance {
   }
   async queryGroupMemberInfo(groupId, userId, params = {}) {
     const forced = this.asBoolean(params.no_cache, true);
-    const service = this.session?.getGroupService?.();
+    const service = this.getGroupService();
     if (service?.getMemberInfo) {
       const uid = await this.resolveUid(userId);
       const waited = await this.waitForNativeEvent(
@@ -4763,7 +4817,7 @@ class QQInstance {
     } catch {
     }
     try {
-      const converted = await this.session?.getGroupService?.().getUidByUins([uin]);
+    const converted = await this.getGroupService()?.getUidByUins?.([uin]);
       const uid = converted?.uids?.get?.(uin);
       if (uid) return String(uid);
     } catch {
@@ -4772,46 +4826,46 @@ class QQInstance {
   }
   async markOneBotMessageRead(type, target) {
     const peerUid = type === "private" ? await this.resolveUid(target) : target;
-    const result = await this.session?.getMsgService?.().setMsgRead({ chatType: type === "group" ? 2 : 1, peerUid, guildId: "" });
+    const result = await this.getMsgService()?.setMsgRead?.({ chatType: type === "group" ? 2 : 1, peerUid, guildId: "" });
     if (result?.result && result.result !== 0) throw new Error(result.errMsg || "设置已读失败");
     return {};
   }
   async setGroupKick(groupId, userId, rejectAdd) {
     const uid = await this.resolveUid(userId);
-    const method = requireNativeMethod(this.session?.getGroupService?.(), "kickMember", "set_group_kick");
+    const method = requireNativeMethod(this.getGroupService(), "kickMember", "set_group_kick");
     checkNativeResult(await method(groupId, [uid], rejectAdd, ""), "移出群成员失败");
     return {};
   }
   async setGroupBan(groupId, userId, duration) {
     const uid = await this.resolveUid(userId);
-    const method = requireNativeMethod(this.session?.getGroupService?.(), "setMemberShutUp", "set_group_ban");
+    const method = requireNativeMethod(this.getGroupService(), "setMemberShutUp", "set_group_ban");
     checkNativeResult(await method(groupId, [{ uid, timeStamp: duration }]), "群禁言失败");
     return {};
   }
   async setGroupWholeBan(groupId, enable) {
-    const method = requireNativeMethod(this.session?.getGroupService?.(), "setGroupShutUp", "set_group_whole_ban");
+    const method = requireNativeMethod(this.getGroupService(), "setGroupShutUp", "set_group_whole_ban");
     checkNativeResult(await method(groupId, enable), "全员禁言失败");
     return {};
   }
   async setGroupAdmin(groupId, userId, enable) {
     const uid = await this.resolveUid(userId);
-    const method = requireNativeMethod(this.session?.getGroupService?.(), "modifyMemberRole", "set_group_admin");
+    const method = requireNativeMethod(this.getGroupService(), "modifyMemberRole", "set_group_admin");
     checkNativeResult(await method(groupId, uid, enable ? 3 : 2), "设置群管理员失败");
     return {};
   }
   async setGroupCard(groupId, userId, card) {
     const uid = await this.resolveUid(userId);
-    const method = requireNativeMethod(this.session?.getGroupService?.(), "modifyMemberCardName", "set_group_card");
+    const method = requireNativeMethod(this.getGroupService(), "modifyMemberCardName", "set_group_card");
     checkNativeResult(await method(groupId, uid, card), "修改群名片失败");
     return {};
   }
   async setGroupName(groupId, groupName) {
-    const method = requireNativeMethod(this.session?.getGroupService?.(), "modifyGroupName", "set_group_name");
+    const method = requireNativeMethod(this.getGroupService(), "modifyGroupName", "set_group_name");
     checkNativeResult(await method(groupId, groupName, false), "修改群名称失败");
     return {};
   }
   async setGroupLeave(groupId) {
-    const method = requireNativeMethod(this.session?.getGroupService?.(), "quitGroup", "set_group_leave");
+    const method = requireNativeMethod(this.getGroupService(), "quitGroup", "set_group_leave");
     checkNativeResult(await method(groupId), "退出群聊失败");
     return {};
   }
@@ -4827,7 +4881,7 @@ class QQInstance {
     return {};
   }
   async getGroupAtAllRemain(groupId) {
-    const result = await this.session?.getGroupService?.().getGroupRemainAtTimes(groupId);
+    const result = await this.getGroupService()?.getGroupRemainAtTimes?.(groupId);
     const info = result?.atInfo || {};
     return {
       can_at_all: Boolean(info.canAtAll),
@@ -5110,8 +5164,9 @@ class QQInstance {
       debugLog("[ATTACH] session enumeration failed: " + (error?.message || error));
     }
     if (!this.session) throw new Error("[ATTACH] 未获取到共享 wrapper session");
-    // 等待 QQ UI 完成 session.init（最多 180 秒，仅等待不失败）。
-    const deadline = Date.now() + 180000;
+    // Hook 进程中 session 的 isSessionInitd 在部分 QQ 版本始终返回 false，
+    // 不能因此阻塞启动数分钟；服务未挂载时由监听器/接口各自短轮询等待。
+    const deadline = Date.now() + 5000;
     let ready = false;
     const sessionApiEnum = this.wrapper?.NodeIQQNTWrapperSession;
     while (Date.now() < deadline) {
@@ -5209,6 +5264,9 @@ class QQInstance {
     }
     this.selfInfo = { uin: selfUin, uid: selfUid, nick };
     log(id, "[ATTACH] selfInfo ready", selfUin);
+    this.loginService = this.session?.getLoginService?.()
+      || this.wrapper?.NodeIKernelLoginService?.get?.()
+      || this.loginService;
     debugLog("[ATTACH] step begin");
     const step = async (name, fn) => {
       try {
@@ -5219,20 +5277,12 @@ class QQInstance {
       }
     };
     await step("initializeAfterSession", async () => { this.packetRuntime.initializeAfterSession(); });
-    await step("initSession", async () => {
-      try {
-        await this.initSession(dataPath);
-        this.debugFileLog?.("[ATTACH] initSession done, session=" + (this.session ? "ok" : "null"));
-      } catch (error) {
-        this.debugFileLog?.("[ATTACH] initSession FAILED: " + (error?.message || error));
-        throw error;
-      }
-    });
-    await step("registerMsgListener", async () => { this.registerMsgListener(); });
+    // Hook 模式复用 QQ UI 的共享 session，绝不再次 init/startNT；否则会
+    // 重置原生 Msg/GroupService，导致消息和群接口全部失效。
+    debugLog("[ATTACH] reuse shared session; skip initSession/startNT ready=" + ready);
+    await step("registerMsgListener", async () => { await this.registerMsgListener(); });
     await step("registerEventListeners", async () => { this.registerEventListeners(); });
-    this.initializeGroupMemberSnapshots().catch((error) => {
-      logErr(id, "[ATTACH] snapshot failed:", error?.message || error);
-    });
+    // Hook 挂接完成后也不预热全部群成员，避免重新连接时触发批量请求。
     this.botConfig.uin = this.selfInfo.uin;
     this.botConfig.nickname = this.selfInfo.nick || this.selfInfo.uin;
     botUinMap.set(this.botConfig.id, this.selfInfo.uin);
@@ -5365,7 +5415,7 @@ class QQInstance {
         // 9.9.35+ 可能不回调 onOpentelemetryInit 但 session 已可用。
         // 乐观成功：让后续 registerMsgListener 继续注册，由实际服务可用性判定。
         resolve();
-      }, 30000);
+      }, 5000);
       const finish = (error) => {
         if (settled) return;
         settled = true;
@@ -5405,8 +5455,9 @@ class QQInstance {
      }
     });
   }
-  registerMsgListener() {
+  async registerMsgListener() {
     const id = this.botConfig.id;
+    if (this.msgListenerRegistered) return;
     if (!this.session) {
       log(id, "[消息] 会话为空，跳过");
       return;
@@ -5455,11 +5506,13 @@ class QQInstance {
     listenerImpl.onAddSendMsg = (message) => {
       self.handleSentMessageUpdates([message]);
     };
-    listenerImpl.onRecvMsg = (msgs) => {
-      void self.handleIncomingMessages(msgs, true);
+    listenerImpl.onRecvMsg = (...args) => {
+      const msgs = args.find((value) => Array.isArray(value) || value?.elements || value?.messages || value?.msgList);
+      void self.handleIncomingMessages(msgs ?? args[0], true);
     };
-    listenerImpl.onRecvOnlineFileMsg = (msgs) => {
-      void self.handleIncomingMessages(msgs);
+    listenerImpl.onRecvOnlineFileMsg = (...args) => {
+      const msgs = args.find((value) => Array.isArray(value) || value?.elements || value?.messages || value?.msgList);
+      void self.handleIncomingMessages(msgs ?? args[0]);
     };
     listenerImpl.onGroupFileInfoUpdate = (...args) => {
       self.emitNativeEvent("group_file_info", ...args);
@@ -5509,20 +5562,38 @@ class QQInstance {
     };
     this.msgListener = proxied(listenerImpl);
     try {
-      this.session.getMsgService().addKernelMsgListener(this.msgListener);
+      const service = await this.waitForMsgService(1500);
+      if (!service?.addKernelMsgListener) throw new Error("MsgService 尚未就绪");
+      service.addKernelMsgListener(this.msgListener);
+      this.msgListenerRegistered = true;
+      this.msgListenerRetryTimer = null;
       log(id, `[消息] 消息监听注册成功，仅接收 ${this.incomingMessageGate.startedAt} 之后的实时消息`);
     } catch (e) {
       logErr(id, "[消息] 注册消息监听失败:", e.message);
+      if (this.runtime.status !== "offline" && !this.msgListenerRetryTimer) {
+        this.msgListenerRetryTimer = setTimeout(() => {
+          this.msgListenerRetryTimer = null;
+          void this.registerMsgListener();
+        }, 1000);
+        this.msgListenerRetryTimer.unref?.();
+      }
     }
   }
   async handleIncomingMessages(msgs, rememberInvites = false) {
     const id = this.botConfig.id;
     const gate = this.incomingMessageGate;
     if (!gate) return;
-    this.debugFileLog?.(`[MSG] batch=${Array.from(msgs || []).length}`);
+    const batch = Array.isArray(msgs)
+      ? msgs
+      : Array.isArray(msgs?.messages)
+        ? msgs.messages
+        : Array.isArray(msgs?.msgList)
+          ? msgs.msgList
+          : (msgs && typeof msgs === "object" ? [msgs] : []);
+    this.debugFileLog?.(`[MSG] batch=${batch.length}`);
     const ignored = { history: 0, invalid_time: 0, duplicate: 0 };
     const jobs = [];
-    for (const msg of Array.from(msgs || [])) {
+    for (const msg of batch) {
       if (rememberInvites) this.rememberGroupInviteArk(msg);
       const decision = gate.inspect(msg);
       if (!decision.accept) {
@@ -5581,7 +5652,10 @@ class QQInstance {
         this.emitNativeEvent("doubt_buddy_requests", payload);
       };
       this.buddyListener = proxied(buddy);
-      this.buddyListenerHandle = this.session?.getBuddyService?.().addKernelBuddyListener?.(this.buddyListener);
+      const buddyService = this.session?.getBuddyService?.();
+      if (!this.buddyListenerHandle) {
+        this.buddyListenerHandle = buddyService?.addKernelBuddyListener?.(this.buddyListener);
+      }
     } catch (error) {
       logErr(id, "[事件] 好友事件监听注册失败:", error?.message || error);
     }
@@ -5634,7 +5708,7 @@ class QQInstance {
       };
       group.onGroupNotifiesUpdated = async (doubt, notifies) => {
         try {
-          await this.session?.getGroupService?.().clearGroupNotifiesUnreadCount?.(false);
+          await this.getGroupService()?.clearGroupNotifiesUnreadCount?.(false);
         } catch (error) {
           logErr(id, "[事件] 清除群请求未读数失败:", error?.message || error);
         }
@@ -5662,9 +5736,18 @@ class QQInstance {
         this.emitNativeEvent("group_shut_list", groupCode, members);
       };
       this.groupListener = proxied(group);
-      this.groupListenerHandle = this.session?.getGroupService?.().addKernelGroupListener?.(this.groupListener);
+      const groupService = this.getGroupService();
+      if (!groupService?.addKernelGroupListener) throw new Error("GroupService 尚未就绪");
+      this.groupListenerHandle = groupService.addKernelGroupListener(this.groupListener);
     } catch (error) {
       logErr(id, "[事件] 群事件监听注册失败:", error?.message || error);
+      if (this.runtime.status !== "offline" && !this.eventListenerRetryTimer) {
+        this.eventListenerRetryTimer = setTimeout(() => {
+          this.eventListenerRetryTimer = null;
+          if (!this.groupListenerHandle) this.registerEventListeners();
+        }, 1500);
+        this.eventListenerRetryTimer.unref?.();
+      }
     }
   }
   emitOneBotEvent(event) {
@@ -5867,7 +5950,7 @@ class QQInstance {
   }
   async resolveGroupMemberUinUncached(groupId, memberUid) {
     let userId = "0";
-    const service = this.session?.getGroupService?.();
+    const service = this.getGroupService();
     if (typeof service?.getMemberInfo === "function") try {
       const hasMember = (value) => collectionValues(extractNativeMemberMap(value)).some(
         (member) => String(member?.uid || "") === String(memberUid),

@@ -12,10 +12,12 @@ export class IncomingMessageGate {
   }
 
   inspect(msg) {
-    const isOnlineMessage = msg?.isOnlineMsg;
+    const isOnlineMessage = msg?.isOnlineMsg ?? msg?.is_online_msg ?? msg?.isOnline;
     if (isOnlineMessage === false) return { accept: false, reason: "history" };
 
-    const messageTime = normalizeMessageTime(msg?.msgTime);
+    const messageTime = normalizeMessageTime(
+      msg?.msgTime ?? msg?.msg_time ?? msg?.messageTime ?? msg?.timestamp ?? msg?.time,
+    );
     if (!messageTime && isOnlineMessage !== true) {
       return { accept: false, reason: "invalid_time" };
     }
@@ -23,7 +25,7 @@ export class IncomingMessageGate {
       return { accept: false, reason: "history" };
     }
 
-    const messageId = String(msg?.msgId || "").trim();
+    const messageId = String(msg?.msgId ?? msg?.msg_id ?? msg?.messageId ?? "").trim();
     if (!messageId) return { accept: true, reason: "live" };
     const key = `${msg?.chatType || ""}:${msg?.peerUid || msg?.peerUin || ""}:${messageId}`;
     if (this.seen.has(key)) return { accept: false, reason: "duplicate" };
