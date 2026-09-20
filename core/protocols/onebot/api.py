@@ -482,8 +482,16 @@ class OneBotAPI:
             data = detail if isinstance(detail, dict) else {}
         embedded = data.get('_inline_keyboard')
         if isinstance(embedded, list) and embedded:
-            return [item for item in embedded if isinstance(item, dict)]
-        if not sequence:
+            if not sequence or str(sequence).strip() == '0':
+                sequence = data.get('real_seq') or data.get('message_seq')
+            result = [dict(item) for item in embedded if isinstance(item, dict)]
+            if sequence:
+                for item in result:
+                    item.setdefault('msg_seq', str(sequence))
+                    item.setdefault('message_seq', str(sequence))
+                    item.setdefault('real_seq', str(sequence))
+            return result
+        if not sequence or str(sequence).strip() == '0':
             sequence = data.get('real_seq') or data.get('message_seq')
         if not sequence:
             return []
@@ -501,7 +509,12 @@ class OneBotAPI:
             raise RuntimeError(
                 str(response.get('message') or response.get('wording') or 'send_packet 读取消息 PB 失败')
             )
-        return extract_inline_keyboard_buttons(response, bot_appid=str(bot_appid or ''))
+        result = extract_inline_keyboard_buttons(response, bot_appid=str(bot_appid or ''))
+        for item in result:
+            item.setdefault('msg_seq', str(sequence))
+            item.setdefault('message_seq', str(sequence))
+            item.setdefault('real_seq', str(sequence))
+        return result
 
     async def get_login_info(self) -> dict | None:
         return await self.call_api('get_login_info')

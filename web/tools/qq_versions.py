@@ -55,24 +55,10 @@ def _install_status(manager) -> dict:
     if os.name == 'nt':
         status = {
             **status,
-            'install_strategy': 'official_website',
+            'install_strategy': 'embedded_package',
             'official_download_url': _QQ_OFFICIAL_DOWNLOAD_URL,
         }
     return status
-
-
-def _windows_official_response(manager) -> web.Response | None:
-    if os.name != 'nt':
-        return None
-    return web.json_response(
-        {
-            'success': True,
-            'external': True,
-            'url': _QQ_OFFICIAL_DOWNLOAD_URL,
-            'message': '请安装并登录 QQ，然后返回此页面继续操作',
-            'status': _install_status(manager),
-        }
-    )
 
 
 async def _stop_embedded_qq(version_key=None):
@@ -227,8 +213,6 @@ async def handle_get_progress(request: web.Request):
 async def handle_download_qq(request: web.Request):
     """下载 QQ 客户端"""
     try:
-        if response := _windows_official_response(_manager()):
-            return response
         body = await json_body(request)
         version_key = body.get('version_key')
 
@@ -254,8 +238,6 @@ async def handle_download_qq(request: web.Request):
 async def handle_install_qq(request: web.Request):
     """安装 QQ 客户端"""
     try:
-        if response := _windows_official_response(_manager()):
-            return response
         body = await json_body(request)
         version_key = body.get('version_key')
         auto_download = body.get('auto_download', True)

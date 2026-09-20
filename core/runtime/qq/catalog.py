@@ -6,11 +6,11 @@ QQ_VERSIONS: dict[str, dict[str, Any]] = {
     'windows_x64': {
         'label': '新版 QQ',
         'channel': 'latest',
-        'version': '9.9.32-55230',
-        'url': 'https://github.com/Rodert/qq-versions/releases/download/qq-packages-20260720-ffedf7c6/QQ_9.9.32_260716_x64_01.exe',
-        'filename': 'QQ_9.9.32_260716_x64_01.exe',
-        'size': 312335528,
-        'sha256': '685c989145381d9bc849948b836270111a8b6b8cebf2068ff158ac9d2324bc44',
+        'version': '9.9.33-52230',
+        'url': 'https://github.com/Rodert/qq-versions/releases/download/qq-packages-20260813-1d08f1d4/QQ_9.9.33_260813_x64_01.exe',
+        'filename': 'QQ_9.9.33_260813_x64_01.exe',
+        'size': 314581680,
+        'sha256': 'b25c0d3ce9df764074a9118d0ded927e1b2d7ebf60e306112e8df18a040ec492',
         'platform': 'windows',
         'arch': 'x64',
         'package': 'exe',
@@ -29,7 +29,7 @@ QQ_VERSIONS: dict[str, dict[str, Any]] = {
     'linux_x64_deb': {
         'label': '新版 QQ',
         'channel': 'latest',
-        'version': '3.2.32-260812',
+        'version': '3.2.32-52194',
         'url': 'https://github.com/Rodert/qq-versions/releases/download/qq-packages-20260813-1d08f1d4/QQ_3.2.32_260812_amd64_01.deb',
         'filename': 'QQ_3.2.32_260812_amd64_01.deb',
         'size': 185828040,
@@ -51,7 +51,7 @@ QQ_VERSIONS: dict[str, dict[str, Any]] = {
     'linux_x64_rpm': {
         'label': '新版 QQ',
         'channel': 'latest',
-        'version': '3.2.32-260812',
+        'version': '3.2.32-52194',
         'url': 'https://github.com/Rodert/qq-versions/releases/download/qq-packages-20260813-1d08f1d4/QQ_3.2.32_260812_x86_64_01.rpm',
         'filename': 'QQ_3.2.32_260812_x86_64_01.rpm',
         'size': 187341996,
@@ -74,7 +74,7 @@ QQ_VERSIONS: dict[str, dict[str, Any]] = {
     'linux_arm64_deb': {
         'label': '新版 QQ',
         'channel': 'latest',
-        'version': '3.2.32-260812',
+        'version': '3.2.32-52194',
         'url': 'https://github.com/Rodert/qq-versions/releases/download/qq-packages-20260813-1d08f1d4/QQ_3.2.32_260812_arm64_01.deb',
         'filename': 'QQ_3.2.32_260812_arm64_01.deb',
         'size': 205524324,
@@ -96,7 +96,7 @@ QQ_VERSIONS: dict[str, dict[str, Any]] = {
     'linux_arm64_rpm': {
         'label': '新版 QQ',
         'channel': 'latest',
-        'version': '3.2.32-260812',
+        'version': '3.2.32-52194',
         'url': 'https://github.com/Rodert/qq-versions/releases/download/qq-packages-20260813-1d08f1d4/QQ_3.2.32_260812_aarch64_01.rpm',
         'filename': 'QQ_3.2.32_260812_aarch64_01.rpm',
         'size': 180220161,

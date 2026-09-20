@@ -845,10 +845,13 @@ class QQManager:
             )
         return None
 
-    def list_available_versions(self) -> list[dict[str, Any]]:
+    def list_available_versions(self, *, include_legacy: bool = False) -> list[dict[str, Any]]:
         platform_key = self.detect_platform()
         result = []
         for key, info in QQ_VERSIONS.items():
+            # 保留旧版本键供已有安装使用，但默认下载列表只展示当前版本。
+            if not include_legacy and info.get('channel') == 'legacy':
+                continue
             downloaded = self._version_path(key).is_file()
             executable = self.get_qq_executable(key)
             compatible = self.is_compatible(key)

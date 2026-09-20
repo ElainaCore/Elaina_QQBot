@@ -757,12 +757,15 @@ class QLinuxManager:
                     return action_failed('当前 QLinux runner 不支持原始发包，请升级 runner', 1405)
                 return action_ok(result or {})
             if action == 'click_inline_keyboard_button':
+                sequence = self._message_sequence(bot_id, params)
+                if sequence <= 0:
+                    return action_failed('点击按钮缺少有效的消息序号', 1400)
                 packet = build_inline_keyboard_click_packet(
                     params.get('group_id'),
                     params.get('bot_appid'),
                     params.get('button_id'),
                     params.get('callback_data'),
-                    params.get('msg_seq') or params.get('message_seq') or params.get('real_seq'),
+                    sequence,
                 )
                 packet_params = {
                     'bot_id': bot_id,
@@ -976,14 +979,34 @@ class QLinuxManager:
 
     def _message_sequence(self, bot_id: str, params: dict) -> int:
         """解析消息 ID 对应的原始序号。"""
-        requested = params.get('message_seq') or params.get('real_seq') or params.get('message_id') or params.get('sequence') or 0
-        try:
-            requested_id = int(requested)
-        except (TypeError, ValueError):
-            requested_id = int(str(requested).rsplit(':', 1)[-1] or 0)
+        values = [params.get(key) for key in (
+            'msg_seq', 'msgSeq', 'message_seq', 'messageSeq',
+            'real_seq', 'realSeq', 'sequence', 'seq',
+            'message_id', 'messageId',
+        ) if params.get(key) not in (None, '', 0, '0')]
+        requested_id = 0
+        for requested in values:
+            try:
+                candidate = int(str(requested).strip())
+            except (TypeError, ValueError):
+                token = str(requested).rsplit(':', 1)[-1].strip()
+                try:
+                    candidate = int(token)
+                except (TypeError, ValueError):
+                    continue
+            if candidate:
+                requested_id = candidate
+                break
         scope = str(self._accounts.get(bot_id, {}).get('uin', ''))
         cached = self._message_cache.get(requested_id, scope) or {}
-        return int(cached.get('real_seq') or cached.get('message_seq') or cached.get('sequence') or requested_id or 0)
+        value = next((cached.get(key) for key in (
+            'real_seq', 'realSeq', 'message_seq', 'messageSeq',
+            'msg_seq', 'msgSeq', 'sequence',
+        ) if cached.get(key) not in (None, '', 0, '0')), requested_id)
+        try:
+            return int(str(value).strip() or 0)
+        except (TypeError, ValueError):
+            return 0
 
     @staticmethod
     async def _ob_to_segments(message) -> list[dict]:

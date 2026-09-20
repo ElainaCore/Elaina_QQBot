@@ -453,7 +453,14 @@ def runner_event_to_onebot(event: dict) -> dict | None:
         contact = d.get('contact') if isinstance(d.get('contact'), dict) else {}
         group_id = contact.get('group_uin')
         is_group = group_id not in (None, '')
-        sequence = int(d.get('sequence', 0) or 0)
+        sequence_value = next((d.get(key) for key in (
+            'sequence', 'message_seq', 'messageSeq', 'msg_seq', 'msgSeq',
+            'real_seq', 'realSeq', 'seq',
+        ) if d.get(key) not in (None, '', 0, '0')), 0)
+        try:
+            sequence = int(str(sequence_value).strip() or 0)
+        except (TypeError, ValueError):
+            sequence = 0
         sender_uin = int(contact.get('uin', 0) or 0)
         peer_uin = int(group_id or contact.get('uin', 0) or 0)
         message_id = build_message_id(

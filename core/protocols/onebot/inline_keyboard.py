@@ -102,7 +102,14 @@ def _button_id(fields: list[tuple[int, int, Any]]) -> str:
             continue
         if wire_type == 2:
             candidate = _text(value).strip()
-            if candidate and not candidate.startswith('BOT1.0_'):
+            # ButtonExtra/KeyboardData/Row 的 field 1 是嵌套 protobuf，
+            # 不能把其二进制内容误当成按钮 ID。真实 ID 必须是可打印文本。
+            if (
+                candidate
+                and not candidate.startswith('BOT1.0_')
+                and candidate.isprintable()
+                and len(candidate) <= 128
+            ):
                 return candidate
         elif wire_type in {0, 1, 5}:
             return str(value)

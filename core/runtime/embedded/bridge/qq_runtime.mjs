@@ -3636,11 +3636,15 @@ class QQInstance {
     if (!service || typeof service.clickInlineKeyboardButton !== "function") {
       throw new Error("当前 QQ 协议不支持 clickInlineKeyboardButton");
     }
+    const msgSeq = String(params.msg_seq || params.message_seq || params.real_seq || "");
+    if (!msgSeq || msgSeq === "0") {
+      throw new OneBotActionError("点击按钮缺少有效的消息序号", 1400, "click_inline_keyboard_button");
+    }
     const result = await service.clickInlineKeyboardButton({
       buttonId: String(params.button_id || "1"),
       peerId: String(params.group_id || ""),
       botAppid: String(params.bot_appid || ""),
-      msgSeq: String(params.msg_seq || Math.floor(Math.random() * 1e6)),
+      msgSeq,
       callback_data: String(params.callback_data || ""),
       dmFlag: 0,
       chatType: 2
