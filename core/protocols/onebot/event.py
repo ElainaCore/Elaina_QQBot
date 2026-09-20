@@ -287,9 +287,17 @@ def normalize_event(data: dict, default_self_id: str = '') -> dict | None:
         normalized.setdefault('message_format', 'array')
         normalized.setdefault('font', 14)
         normalized['message_id'] = _number(normalized.get('message_id'), 0)
-        normalized['message_seq'] = _number(normalized.get('message_seq'), normalized['message_id'])
+        sequence_keys = ('real_seq', 'realSeq', 'message_seq', 'messageSeq', 'sequence', 'msg_seq', 'msgSeq')
+        has_explicit_sequence = any(key in normalized for key in sequence_keys)
+        normalized['message_seq'] = _number(
+            normalized.get('message_seq'),
+            0 if has_explicit_sequence else normalized['message_id'],
+        )
         normalized['real_id'] = _number(normalized.get('real_id'), normalized['message_id'])
-        normalized['real_seq'] = _number(normalized.get('real_seq'), normalized['message_seq'])
+        normalized['real_seq'] = _number(
+            normalized.get('real_seq'),
+            0 if has_explicit_sequence else normalized['message_seq'],
+        )
         normalized['user_id'] = _number(normalized.get('user_id'), 0)
         if not normalized.get('raw_message'):
             normalized['raw_message'] = message_to_cq(normalized['message'])

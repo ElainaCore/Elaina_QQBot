@@ -57,13 +57,17 @@ def normalize_message_identity(payload: dict[str, Any], fallback_self_id: str = 
                 return value
         return 0
 
-    sequence = int(
-        first_value(
-            "real_seq", "realSeq", "message_seq", "messageSeq", "sequence",
-            "msg_seq", "msgSeq", "message_id", "messageId", "msg_id", "msgId",
-        )
-        or 0
+    sequence_keys = (
+        "real_seq", "realSeq", "message_seq", "messageSeq", "sequence",
+        "msg_seq", "msgSeq",
     )
+    # OneBot message_id may be a framework-generated hash, not the protocol
+    # sequence used by QQ packets. Only legacy events without any sequence
+    # field may fall back to message_id.
+    sequence_value = first_value(*sequence_keys)
+    if not sequence_value and not any(key in data for key in sequence_keys):
+        sequence_value = first_value("message_id", "messageId", "msg_id", "msgId")
+    sequence = int(sequence_value or 0)
     message_seq = int(first_value("message_seq", "messageSeq", "msg_seq", "msgSeq") or sequence)
     real_seq = int(first_value("real_seq", "realSeq") or message_seq)
     message_value = int(first_value("message_id", "messageId", "msg_id", "msgId") or real_seq)

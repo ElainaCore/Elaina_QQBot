@@ -426,7 +426,14 @@ class QLinuxManager:
         try:
             payload = normalize_event(payload, str(payload.get('self_id') or '')) or dict(payload)
             payload = normalize_message_identity(payload, str(payload.get('self_id') or ''))
-            sequence = int(payload.get('real_seq') or payload.get('message_seq') or payload.get('message_id') or 0)
+            # message_id 可能是哈希 ID，不能作为 QQ 协议消息序号。
+            sequence = int(
+                payload.get('real_seq')
+                or payload.get('message_seq')
+                or payload.get('sequence')
+                or payload.get('msg_seq')
+                or 0
+            )
             payload.setdefault('sequence', sequence)
             payload.setdefault('nt_msg_seq', 0)
             payload.setdefault('peer', payload.get('group_id') or payload.get('user_id'))

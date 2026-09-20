@@ -483,7 +483,10 @@ class OneBotAPI:
         embedded = data.get('_inline_keyboard')
         if isinstance(embedded, list) and embedded:
             if not sequence or str(sequence).strip() == '0':
-                sequence = data.get('real_seq') or data.get('message_seq')
+                sequence = next((data.get(key) for key in (
+                    'real_seq', 'realSeq', 'message_seq', 'messageSeq',
+                    'msg_seq', 'msgSeq', 'sequence',
+                ) if data.get(key) not in (None, '', 0, '0')), None)
             result = [dict(item) for item in embedded if isinstance(item, dict)]
             if sequence:
                 for item in result:
@@ -492,7 +495,10 @@ class OneBotAPI:
                     item.setdefault('real_seq', str(sequence))
             return result
         if not sequence or str(sequence).strip() == '0':
-            sequence = data.get('real_seq') or data.get('message_seq')
+            sequence = next((data.get(key) for key in (
+                'real_seq', 'realSeq', 'message_seq', 'messageSeq',
+                'msg_seq', 'msgSeq', 'sequence',
+            ) if data.get(key) not in (None, '', 0, '0')), None)
         if not sequence:
             return []
         try:
