@@ -57,6 +57,8 @@ class QLinuxManager:
         # 不能把这次瞬时故障直接暴露给对比任务；恢复锁保证并发请求只
         # 重建一次 runner。
         self._runner_recovery_lock = asyncio.Lock()
+        # 版本标记变化时替换仍在运行的旧进程，避免更新后继续使用旧协议。
+        self._runner_lifecycle_lock = asyncio.Lock()
         self._watchdog_task: asyncio.Task | None = None
         self._load_accounts()
 
@@ -188,23 +190,55 @@ class QLinuxManager:
 
     async def ensure_started(self) -> None:
         """启动 runner (如未运行); 二进制缺失自动走 Releases 下载。"""
-        if self._rpc and self._rpc.alive:
-            return
+        async with self._runner_lifecycle_lock:
+            if self._rpc and self._rpc.alive:
+                downloader = self._downloader or RunnerDownloader(self._bin_dir)
+                self._downloader = downloader
+                if downloader.has_runner():
+                    return
+                if self._rpc and self._rpc.alive and not downloader.has_runner():
+                    log.warning('QLinux runner 版本标记失效，准备替换旧进程')
+                    await self._stop_runner_for_restart(self._rpc)
 
-        # 不能在 _starting 时直接返回: Web 请求可能紧接着访问 _rpc，
-        existing_task = self._start_task
-        if existing_task and not existing_task.done():
-            await asyncio.shield(existing_task)
-            return
+            # 不能在 _starting 时直接返回: Web 请求可能紧接着访问 _rpc，
+            existing_task = self._start_task
+            if existing_task and not existing_task.done():
+                start_task = existing_task
+            else:
+                loop = asyncio.get_running_loop()
+                start_task = loop.create_task(self._start_runner(), name='qlinux-runner-start')
+                self._start_task = start_task
 
-        loop = asyncio.get_running_loop()
-        start_task = loop.create_task(self._start_runner(), name='qlinux-runner-start')
-        self._start_task = start_task
+        # 不要在生命周期锁内等待启动任务。runner 读取循环在启动阶段
+        # 失败时可能触发恢复回调，而恢复回调也需要取得这把锁。
         try:
             await asyncio.shield(start_task)
         finally:
             if self._start_task is start_task and start_task.done():
                 self._start_task = None
+
+    async def _stop_runner_for_restart(self, rpc: RunnerRPC) -> None:
+        """停止待升级 runner，但保留账号票据供新进程恢复。"""
+        watchdog = self._watchdog_task
+        self._watchdog_task = None
+        if watchdog and not watchdog.done() and watchdog is not asyncio.current_task():
+            watchdog.cancel()
+            await asyncio.gather(watchdog, return_exceptions=True)
+        resume_bot_ids = {
+            bot_id for bot_id, account in self._accounts.items()
+            if account.get('status') in {'online', 'connecting', 'reconnecting'}
+        }
+        for bot_id in resume_bot_ids:
+            account = self._accounts.get(bot_id)
+            if account:
+                account['status'] = 'resume_pending'
+        if resume_bot_ids:
+            self._save_accounts()
+        self._login_active.clear()
+        if self._rpc is rpc:
+            self._rpc = None
+        with contextlib.suppress(Exception):
+            await rpc.stop()
 
     async def _start_runner(self) -> None:
         """执行一次 runner 启动；由 ensure_started 统一复用和等待。"""
