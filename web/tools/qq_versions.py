@@ -144,7 +144,13 @@ async def _run_job(job: dict, manager, operation: str, version_key: str, auto_do
 
         install_path = await manager.install_qq(version_key, auto_download, on_download, on_stage)
         executable = _sync_embedded_path(manager, version_key)
+        same_executable = False
         if install_path and executable:
+            try:
+                same_executable = Path(install_path).resolve() == Path(executable).resolve()
+            except OSError:
+                same_executable = str(install_path) == str(executable)
+        if install_path and executable and same_executable:
             _set_job(
                 job,
                 state='completed',
@@ -157,21 +163,43 @@ async def _run_job(job: dict, manager, operation: str, version_key: str, auto_do
                 success=True,
             )
         elif install_path:
+            record = dict((manager.installed_versions or {}).get(version_key) or {})
+            detail = str(record.get('error') or '').strip()
+            manual_command = str(record.get('manual_command') or '').strip()
+            message = '安装包已准备，但未能自动安装 QQ'
+            if detail:
+                message = f'{message}: {detail}'
+            if manual_command:
+                message = f'{message}；可手动执行: {manual_command}'
             _set_job(
                 job,
                 state='manual',
                 stage='manual_install_required',
                 percent=100,
                 indeterminate=False,
-                message='安装包已准备，请完成安装后继续',
+                message=message,
                 install_path=str(install_path),
+                executable=str(executable) if executable else None,
+                manual_command=manual_command,
+                error=detail,
                 success=False,
             )
         else:
             _set_job(job, state='failed', stage='failed', percent=0, indeterminate=False, message='QQ 安装失败', success=False)
     except Exception as exc:
         message = 'QQ 安装包下载失败，请稍后重试' if isinstance(exc, QQDownloadError) else 'QQ 安装失败，请稍后重试'
-        _set_job(job, state='failed', stage='failed', percent=0, indeterminate=False, message=message, error=message, success=False)
+        detail = '; '.join(exc.failures[-2:]) if isinstance(exc, QQDownloadError) else str(exc)
+        _set_job(
+            job,
+            state='failed',
+            stage='failed',
+            percent=0,
+            indeterminate=False,
+            message=message,
+            error=message,
+            detail=detail,
+            success=False,
+        )
     finally:
         job['task'] = None
 

@@ -7,7 +7,9 @@ import json
 import logging
 import os
 import platform
+import posixpath
 import shutil
+import stat
 import sys
 from pathlib import Path
 
@@ -349,12 +351,23 @@ class QQLauncher:
         if display:
             self.launch_env = {
                 'DISPLAY': display,
-                'ELAINAQQ_HEADLESS_RUNTIME': 'shared-xvfb',
+                'ELAINAQQ_HEADLESS_RUNTIME': 'display',
             }
             command = [
                 str(self.executable),
                 '--no-sandbox',
             ]
+        elif os.environ.get('WAYLAND_DISPLAY'):
+            wayland_display = os.environ['WAYLAND_DISPLAY']
+            if not os.path.isabs(wayland_display):
+                runtime_dir = os.environ.get('XDG_RUNTIME_DIR', '')
+                if runtime_dir:
+                    wayland_display = posixpath.join(runtime_dir, wayland_display)
+            self.launch_env = {
+                'ELAINAQQ_HEADLESS_RUNTIME': 'wayland',
+                'WAYLAND_DISPLAY': wayland_display,
+            }
+            command = [str(self.executable), '--no-sandbox', '--ozone-platform=wayland']
         else:
             xvfb_run = shutil.which('xvfb-run')
             if not xvfb_run:
@@ -399,7 +412,17 @@ class QQLauncher:
         if not target_executable.is_file() or current_state != source_state:
             shutil.copytree(self.executable.parent, target_dir, dirs_exist_ok=True, symlinks=True)
             marker.write_text(json.dumps(source_state, ensure_ascii=False, indent=2), encoding='utf-8')
-        return QQLauncher(target_executable, self.bridge_entry)
+        launcher = QQLauncher(target_executable, self.bridge_entry)
+        app_dir = launcher.app_dir()
+        target_root = target_dir.resolve()
+        for path in (app_dir, app_dir / 'package.json'):
+            resolved = path.resolve()
+            try:
+                resolved.relative_to(target_root)
+            except ValueError as exc:
+                raise RuntimeError(f'QQ 运行时链接超出隔离副本: {path}') from exc
+            path.chmod(path.stat().st_mode | stat.S_IWUSR)
+        return launcher
 
     def command(
         self,

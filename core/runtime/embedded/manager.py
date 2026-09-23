@@ -391,6 +391,14 @@ class EmbeddedQQManager:
             if self._xvfb_process and self._xvfb_process.returncode is None:
                 return self._xvfb_display
 
+            # 桌面部署应复用用户现有的显示会话，不应因为没有 Xvfb 而拒绝启动。
+            display = os.environ.get('DISPLAY', '')
+            if display:
+                self._xvfb_display = display
+                return display
+            if os.environ.get('WAYLAND_DISPLAY'):
+                return ''
+
             executable = shutil.which('Xvfb')
             if not executable:
                 raise RuntimeError('Linux 无头运行需要 Xvfb，请先安装 xorg-x11-server-Xvfb 或 xvfb')
@@ -464,12 +472,25 @@ class EmbeddedQQManager:
         qq_path = self._qq_path(bot)
         launcher = QQLauncher(qq_path, self._bridge_entry())
         if sys.platform.startswith('linux'):
-            command = launcher.command(
-                data_dir,
-                headless=True,
-                quick_login=bot.uin if bot.force_quick_login else '',
-                linux_display=self._xvfb_display,
-            )
+            # 系统安装的 QQ 通常位于 root 所有的 /opt/QQ，加载器不能直接写入。
+            # 复用一份框架可写副本，避免 Linux 分支提前返回而绕过权限回退。
+            runtime_root = self._base_dir / 'data' / 'qq_runtime'
+            launcher = launcher.writable_runtime(runtime_root)
+            try:
+                command = launcher.command(
+                    data_dir,
+                    headless=True,
+                    quick_login=bot.uin if bot.force_quick_login else '',
+                    linux_display=self._xvfb_display,
+                )
+            except PermissionError:
+                launcher = launcher.writable_runtime(runtime_root, force_copy=True)
+                command = launcher.command(
+                    data_dir,
+                    headless=True,
+                    quick_login=bot.uin if bot.force_quick_login else '',
+                    linux_display=self._xvfb_display,
+                )
             command = self._linux_cgroup_command(bot, command)
             return command, dict(launcher.launch_env)
         if os.name == 'nt' and bool(cfg.get('settings', 'embedded_qq.windows_hook_launch', False)):

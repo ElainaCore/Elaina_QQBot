@@ -266,6 +266,10 @@ class QLinuxManager:
                     # ensure_started() 的统一封装，否则 runner 恢复时会自等待。
                     await self._rpc.call('bot.create', {'bot_id': bot_id}, timeout=30)
                     if acc.get('status') in {'online', 'connecting', 'reconnecting', 'resume_pending'}:
+                        # 账号重启恢复时，bot.online 事件可能早于插件动作请求，
+                        # 也可能因旧 runner/票据恢复流程没有再次派发。已保存的
+                        # UIN 足以恢复本地 OneBot 路由，避免出现“已登录但 1404”。
+                        self._register_account(bot_id)
                         acc['status'] = 'reconnecting'
                         self._save_accounts()
                         self._login_active.add(bot_id)
@@ -452,22 +456,34 @@ class QLinuxManager:
                         acc['last_error'] = error or '登录后注册在线失败'
                         self._unbind_account(bot_id)
                         self._save_accounts()
+            else:
+                # 某些 runner 版本只保证 login.completed 携带 UIN，
+                # 不保证 bot.online 一定先于它到达 Python 进程。
+                # 登录完成时也尝试一次绑定，作为生命周期事件的兜底。
+                acc = self._accounts.get(bot_id)
+                self._update_account_uin(bot_id, event)
+                if acc:
+                    acc['status'] = 'online'
+                    acc['last_online'] = int(time.time())
+                    self._save_accounts()
+                self._register_account(bot_id)
             self._login_active.discard(bot_id)
             return
         if etype == 'bot.online':
             self._login_active.discard(bot_id)
             acc = self._accounts.get(bot_id)
+            uin = self._update_account_uin(bot_id, event)
             if acc:
                 acc['status'] = 'online'
-                acc['uin'] = str(event.get('uin') or acc.get('uin', ''))
                 acc['last_online'] = int(time.time())
                 self._save_accounts()
-            uin = str(event.get('uin') or (acc or {}).get('uin', '')) if acc else str(event.get('uin') or '')
             adapter = getattr(self._app, 'adapter', None)
             if adapter is not None and uin:
                 # bot_id 是面板配置编号，uin 是 OneBot 标准 self_id；两者
                 adapter.register_identity_alias(bot_id, uin)
-            asyncio.get_running_loop().create_task(self._bind_account(bot_id))
+            # 注册动作处理器本身不需要异步 I/O。同步完成可以消除
+            # bot.online 与插件首个出站请求之间的事件循环竞态。
+            self._register_account(bot_id)
         elif etype == 'bot.offline':
             # 运行期间收到下线/被踢只更新为离线，不能擅自重新登录。
             # 只有框架 shutdown 保存为 resume_pending 后，下一次启动才会恢复登录。
@@ -530,15 +546,53 @@ class QLinuxManager:
         except Exception:  # noqa: BLE001
             log.exception('QLinux 事件注入失败')
 
-    async def _bind_account(self, bot_id: str) -> None:
-        """登录成功后把账号注册为 OneBot 本地动作 bot (发消息能力)。"""
+    @staticmethod
+    def _event_uin(event: dict) -> str:
+        """从不同 runner 版本的生命周期事件中提取真实 QQ UIN。"""
+        if not isinstance(event, dict):
+            return ''
+        candidates = [
+            event.get('uin'), event.get('self_id'), event.get('selfId'),
+            event.get('self_uin'), event.get('selfUin'),
+        ]
+        data = event.get('data')
+        if isinstance(data, dict):
+            candidates.extend([
+                data.get('uin'), data.get('self_id'), data.get('selfId'),
+                data.get('self_uin'), data.get('selfUin'),
+            ])
+        for value in candidates:
+            text = str(value or '').strip()
+            if text and text != '0':
+                return text
+        return ''
+
+    def _update_account_uin(self, bot_id: str, event: dict) -> str:
+        """记录生命周期事件携带的 UIN，并返回当前有效 UIN。"""
         acc = self._accounts.get(bot_id)
-        uin = str(acc.get('uin', '')) if acc else ''
-        if not uin or uin in self._registered_uins:
-            return
+        current = str((acc or {}).get('uin') or '').strip()
+        uin = self._event_uin(event) or current
+        if acc and uin and uin != current:
+            acc['uin'] = uin
+            self._save_accounts()
+        return uin
+
+    def _register_account(self, bot_id: str) -> bool:
+        """同步注册 QLinux 的 OneBot 本地动作路由。"""
+        acc = self._accounts.get(bot_id)
+        uin = str(acc.get('uin', '')).strip() if acc else ''
+        if not uin:
+            return False
         adapter = getattr(self._app, 'adapter', None)
         if adapter is None:
-            return
+            return False
+
+        # _registered_uins 只是管理器内存中的优化标记；适配器可能在热重载、
+        # 连接重建或其他渠道清理时丢失实际 handler，不能仅凭该集合跳过绑定。
+        local_actions = getattr(adapter, 'local_actions', {})
+        if uin in self._registered_uins and uin in local_actions:
+            adapter.register_identity_alias(bot_id, uin)
+            return True
 
         async def _handler(action: str, params: dict, _bot_id=bot_id):
             return await self.handle_action(_bot_id, action, params)
@@ -549,6 +603,11 @@ class QLinuxManager:
         adapter.register_identity_alias(bot_id, uin)
         self._registered_uins.add(uin)
         log.info('QLinux 账号 %s (bot_id=%s) 已绑定本地动作', uin, bot_id)
+        return True
+
+    async def _bind_account(self, bot_id: str) -> None:
+        """兼容旧调用方的异步绑定入口。"""
+        self._register_account(bot_id)
 
     # ---------- 公开 API (web 面板与动作层调用) ----------
 
