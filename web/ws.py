@@ -221,7 +221,10 @@ async def handle_sse(request: web.Request) -> web.StreamResponse:
                 await resp.write(f'data: {payload}\n\n'.encode())
             except TimeoutError:
                 await resp.write(b': keepalive\n\n')
-    except (asyncio.CancelledError, ConnectionResetError, Exception):
+    except asyncio.CancelledError:
+        # 关闭时必须向上传播取消，不能吞掉，否则协程被取消后仍返回响应。
+        raise
+    except (ConnectionResetError, Exception):  # noqa: BLE001
         pass
     finally:
         _broadcast.sse_queues.discard(queue)

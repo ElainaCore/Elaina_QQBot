@@ -16,11 +16,21 @@ def action_ok(data: Any = None, **extra) -> dict[str, Any]:
 
 
 def action_failed(message: str, retcode: int = 1500, **extra) -> dict[str, Any]:
-    """构造标准失败响应。"""
+    """构造标准失败响应。
+
+    失败响应绝不能返回 retcode=0：大量调用方只检查 retcode==0 判定成功，
+    retcode=0 的 failed 会被误读成成功 (例如原生错误无数字码时的回落)。
+    """
     text = str(message or 'OneBot 动作执行失败')
+    try:
+        code = int(retcode)
+    except (TypeError, ValueError):
+        code = 1500
+    if code == 0:
+        code = 1500
     return {
         'status': 'failed',
-        'retcode': int(retcode),
+        'retcode': code,
         'data': None,
         'message': text,
         'wording': text,

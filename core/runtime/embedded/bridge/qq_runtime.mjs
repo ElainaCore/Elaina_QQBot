@@ -1003,6 +1003,12 @@ class QQInstance {
         return this.getGroupSignedList(params);
       case "upload_image_to_qun_album":
         return this.uploadImageToQunAlbum(params);
+      case "upload_images_to_qun_album":
+        return this.uploadImagesToQunAlbum(params);
+      case "upload_video_to_qun_album":
+        return this.uploadVideoToQunAlbum(params);
+      case "get_group_share_link":
+        return this.getGroupShareLink(params);
       case "send_qzone_msg":
         return this.sendQzoneMessage(params);
       case "delete_qzone_msg":
@@ -2921,6 +2927,50 @@ class QQInstance {
       if (materialized.temporary) this.removeTemporaryFile(materialized.path);
     }
   }
+  // NapCat UploadImagesToQunAlbum: 一次上传多张图片，共用同一批次进入相册。
+  async uploadImagesToQunAlbum(params) {
+    const groupId = String(params.group_id || "").trim();
+    const albumId = String(params.album_id || "").trim();
+    const albumName = String(params.album_name || "");
+    const files = Array.isArray(params.files) ? params.files : [];
+    if (!groupId || !albumId) throw new OneBotActionError("上传群相册图片缺少 group_id/album_id", 1400, "upload_images_to_qun_album");
+    if (!files.length) throw new OneBotActionError("files 不能为空", 1400, "upload_images_to_qun_album");
+    const temporary = [];
+    try {
+      for (const file of files) {
+        const materialized = await this.materializeFile(String(file), ".jpg");
+        if (materialized.temporary) temporary.push(materialized.path);
+        await this.uploadImageToQunAlbum({
+          group_id: groupId, album_id: albumId, album_name: albumName, file: materialized.path,
+        });
+      }
+      return null;
+    } finally {
+      for (const path of temporary) this.removeTemporaryFile(path);
+    }
+  }
+  // NapCat UploadVideoToQunAlbum: 需要视频会话与封面关联，当前内置运行时未实现。
+  async uploadVideoToQunAlbum() {
+    throw new OneBotActionError("当前内置 QQ 版本未提供 upload_video_to_qun_album 所需的原生能力", 1405, "upload_video_to_qun_album");
+  }
+  // NapCat GetGroupShareLink: 通过原生 getJoinGroupLink 获取加群/分享链接。
+  async getGroupShareLink(params = {}) {
+    const groupId = String(params.group_id || "").trim();
+    if (!groupId) throw new OneBotActionError("缺少 group_id", 1400, "get_group_share_link");
+    const needShortUrl = params.need_short_url === void 0 ? true : String(params.need_short_url) === "true";
+    const srcId = params.src_id === void 0 ? 73 : Number(params.src_id);
+    const method = requireNativeMethod(this.getGroupService(), "getJoinGroupLink", "get_group_share_link");
+    const result = await method({
+      groupCode: groupId,
+      srcId,
+      needShortUrl,
+      additionalParam: String(params.additional_param ?? ""),
+    });
+    if (!result?.url) {
+      throw new OneBotActionError(String(result?.errMsg || result?.message || "获取群分享链接失败"), Number(result?.result || 1500), "get_group_share_link");
+    }
+    return { url: String(result.url) };
+  }
   bknFromSkey(skey) {
     let hash = 5381;
     for (const char of String(skey || "")) hash += (hash << 5) + char.charCodeAt(0);
@@ -3636,15 +3686,13 @@ class QQInstance {
     if (!service || typeof service.clickInlineKeyboardButton !== "function") {
       throw new Error("当前 QQ 协议不支持 clickInlineKeyboardButton");
     }
-    const msgSeq = String(params.msg_seq || params.message_seq || params.real_seq || "");
-    if (!msgSeq || msgSeq === "0") {
-      throw new OneBotActionError("点击按钮缺少有效的消息序号", 1400, "click_inline_keyboard_button");
-    }
+    // 参数与 NapCat ClickInlineKeyboardButton 一致:
+    // msg_seq 缺省为 "10086", button_id 缺省为 "1", chatType=2 (群聊)。
     const result = await service.clickInlineKeyboardButton({
       buttonId: String(params.button_id || "1"),
       peerId: String(params.group_id || ""),
       botAppid: String(params.bot_appid || ""),
-      msgSeq,
+      msgSeq: String(params.msg_seq ?? params.message_seq ?? params.real_seq ?? "10086"),
       callback_data: String(params.callback_data || ""),
       dmFlag: 0,
       chatType: 2

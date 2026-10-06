@@ -75,12 +75,46 @@ class LogService:
                 with self._database_lock(key):
                     connection.close()
 
+    @staticmethod
+    def _free_rlock(lock: threading.RLock) -> bool:
+        """判断 RLock 当前未被持有（用公开的非阻塞 acquire 探测）。"""
+        try:
+            acquired = lock.acquire(blocking=False)
+        except RuntimeError:
+            return False
+        if acquired:
+            lock.release()
+            return True
+        return False
+
     def _database_lock(self, key: tuple[str, str]) -> threading.RLock:
         with self._connection_lock:
-            return self._database_locks.setdefault(key, threading.RLock())
+            lock = self._database_locks.get(key)
+            if lock is None:
+                # 锁字典按 (类型, 账号) 增长；键来自请求输入，需设上限。
+                # 只清理当前未被持有的锁，避免误删正在使用的锁。
+                if len(self._database_locks) >= 512:
+                    for stale, candidate in list(self._database_locks.items()):
+                        if stale == key or not self._free_rlock(candidate):
+                            continue
+                        del self._database_locks[stale]
+                        if len(self._database_locks) < 384:
+                            break
+                lock = threading.RLock()
+                self._database_locks[key] = lock
+            return lock
 
     def _flush_lock(self, key: tuple[str, str]) -> asyncio.Lock:
-        return self._flush_locks.setdefault(key, asyncio.Lock())
+        lock = self._flush_locks.get(key)
+        if lock is None:
+            if len(self._flush_locks) >= 512:
+                for stale in [k for k, v in self._flush_locks.items() if k != key and not v.locked()]:
+                    self._flush_locks.pop(stale, None)
+                    if len(self._flush_locks) < 384:
+                        break
+            lock = asyncio.Lock()
+            self._flush_locks[key] = lock
+        return lock
 
     @property
     def stats(self) -> dict[str, int]:
@@ -170,7 +204,15 @@ class LogService:
     def _database_path(self, key: tuple[str, str]) -> str:
         log_type, bot_qq = key
         if bot_qq:
-            return os.path.join(self._base_dir, bot_qq, f'{log_type}.db')
+            account = str(bot_qq)
+            base = os.path.realpath(self._base_dir)
+            candidate = os.path.realpath(os.path.join(base, account, f'{log_type}.db'))
+            # bot_qq 只允许是账号分库的单层目录名；拒绝 ../、绝对路径以及任意
+            # 路径分隔符 (/ 与 \，Windows 下 os.sep 只是其中之一)。
+            has_separator = any(sep in account for sep in ('/', '\\')) or account.strip(os.sep) != account
+            if has_separator or os.path.commonpath((base, candidate)) != base:
+                raise ValueError(f'非法的日志账号分库: {bot_qq!r}')
+            return candidate
         return os.path.join(self._base_dir, f'{log_type}.db')
 
     def _warn_queue_drop(self, log_type: str) -> None:

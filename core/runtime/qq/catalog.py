@@ -1,4 +1,9 @@
-"""内置运行时支持的 QQ 安装包目录。"""
+"""内置运行时支持的 QQ 安装包目录。
+
+``version`` 字段必须与 NapCat 的 ``napcat-core/external/appid.json`` /
+``packet.json`` 构建号一致 (见 ``core/runtime/embedded/bridge/qq_appid.json``)，
+否则原生包 Hook 与内置登录无法匹配。更新安装包时须同时更新构建号。
+"""
 
 from typing import Any
 
@@ -15,10 +20,13 @@ QQ_VERSIONS: dict[str, dict[str, Any]] = {
         'arch': 'x64',
         'package': 'exe',
     },
+    # NapCat 兼容的旧版 Windows 构建号为 9.9.30-48517 / 9.9.30-48762；
+    # 上游 9.9.30 安装包发布时未提供确定性构建号，此处沿用 NapCat 构建号，
+    # 安装后由 launcher 从 QQ 目录读取真实 curVersion 再行校验。
     'windows_x64_legacy': {
         'label': '旧版 QQ',
         'channel': 'legacy',
-        'version': '9.9.30-260429',
+        'version': '9.9.30-48762',
         'url': 'https://github.com/Rodert/qq-versions/releases/download/qq-windows-x64-9.9.30-20260429/QQ_9.9.30_260429_x64_01.exe',
         'filename': 'QQ_9.9.30_260429_x64_01.exe',
         'size': 291623088,

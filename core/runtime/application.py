@@ -70,6 +70,7 @@ class Application:
         self._embedded_qq = None
         self._embedded_qq_start_task = None
         self._qlinux_manager = None
+        self._qlinux_start_task = None
         self._process_injector = NativeQQInjector(self._base_dir)
         self._hook_bridges: dict[int, HookBridge] = {}
         self._hook_bot_ids: set[str] = set()
@@ -341,7 +342,10 @@ class Application:
 
         # 8.7) QLinux (Lagrange) 渠道 — 拉起 runner 并恢复已有账号
         if self._qlinux_manager:
-            asyncio.create_task(self._qlinux_manager.ensure_started(), name='qlinux-autostart')
+            # 保存任务引用，shutdown 时等待/取消，避免 runner 子进程变孤儿。
+            self._qlinux_start_task = asyncio.create_task(
+                self._qlinux_manager.ensure_started(), name='qlinux-autostart'
+            )
 
         # 9) 配置监视
         self._config_watcher = ConfigWatcherService(interval=5.0, on_reload=self.apply_config)
@@ -420,6 +424,10 @@ class Application:
                 await self._embedded_qq_start_task
         if self._embedded_qq:
             await self._shutdown_step('内置 QQ 进程', self._embedded_qq.stop_all(), timeout=20)
+        if self._qlinux_start_task and not self._qlinux_start_task.done():
+            self._qlinux_start_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._qlinux_start_task
         if self._qlinux_manager:
             await self._shutdown_step('QLinux 协议端', self._qlinux_manager.shutdown(), timeout=10)
         if self._process_injector:

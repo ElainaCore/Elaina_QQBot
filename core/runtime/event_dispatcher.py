@@ -22,10 +22,12 @@ class EventDispatcher:
         *,
         max_concurrency: int = 32,
         max_pending: int = 2000,
+        shutdown_timeout: float = 10.0,
     ) -> None:
         self._processor = processor
         self._concurrency = asyncio.Semaphore(max(1, max_concurrency))
         self._max_pending = max(1, max_pending)
+        self._shutdown_timeout = max(0.1, float(shutdown_timeout))
         self._queues: dict[str, deque[Any]] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._pending = 0
@@ -80,14 +82,26 @@ class EventDispatcher:
         tasks = tuple(self._workers.values())
         if not tasks:
             return
+
+        async def _drain() -> None:
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                self._reject_pending()
+                raise
+
+        # 设上限：某个插件 handler 卡死时不能让整个框架的关闭流程永久挂起。
         try:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        except asyncio.CancelledError:
+            await asyncio.wait_for(_drain(), timeout=self._shutdown_timeout)
+        except TimeoutError:
+            log.warning('事件管线关闭超时，强制取消 %d 个会话任务', len(tasks))
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             self._reject_pending()
-            raise
 
     def _reject_pending(self) -> None:
         """拒绝强制关闭时尚未处理的事件，并释放全部队列引用。"""

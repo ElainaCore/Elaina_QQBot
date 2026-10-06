@@ -143,6 +143,12 @@ class HookBridge:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._pump_task
             self._pump_task = None
+        # 取消仍在派发的事件任务，避免关闭后仍有事件进入管线。
+        for task in list(self._dispatch_tasks):
+            task.cancel()
+        if self._dispatch_tasks:
+            await asyncio.gather(*self._dispatch_tasks, return_exceptions=True)
+            self._dispatch_tasks.clear()
         await self._control.close()
         await self._recv.close()
         self.status.control_open = self.status.recv_open = False
@@ -196,11 +202,13 @@ class HookBridge:
             self._handle_packet(frame)
             return
         if op in (OP_ACK, OP_REPLY, OP_ERROR):
+            # ACK 只是受理确认，必须保留 pending 直到 REPLY/ERROR 到达，
+            # 否则真正的结果会因 future 已被弹出而丢失 (请求超时)。
+            if op == OP_ACK:
+                return
             fut = self._pending.pop(frame.request_id, None)
             if fut is None or fut.done():
                 return
-            if op == OP_ACK:
-                return  # 仅确认受理，继续等 REPLY
             if op == OP_ERROR:
                 fut.set_exception(RuntimeError(frame.msg or f'hook 请求失败 status={frame.status}'))
                 return
@@ -462,27 +470,14 @@ class HookBridge:
 
     @staticmethod
     def _raw_message(segments: list[dict[str, Any]]) -> str:
-        """把段列表序列化为 CQ 码字符串（与 OneBot raw_message 语义一致）。"""
-        parts: list[str] = []
-        for seg in segments:
-            seg_type = seg['type']
-            data = seg.get('data') or {}
-            if seg_type == 'text':
-                text = str(data.get('text') or '')
-                parts.append(text.replace('&', '&amp;').replace('[', '&#91;')
-                             .replace(']', '&#93;').replace(',', '&#44;'))
-                continue
-            fields = ','.join(
-                '{}={}'.format(
-                    key,
-                    str(value).replace('&', '&amp;').replace('[', '&#91;')
-                    .replace(']', '&#93;').replace(',', '&#44;')
-                    .replace('\r', '&#10;').replace('\n', '&#8260;'),
-                )
-                for key, value in data.items() if value is not None
-            )
-            parts.append(f'[CQ:{seg_type}{"," if fields else ""}{fields}]')
-        return ''.join(parts)
+        """把段列表序列化为 CQ 码字符串（与 OneBot raw_message 语义一致）。
+
+        复用统一编码器：此前本地实现会在正文里转义逗号，把普通文本中的
+        `,` 变成 `&#44;`，与其它渠道的 raw_message 不一致。
+        """
+        from core.protocols.onebot.message import message_to_cq
+
+        return message_to_cq(segments)
 
     # -- 请求缓存（供 get_msg / 回复目标）-----------------------------------
 

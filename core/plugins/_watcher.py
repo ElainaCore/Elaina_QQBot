@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import os
+import threading
 
 from core.foundation.logging import PLUGIN, get_logger, report_error
 
@@ -12,18 +13,29 @@ log = get_logger(PLUGIN, '管理器')
 class _WatcherMixin:
     """监视插件文件变更并自动热重载。"""
 
+    def _mtimes_lock(self) -> threading.Lock:
+        lock = getattr(self, '_file_mtimes_guard', None)
+        if lock is None:
+            lock = threading.Lock()
+            self._file_mtimes_guard = lock
+        return lock
+
     def _scan_plugin_mtimes(self, pdir):
-        for root, dirs, files in os.walk(pdir):
-            dirs[:] = [name for name in dirs if name != '__pycache__' and not name.startswith('.')]
-            for f in files:
-                if f.endswith('.py'):
-                    fp = os.path.join(root, f)
-                    with contextlib.suppress(OSError):
-                        stat = os.stat(fp)
-                        self._file_mtimes[fp] = (stat.st_mtime_ns, stat.st_size)
+        # 该函数经 asyncio.to_thread 调用，可能与监视循环 / reload 并发，
+        # 必须加锁，否则会触发 “dictionary changed size during iteration”。
+        with self._mtimes_lock():
+            for root, dirs, files in os.walk(pdir):
+                dirs[:] = [name for name in dirs if name != '__pycache__' and not name.startswith('.')]
+                for f in files:
+                    if f.endswith('.py'):
+                        fp = os.path.join(root, f)
+                        with contextlib.suppress(OSError):
+                            stat = os.stat(fp)
+                            self._file_mtimes[fp] = (stat.st_mtime_ns, stat.st_size)
 
     def _snapshot_all_mtimes(self):
-        self._file_mtimes.clear()
+        with self._mtimes_lock():
+            self._file_mtimes.clear()
         for name in self._plugins:
             pdir = os.path.join(self._dir, name)
             if os.path.isdir(pdir):
@@ -34,14 +46,16 @@ class _WatcherMixin:
 
     def _detect_changed_plugins(self):
         changed = set()
-        for fp, old_mt in list(self._file_mtimes.items()):
-            try:
-                stat = os.stat(fp)
-                if (stat.st_mtime_ns, stat.st_size) != old_mt:
+        with self._mtimes_lock():
+            for fp, old_mt in list(self._file_mtimes.items()):
+                try:
+                    stat = os.stat(fp)
+                    if (stat.st_mtime_ns, stat.st_size) != old_mt:
+                        changed.add(self._plugin_of(fp))
+                except OSError:
                     changed.add(self._plugin_of(fp))
-            except OSError:
-                changed.add(self._plugin_of(fp))
-                self._file_mtimes.pop(fp, None)
+                    self._file_mtimes.pop(fp, None)
+            known = set(self._file_mtimes)
         for name in self._plugins:
             pdir = os.path.join(self._dir, name)
             if not os.path.isdir(pdir):
@@ -49,7 +63,7 @@ class _WatcherMixin:
             for root, dirs, files in os.walk(pdir):
                 dirs[:] = [item for item in dirs if item != '__pycache__' and not item.startswith('.')]
                 for f in files:
-                    if f.endswith('.py') and os.path.join(root, f) not in self._file_mtimes:
+                    if f.endswith('.py') and os.path.join(root, f) not in known:
                         changed.add(name)
         return changed
 

@@ -116,17 +116,24 @@ def _button_id(fields: list[tuple[int, int, Any]]) -> str:
     return ''
 
 
-def _find_button(
+def _collect_buttons(
     data: bytes,
+    out: list[tuple[str, str]],
+    seen: set[tuple[str, str]],
     depth: int = 0,
     inherited_button_id: str = '',
-) -> tuple[str, str] | None:
+) -> None:
+    """递归遍历 QQNT 消息 protobuf，收集全部内联键盘回调按钮。
+
+    与 JS 侧 ``extractInlineKeyboardButtons`` 对齐：一条消息可携带多个按钮，
+    不能只返回第一个。
+    """
     if depth > 32 or not data:
-        return None
+        return
     try:
         fields = _parse_fields(data)
     except ValueError:
-        return None
+        return
 
     local_button_id = _button_id(fields)
     # ButtonExtra 的结构是 Button(id=1, action=3)，而 callback_data 位于
@@ -134,21 +141,22 @@ def _find_button(
     # 进入 action 后把 type(=1/2) 误当成按钮 id。
     if not local_button_id or (local_button_id.isdigit() and inherited_button_id):
         local_button_id = inherited_button_id
-    for _tag, wire_type, value in fields:
-        if wire_type != 2:
-            continue
-        callback_data = _text(value)
-        if callback_data.startswith('BOT1.0_'):
-            return local_button_id, callback_data
 
     for _tag, wire_type, value in fields:
         if wire_type != 2:
             continue
-        found = _find_button(value, depth + 1, local_button_id)
-        if found:
-            button_id, callback_data = found
-            return button_id or local_button_id, callback_data
-    return None
+        callback_data = _text(value)
+        if not callback_data.startswith('BOT1.0_'):
+            continue
+        identity = (local_button_id or '1', callback_data)
+        if identity not in seen:
+            seen.add(identity)
+            out.append(identity)
+
+    for _tag, wire_type, value in fields:
+        if wire_type != 2:
+            continue
+        _collect_buttons(value, out, seen, depth + 1, local_button_id)
 
 
 def _hex_payload(value: Any) -> str:
@@ -175,19 +183,17 @@ def extract_inline_keyboard_buttons(
     *,
     bot_appid: str = '',
 ) -> list[dict[str, str]]:
-    """提取 SsoGetGroupMsg 响应中嵌入的回调按钮。"""
+    """提取 SsoGetGroupMsg 响应中嵌入的全部回调按钮。"""
     payload = _hex_payload(response)
     if not payload:
         return []
+    found: list[tuple[str, str]] = []
     try:
-        found = _find_button(bytes.fromhex(payload))
+        _collect_buttons(bytes.fromhex(payload), found, set())
     except ValueError:
         return []
-    if not found:
-        return []
-    button_id, callback_data = found
-    return [{
-        'bot_appid': str(bot_appid or ''),
-        'button_id': button_id or '1',
-        'callback_data': callback_data,
-    }]
+    appid = str(bot_appid or '')
+    return [
+        {'bot_appid': appid, 'button_id': button_id or '1', 'callback_data': callback_data}
+        for button_id, callback_data in found
+    ]

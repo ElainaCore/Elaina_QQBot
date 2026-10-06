@@ -9,6 +9,9 @@ import logging
 import time
 from pathlib import Path
 
+import aiohttp
+
+from core.foundation.config import cfg
 from core.protocols.onebot.cache import MessageCache
 from core.protocols.onebot.event import normalize_event
 from core.protocols.onebot.identity import (
@@ -51,6 +54,7 @@ class QLinuxManager:
         # Lagrange 的 Login() 不是可重入操作。启动恢复和面板点击扫码可能
         self._login_active: set[str] = set()
         self._registered_uins: set[str] = set()
+        self._ingest_tasks: set[asyncio.Task] = set()
         self._message_cache = MessageCache()
         self._shutting_down = False
         # Runner 进程可能因协议升级或底层网络异常短暂退出。动作请求
@@ -60,23 +64,58 @@ class QLinuxManager:
         # 版本标记变化时替换仍在运行的旧进程，避免更新后继续使用旧协议。
         self._runner_lifecycle_lock = asyncio.Lock()
         self._watchdog_task: asyncio.Task | None = None
+        # 签名服务健康探测：签名端抖动会表现为 runner 章节失败，但不应被
+        # 当成 runner 进程故障而粗暴重启，否则账号会被反复踢下线。
+        self._sign_health_task: asyncio.Task | None = None
+        self._sign_healthy = True
+        self._sign_last_error = ''
         self._load_accounts()
 
     # ---------- 配置 ----------
 
     def _sign_server(self) -> str:
-        try:
-            return str(self._app.cfg.get('settings', 'qlinux', {}).get('sign_server')
-                       or _DEFAULT_SIGN_SERVER)
-        except Exception:  # noqa: BLE001
-            return _DEFAULT_SIGN_SERVER
+        value = cfg.get('settings', 'qlinux.sign_server', '')
+        return str(value or _DEFAULT_SIGN_SERVER)
+
+    def sign_healthy(self) -> bool:
+        """签名服务是否可用（用于面板展示与降噪诊断）。"""
+        return self._sign_healthy
+
+    def sign_status(self) -> dict:
+        return {'healthy': self._sign_healthy, 'error': self._sign_last_error}
+
+    async def _sign_health_loop(self) -> None:
+        """定期探测签名服务，避免把签名抖动误判为 runner/账号故障。"""
+        url = self._sign_server().rstrip('/') + '/health'
+        # 允许配置为不带 /health 的兼容端：探测失败仅是提示，不影响运行。
+        while not self._shutting_down:
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session, session.get(url) as resp:
+                    healthy = resp.status < 500
+                    body = '' if healthy else f'HTTP {resp.status}'
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                healthy, body = False, str(exc)
+            if healthy != self._sign_healthy:
+                if healthy:
+                    log.info('QLinux 签名服务已恢复: %s', self._sign_server())
+                else:
+                    log.warning(
+                        'QLinux 签名服务不可用: %s (%s)。账号可能无法收发消息，'
+                        '但不会因此重启 runner。',
+                        self._sign_server(), body,
+                    )
+            self._sign_healthy = healthy
+            self._sign_last_error = '' if healthy else body
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                raise
 
     def enabled(self) -> bool:
-        try:
-            # 默认开启 (与 Application 装配逻辑一致), 显式 enabled: false 才禁用
-            return bool((self._app.cfg.get('settings', 'qlinux', {}) or {}).get('enabled', True))
-        except Exception:  # noqa: BLE001
-            return True
+        # 默认开启 (与 Application 装配逻辑一致), 显式 enabled: false 才禁用
+        return bool(cfg.get('settings', 'qlinux.enabled', True))
 
     def _rpc_or_raise(self) -> RunnerRPC:
         """返回已启动的 runner。"""
@@ -137,7 +176,14 @@ class QLinuxManager:
             # 其他并发请求可能已经完成了恢复。
             if self._rpc is not failed_rpc and self._rpc and self._rpc.alive:
                 return
-            self._mark_accounts_offline('QLinux runner 通道已断开')
+            # 保留可恢复账号的状态，供 ensure_started 触发快速重登；
+            # 仅清理其他账号，避免恢复流程自己把恢复条件抹掉。
+            resumable = {
+                bot_id
+                for bot_id, acc in self._accounts.items()
+                if acc.get('status') in {'online', 'connecting', 'reconnecting', 'resume_pending'}
+            }
+            self._mark_accounts_offline('QLinux runner 通道已断开', keep=resumable)
             if self._rpc is failed_rpc:
                 self._rpc = None
             with contextlib.suppress(Exception):
@@ -167,18 +213,28 @@ class QLinuxManager:
     # ---------- 账号持久化 ----------
 
     def _load_accounts(self) -> None:
-        if self._accounts_path.is_file():
-            try:
-                changed = False
-                for acc in json.loads(self._accounts_path.read_text(encoding='utf-8')):
-                    if 'protocol' in acc:
-                        acc.pop('protocol')
-                        changed = True
-                    self._accounts[acc['bot_id']] = acc
-                if changed:
-                    self._save_accounts()
-            except Exception:  # noqa: BLE001
-                log.exception('QLinux 账号文件损坏, 已忽略')
+        if not self._accounts_path.is_file():
+            return
+        try:
+            raw = json.loads(self._accounts_path.read_text(encoding='utf-8'))
+        except Exception:  # noqa: BLE001
+            log.exception('QLinux 账号文件损坏, 已忽略')
+            return
+        if not isinstance(raw, list):
+            log.warning('QLinux 账号文件格式异常 (期望列表), 已忽略')
+            return
+        changed = False
+        # 逐条校验：单条损坏不应导致其后的所有账号都无法加载。
+        for acc in raw:
+            if not isinstance(acc, dict) or not str(acc.get('bot_id') or '').strip():
+                log.warning('跳过无效的 QLinux 账号记录: %r', acc)
+                continue
+            if 'protocol' in acc:
+                acc.pop('protocol')
+                changed = True
+            self._accounts[str(acc['bot_id'])] = acc
+        if changed:
+            self._save_accounts()
 
     def _save_accounts(self) -> None:
         self._data_dir.mkdir(parents=True, exist_ok=True)
@@ -257,6 +313,10 @@ class QLinuxManager:
             self._watchdog_task = asyncio.create_task(
                 self._runner_watchdog(self._rpc), name='qlinux-runner-watchdog'
             )
+            if self._sign_health_task is None or self._sign_health_task.done():
+                self._sign_health_task = asyncio.create_task(
+                    self._sign_health_loop(), name='qlinux-sign-health'
+                )
             log.info('QLinux runner 就绪')
             # 恢复已有账号。仅创建 runner 侧 Bot 不会开始收包，必须再调用
             for bot_id in list(self._accounts):
@@ -286,6 +346,12 @@ class QLinuxManager:
             self._starting = False
 
     async def shutdown(self) -> None:
+        # 先取消未完成的事件派发任务，再关 runner，避免关闭中途丢事件。
+        for task in list(self._ingest_tasks):
+            task.cancel()
+        if self._ingest_tasks:
+            await asyncio.gather(*self._ingest_tasks, return_exceptions=True)
+            self._ingest_tasks.clear()
         rpc = self._rpc
         if rpc is None:
             return
@@ -302,6 +368,11 @@ class QLinuxManager:
         if watchdog and not watchdog.done():
             watchdog.cancel()
             await asyncio.gather(watchdog, return_exceptions=True)
+        health = self._sign_health_task
+        self._sign_health_task = None
+        if health and not health.done():
+            health.cancel()
+            await asyncio.gather(health, return_exceptions=True)
         if rpc.alive:
             stop_tasks = [
                 asyncio.create_task(
@@ -342,6 +413,16 @@ class QLinuxManager:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001
+                    # ping 走同一 stdio 通道，签名服务卡住时 runner 可能只是
+                    # 忙而不是死了。此时重启 runner 会踢掉全部账号，必须区分：
+                    # 签名不可用时延长容忍度并只告警。
+                    if not self._sign_healthy:
+                        consecutive_failures = 0
+                        log.warning(
+                            'QLinux 探活失败，但签名服务当前不可用，暂不重启 runner: %s',
+                            exc,
+                        )
+                        continue
                     consecutive_failures += 1
                     log.warning('QLinux runner 探活失败 (%d/3): %s', consecutive_failures, exc)
                     if consecutive_failures < 3:
@@ -378,11 +459,16 @@ class QLinuxManager:
         if uin:
             self._registered_uins.discard(uin)
 
-    def _mark_accounts_offline(self, reason: str = '') -> None:
-        """runner 通道丢失后立即清理所有旧在线状态。"""
+    def _mark_accounts_offline(self, reason: str = '', *, keep: set[str] | None = None) -> None:
+        """runner 通道丢失后立即清理所有旧在线状态。
+
+        ``keep`` 中的账号保留原状态：runner 自动恢复后需要据此触发重登，
+        若一并改成 offline，_start_runner 的恢复分支将不再命中，账号会永久掉线。
+        """
+        keep = keep or set()
         changed = False
         for bot_id, acc in self._accounts.items():
-            if acc.get('status') in {'online', 'connecting', 'reconnecting', 'password_login'}:
+            if bot_id not in keep and acc.get('status') in {'online', 'connecting', 'reconnecting', 'password_login'}:
                 acc['status'] = 'offline'
                 if reason:
                     acc['last_error'] = reason
@@ -510,8 +596,10 @@ class QLinuxManager:
         # OneBot 事件转换 → 框架事件总线
         payload = runner_event_to_onebot(event)
         if payload:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self._ingest(payload))
+            task = asyncio.get_running_loop().create_task(self._ingest(payload))
+            # 保存引用，避免任务被 GC，并可在 shutdown 时统一取消。
+            self._ingest_tasks.add(task)
+            task.add_done_callback(self._ingest_tasks.discard)
 
     async def _ingest(self, payload: dict) -> None:
         try:

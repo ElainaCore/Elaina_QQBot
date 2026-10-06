@@ -36,7 +36,7 @@ async def _login_info(self_id: str) -> dict:
             info = resp.get('data') or {}
     except Exception:
         info = {}
-    _login_cache[self_id] = (now, info)
+    _common.cache_put(_login_cache, self_id, (now, info))
     return info
 
 

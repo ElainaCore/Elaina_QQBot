@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+from core.protocols.onebot.contract import normalize_int
+
 
 def hash_message_id(sequence: int, session_id: int, event_name: str) -> int:
     """生成稳定的 OneBot int32 消息 ID。"""
@@ -44,6 +46,11 @@ def message_id(
     )
 
 
+def _as_int(value: Any, fallback: int = 0) -> int:
+    """宽松整数转换；非数字 (如外部协议端的字符串 ID) 回退而不抛异常。"""
+    return normalize_int(value, fallback)
+
+
 def normalize_message_identity(payload: dict[str, Any], fallback_self_id: str = "") -> dict[str, Any]:
     """补齐 message_id、message_seq、real_id 与 real_seq。"""
     data = dict(payload)
@@ -67,12 +74,12 @@ def normalize_message_identity(payload: dict[str, Any], fallback_self_id: str = 
     sequence_value = first_value(*sequence_keys)
     if not sequence_value and not any(key in data for key in sequence_keys):
         sequence_value = first_value("message_id", "messageId", "msg_id", "msgId")
-    sequence = int(sequence_value or 0)
-    message_seq = int(first_value("message_seq", "messageSeq", "msg_seq", "msgSeq") or sequence)
-    real_seq = int(first_value("real_seq", "realSeq") or message_seq)
-    message_value = int(first_value("message_id", "messageId", "msg_id", "msgId") or real_seq)
+    sequence = _as_int(sequence_value, 0)
+    message_seq = _as_int(first_value("message_seq", "messageSeq", "msg_seq", "msgSeq"), sequence) or sequence
+    real_seq = _as_int(first_value("real_seq", "realSeq"), message_seq) or message_seq
+    message_value = _as_int(first_value("message_id", "messageId", "msg_id", "msgId"), real_seq) or real_seq
     data["message_id"] = message_value
     data["message_seq"] = message_seq
-    data["real_id"] = int(first_value("real_id", "realId") or message_value)
+    data["real_id"] = _as_int(first_value("real_id", "realId"), message_value) or message_value
     data["real_seq"] = real_seq
     return data

@@ -46,18 +46,20 @@ SUPPORTED_ACTIONS = frozenset(
         '_set_model_show',
         'add_custom_face',
         'bot_exit',
+        'can_send_image',
+        'can_send_record',
         'cancel_group_album_media_like',
         'cancel_group_todo',
         'cancel_online_file',
-        'can_send_image',
-        'can_send_record',
         'check_url_safely',
         'clean_cache',
         'clean_stream_temp_file',
+        'click_inline_keyboard_button',
         'complete_group_todo',
         'create_collection',
-        'create_group_file_folder',
         'create_flash_task',
+        'create_group_file_folder',
+        'del_group_album_media',
         'delete_custom_face',
         'delete_essence_msg',
         'delete_friend',
@@ -65,7 +67,6 @@ SUPPORTED_ACTIONS = frozenset(
         'delete_group_folder',
         'delete_msg',
         'delete_qzone_msg',
-        'del_group_album_media',
         'do_group_album_comment',
         'download_file',
         'download_file_image_stream',
@@ -86,7 +87,6 @@ SUPPORTED_ACTIONS = frozenset(
         'get_cookies',
         'get_credentials',
         'get_csrf_token',
-        'scan_red_packet_history',
         'get_doubt_friends_add_request',
         'get_emoji_likes',
         'get_essence_msg_list',
@@ -116,10 +116,10 @@ SUPPORTED_ACTIONS = frozenset(
         'get_group_msg_history',
         'get_group_notice',
         'get_group_root_files',
+        'get_group_share_link',
         'get_group_shut_list',
         'get_group_signed_list',
         'get_group_system_msg',
-        'group_poke',
         'get_guild_list',
         'get_guild_service_profile',
         'get_image',
@@ -129,7 +129,6 @@ SUPPORTED_ACTIONS = frozenset(
         'get_msg',
         'get_online_clients',
         'get_online_file_msg',
-        'ocr_image',
         'get_packet_status',
         'get_private_file_url',
         'get_profile_like',
@@ -145,6 +144,7 @@ SUPPORTED_ACTIONS = frozenset(
         'get_unidirectional_friend_list',
         'get_user_status',
         'get_version_info',
+        'group_poke',
         'mark_all_as_read',
         'mark_group_msg_as_read',
         'mark_msg_as_read',
@@ -153,12 +153,13 @@ SUPPORTED_ACTIONS = frozenset(
         'nc_get_packet_status',
         'nc_get_rkey',
         'nc_get_user_status',
+        'ocr_image',
         'receive_online_file',
         'refuse_online_file',
         'rename_group_file',
+        'scan_red_packet_history',
         'send_ark_share',
         'send_flash_msg',
-        'click_inline_keyboard_button',
         'send_forward_msg',
         'send_group_ai_record',
         'send_group_ark_share',
@@ -216,7 +217,9 @@ SUPPORTED_ACTIONS = frozenset(
         'upload_file_stream',
         'upload_group_file',
         'upload_image_to_qun_album',
+        'upload_images_to_qun_album',
         'upload_private_file',
+        'upload_video_to_qun_album',
     }
 )
 
@@ -297,9 +300,16 @@ class OneBotAPI:
             self_id = route_id if route_id is not None else current_self_id()
         if not self._adapter:
             return action_failed('OneBot 适配器未初始化', 1500)
+        # 空串与 None 同等对待：否则 self_id='' 会绕过歧义保护，退化到
+        # “唯一连接”兜底，把账号 A 的动作发到账号 B。
+        if isinstance(self_id, str) and not self_id.strip():
+            self_id = None
         if self_id is None and self._adapter.has_ambiguous_routes():
             return action_failed('存在多个机器人，请明确指定 self_id', 1400)
         self_id = self._adapter.default_self_id() if self_id is None else self._adapter.resolve_self_id(self_id)
+        # 显式空串同样视为未指定，避免退化到“唯一连接”兜底而串号。
+        if not str(self_id or '').strip():
+            return action_failed('无法确定目标机器人 self_id', 1400)
 
         action, params = normalize_action_request(action, params)
         source_plugin, source_context = current_source()

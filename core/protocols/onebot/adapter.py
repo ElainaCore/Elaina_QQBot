@@ -126,9 +126,13 @@ class OneBotAdapter:
                 runtime_mode = channel
             aliases = sorted(alias for alias, target in self.identity_aliases.items()
                              if self._canonical(target) == actual and alias != actual)
+            # 只有框架托管的运行时 (内置 QQ / QQ 注入) 才带 bot_id。
+            # Web 面板以 bot_id 是否存在区分「内置 QQ」页签，纯 OneBot 连接
+            # 若回填 QQ 号会被误判成内置账号并带出内置专属配置入口。
+            bot_id = (aliases[0] if aliases else actual) if channel in {Channel.EMBEDDED, Channel.INJECTED} else ''
             accounts.append({
                 'self_id': actual,
-                'bot_id': aliases[0] if aliases else actual,
+                'bot_id': bot_id,
                 'bot_qq': actual,
                 'qq': actual,
                 'aliases': aliases,
@@ -190,17 +194,35 @@ class OneBotAdapter:
         anonymous_http = sum(1 for client in self.http_clients.values() if not client.get('self_id'))
         return len(identities) > 1 or anonymous_http > 1 or (anonymous_http and identities)
 
+    @staticmethod
+    def _normalize_endpoint_path(path: Any) -> str:
+        """与 ConnectionManager._normalize_path 保持一致的端点路径规范化。
+
+        写入凭据时用的是规范化路径，读取时若用原始 request.path，
+        ``/onebot/v11/`` 与 ``/onebot/v11`` 会查不到配置的 token/secret。
+        """
+        normalized = '/' + str(path or '/').strip('/')
+        return normalized if normalized != '//' else '/'
+
     def expected_ws_token(self, port=None, path=None) -> str:
         """返回指定 (端口, 路径) 反向 WS 入口应校验的 token。"""
         m = self.reverse_ws_tokens
-        if port is not None and (port, path) in m:
-            return m[(port, path)]
+        if port is not None:
+            if (port, path) in m:
+                return m[(port, path)]
+            key = (port, self._normalize_endpoint_path(path))
+            if key in m:
+                return m[key]
         return ''
 
     def expected_http_secret(self, port=None, path=None) -> str:
         m = self.reverse_http_secrets
-        if port is not None and (port, path) in m:
-            return m[(port, path)]
+        if port is not None:
+            if (port, path) in m:
+                return m[(port, path)]
+            key = (port, self._normalize_endpoint_path(path))
+            if key in m:
+                return m[key]
         return ''
 
     def _check_signature(self, body: bytes, signature: str | None, secret: str = '') -> bool:

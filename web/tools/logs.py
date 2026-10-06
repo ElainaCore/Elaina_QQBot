@@ -143,8 +143,18 @@ async def handle_get_logs(request: web.Request):
     if log_type not in ('message', 'framework', 'error', 'lifecycle'):
         return web.json_response({'error': '无效的日志类型'}, status=400)
 
-    page = int(request.query.get('page', '1'))
-    page_size = int(request.query.get('size', '50'))
+    def _positive_int(raw: object, default: int) -> int:
+        try:
+            value = int(str(raw))
+        except (TypeError, ValueError):
+            return default
+        return value
+
+    # 分页参数必须夹紧：page_size=-1 会生成 LIMIT -1 (SQLite 视为无上限)，
+    # 直接把整张表读进内存。
+    page = max(1, _positive_int(request.query.get('page', '1'), 1))
+    page_size = _positive_int(request.query.get('size', '50'), 50)
+    page_size = min(max(1, page_size), 200)
     offset = (page - 1) * page_size
 
     requested = str(request.query.get('bot_qq') or '')
@@ -152,11 +162,18 @@ async def handle_get_logs(request: web.Request):
     if log_type in ('message', 'lifecycle'):
         if not bot_ids:
             bot_ids = [_common.primary_bot_qq()]
+        # 多分库合并排序无法直接 LIMIT，但单库可先截断到 offset+page_size，
+        # 避免把整张消息表读进内存。
+        fetch_limit = offset + page_size
         rows = []
         for bot_qq in bot_ids:
-            rows.extend(await _common.query_log(log_type, 'SELECT * FROM log ORDER BY id DESC', bot_qq=bot_qq))
+            rows.extend(await _common.query_log(
+                log_type,
+                f'SELECT * FROM log ORDER BY id DESC LIMIT {fetch_limit}',
+                bot_qq=bot_qq,
+            ))
         rows.sort(key=lambda row: (row.get('timestamp', ''), row.get('id', 0)), reverse=True)
-        total = len(rows)
+        total = len(rows) if len(rows) < fetch_limit else max(fetch_limit, offset + page_size)
         rows = rows[offset : offset + page_size]
     else:
         rows = await _common.query_log(

@@ -15,9 +15,12 @@ from pathlib import Path
 
 log = logging.getLogger('ElainaQQ.qq_launcher')
 
-_WINDOWS_APPID_TABLE = (
-    Path(__file__).parents[1] / 'embedded' / 'bridge' / 'qq_windows_appid.json'
+_QQ_APPID_TABLE = (
+    Path(__file__).parents[1] / 'embedded' / 'bridge' / 'qq_appid.json'
 )
+
+# 应用 ID / QUA 表按平台分前缀: 9.9.* 为 Windows, 3.2.* 为 Linux, 6.9.* 为 macOS。
+_PLATFORM_PREFIXES = {'win32': '9.9', 'linux': '3.2', 'darwin': '6.9'}
 
 
 class QQLauncher:
@@ -40,8 +43,12 @@ class QQLauncher:
 
     @classmethod
     def windows_supported_versions(cls) -> frozenset[str]:
-        table = cls._read_json(_WINDOWS_APPID_TABLE)
-        return frozenset(str(version) for version in table)
+        table = cls._read_json(_QQ_APPID_TABLE)
+        return frozenset(
+            str(version)
+            for version in table
+            if version.startswith(_PLATFORM_PREFIXES['win32'])
+        )
 
     def windows_version(self) -> str:
         """按 QQ 目录规则读取 Windows QQNT 的真实版本。"""
@@ -449,19 +456,14 @@ class QQLauncher:
                 grab_log.parent.mkdir(parents=True, exist_ok=True)
                 self.launch_env['ELAINAQQ_GRAB_LOG'] = str(grab_log)
             args = [str(self.executable), '--user-data-dir', str(data_dir / 'chromium')]
+        else:
+            # macOS 等平台：Electron 入口同样走 user-data-dir 隔离。
+            args = [str(self.executable), '--user-data-dir', str(data_dir / 'chromium')]
         if os.environ.get('ELAINAQQ_CDP_PORT'):
             args.append(f'--remote-debugging-port={os.environ["ELAINAQQ_CDP_PORT"]}')
             args.append('--remote-allow-origins=*')
         if headless:
             args.insert(1, '--headless')
-        if quick_login:
-            args.extend(('-q', quick_login))
-        return args
-        self.install_loader()
-        args = [str(self.executable), '--user-data-dir', str(data_dir / 'chromium')]
-        if os.environ.get('ELAINAQQ_CDP_PORT'):
-            args.append(f'--remote-debugging-port={os.environ["ELAINAQQ_CDP_PORT"]}')
-            args.append('--remote-allow-origins=*')
         if quick_login:
             args.extend(('-q', quick_login))
         return args

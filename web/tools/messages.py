@@ -150,7 +150,7 @@ async def _group_member_names(group_id: str, user_ids: set[str], bot_qq: str) ->
     for user_id, name in await asyncio.gather(*(resolve(value) for value in missing)):
         if name:
             result[user_id] = name
-            _group_member_name_cache[(bot_qq, group_id, user_id)] = (now, name)
+            _common.cache_put(_group_member_name_cache, (bot_qq, group_id, user_id), (now, name))
     return result
 
 
@@ -256,7 +256,7 @@ async def _fetch_directory(api, chat_type: str, bot_qq: str) -> dict[str, dict]:
                 if _directory_tasks.get(cache_key) is completed:
                     _directory_tasks.pop(cache_key, None)
                 with contextlib.suppress(Exception, asyncio.CancelledError):
-                    _directory_cache[cache_key] = (time.time(), completed.result())
+                    _common.cache_put(_directory_cache, cache_key, (time.time(), completed.result()))
 
             task.add_done_callback(finish_refresh)
         return cached[1]
@@ -271,7 +271,7 @@ async def _fetch_directory(api, chat_type: str, bot_qq: str) -> dict[str, dict]:
     finally:
         if _directory_tasks.get(cache_key) is task:
             _directory_tasks.pop(cache_key, None)
-    _directory_cache[cache_key] = (time.time(), result)
+    _common.cache_put(_directory_cache, cache_key, (time.time(), result))
     return result
 
 
@@ -858,11 +858,12 @@ async def handle_send_message(request: web.Request):
             return web.json_response({'success': True, 'message': '发送成功'})
         err = (resp or {}).get('message') or (resp or {}).get('wording') or '发送失败'
         return web.json_response({'success': False, 'message': str(err)})
-    except Exception as e:
+    except Exception:
         import traceback
 
         traceback.print_exc()
-        return web.json_response({'success': False, 'message': str(e)}, status=500)
+        # 不把内部异常信息回传给客户端，仅记录在服务端日志。
+        return web.json_response({'success': False, 'message': '发送失败'}, status=500)
 
 
 async def handle_recall_message(request: web.Request):

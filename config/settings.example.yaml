@@ -46,7 +46,10 @@ embedded_qq:
 # QLinux 渠道
 qlinux:
   enabled: true                                 # 默认启用 (面板"接入中心"-> QLinux 协议端)
-  sign_server: "https://esign.linsur.cn/"       # Linux 协议签名服务器 (可换任意兼容端)
+  # Linux 协议签名服务器 (可换任意兼容端)。推荐自建 Go 签名端
+  # (见 qqsign 仓库 lagrange/sign-server-go/)，它支持 /health 探测，
+  # 签名卡顿时只让单个请求失败，不会像旧 Python 端那样退出进程导致全部账号掉线。
+  sign_server: "https://esign.linsur.cn/"
 
 # 日志配置
 logging:

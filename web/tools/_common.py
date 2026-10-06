@@ -72,6 +72,19 @@ async def query_log(log_type: str, sql: str, params=None, bot_qq: str = '') -> l
 
 _nick_cache: dict[tuple[str, str], tuple[float, str]] = {}
 _NICK_TTL = 600
+_CACHE_MAX = 4096
+
+
+def cache_put(cache: dict, key, value, *, max_size: int = _CACHE_MAX) -> None:
+    """写入按键增长的缓存，并在超限时裁剪最旧的一半。
+
+    面板的若干缓存键来自请求输入，永不清理会随使用持续增长。
+    """
+    cache[key] = value
+    if len(cache) > max_size:
+        # dict 保持插入顺序，丢弃较早的一半即可。
+        for stale in list(cache)[: len(cache) - max_size // 2]:
+            cache.pop(stale, None)
 
 
 async def get_nickname(user_id: str, bot_qq: str = '') -> str:
@@ -96,7 +109,7 @@ async def get_nickname(user_id: str, bot_qq: str = '') -> str:
         name = ''
     if not name:
         name = f'用户{uid[-6:]}' if len(uid) >= 6 else f'用户{uid}'
-    _nick_cache[cache_key] = (now, name)
+    cache_put(_nick_cache, cache_key, (now, name))
     return name
 
 

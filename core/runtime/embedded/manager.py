@@ -738,11 +738,15 @@ class EmbeddedQQManager:
                 web.post('/api/embedded/control/result', resolve_control),
             ]
         )
+        # 先分配端口再建 runner：_assign_bridge_port 可能失败，提前执行可避免
+        # 已经 setup 的 runner 因异常逃逸而泄漏。
+        start = self.bridge_port_start
+        assigned = self._assign_bridge_port(bot)
+        if assigned is None:
+            raise RuntimeError('无法为内置 QQ 分配服务端口')
         runner = web.AppRunner(bridge_app, access_log=None)
         await runner.setup()
 
-        start = self.bridge_port_start
-        assigned = self._assign_bridge_port(bot)
         reserved = {item.bridge_port for item in self.bots.values() if item is not bot and start <= item.bridge_port <= 65535}
         main_port = self._parse_bridge_port(cfg.get('settings', 'server.port', 5201))
         if main_port:
@@ -921,7 +925,22 @@ class EmbeddedQQManager:
     _process_tree_pids = staticmethod(process_tree_pids)
     _terminate_process_tree = staticmethod(terminate_process_tree)
 
+    def _drop_grab_agent_session(self, pid: int) -> None:
+        """关闭并移除某个 PID 的抢包会话，避免 PID 复用后误用失效句柄。"""
+        session = self._grab_agent_sessions.pop(pid, None)
+        if session is None:
+            return
+        with contextlib.suppress(Exception):
+            session.close()
+
     async def stop(self, bot_id: str, disable: bool = True) -> bool:
+        # 与 start 共用生命周期锁：否则 stop 可能在 start 等待子进程创建的
+        # 间隙执行，读到 process=None 就返回，随后 start 恢复并拉起一个
+        # 无人跟踪、无法再停止的 QQ 进程。
+        async with self._lock:
+            return await self._stop_locked(bot_id, disable)
+
+    async def _stop_locked(self, bot_id: str, disable: bool = True) -> bool:
         bot = self.bots.get(bot_id)
         if not bot:
             return True
@@ -944,6 +963,9 @@ class EmbeddedQQManager:
                 bot.output_task = None
             finally:
                 self._stopping.discard(bot_id)
+            # 进程已结束：关闭其抢包会话，避免句柄泄漏与 PID 复用误用。
+            if process.pid:
+                self._drop_grab_agent_session(process.pid)
         self._unregister_bot_aliases(bot)
         self._cancel_control_commands(bot_id)
         await self._stop_bridge(bot_id)
@@ -1017,6 +1039,10 @@ class EmbeddedQQManager:
                 )
             except TimeoutError:
                 return None
+            finally:
+                # 本轮优先轮询结束（无论取到命令还是超时）后必须移除标记，
+                # 否则常规轮询会永远不再兜底消费优先队列，红包等命令将一直滞留。
+                self._priority_control_pollers.discard(bot_id)
 
         regular_queue = self._control_queue(bot_id)
         priority_queue = self._control_queue(bot_id, priority=True)
@@ -1038,8 +1064,15 @@ class EmbeddedQQManager:
             if priority_get is not None and priority_get in done:
                 command = priority_get.result()
                 if regular_get in done:
-                    with contextlib.suppress(asyncio.QueueFull):
-                        regular_queue.put_nowait(regular_get.result())
+                    # 常规队列满时不能静默丢弃：其调用方仍在等 future，
+                    # 会白等 30s 超时。改为立即回填失败结果。
+                    regular_command = regular_get.result()
+                    try:
+                        regular_queue.put_nowait(regular_command)
+                    except asyncio.QueueFull:
+                        self._fail_control_command(
+                            regular_command, 'QQ 运行时控制队列已满', 1500
+                        )
                 return command
             return regular_get.result()
         finally:
@@ -1052,6 +1085,16 @@ class EmbeddedQQManager:
                 *(task for task in (regular_get, priority_get) if task is not None),
                 return_exceptions=True,
             )
+
+    def _fail_control_command(self, command: dict[str, Any], message: str, retcode: int) -> None:
+        """立即以失败结果结算某条控制命令，避免其调用方空等超时。"""
+        request_id = str(command.get('request_id') or '')
+        pending = self._control_futures.get(request_id)
+        if not pending:
+            return
+        _pending_bot_id, future = pending
+        if not future.done():
+            future.set_result(action_failed(message, retcode))
 
     def resolve_control_command(self, bot_id: str, payload: dict[str, Any]) -> bool:
         request_id = str(payload.get('request_id') or '')
@@ -1107,7 +1150,11 @@ class EmbeddedQQManager:
                 except asyncio.QueueFull:
                     return action_failed('红包优先控制队列已满', 1500)
             else:
-                await asyncio.wait_for(queue.put(item), timeout=2)
+                try:
+                    await asyncio.wait_for(queue.put(item), timeout=2)
+                except TimeoutError:
+                    # 入队超时（非机器人响应超时），明确区分以便排查。
+                    return action_failed('QQ 运行时控制队列繁忙，请稍后重试', 1500)
             return await asyncio.wait_for(future, timeout)
         except TimeoutError:
             return action_failed('ElainaQQ QQ 运行时响应超时', 1500)
@@ -1612,7 +1659,15 @@ class EmbeddedQQManager:
                         'err_msg': f'agent 注入失败: {exc}',
                     }
                 self._grab_agent_sessions[target_pid] = session
-        status = session.request({'op': 'status'}, timeout_seconds=10.0)
+        try:
+            status = session.request({'op': 'status'}, timeout_seconds=10.0)
+        except (GrabAgentError, OSError) as exc:
+            # 进程退出/PID 复用会让旧会话失效；丢弃后下次请求会重新注入。
+            self._drop_grab_agent_session(target_pid)
+            return {
+                'ok': False, 'amount': 0, 'err_code': -12,
+                'err_msg': f'agent 会话已失效: {exc}',
+            }
         if not status.get('inst'):
             return {
                 'ok': False, 'amount': 0, 'err_code': -11,

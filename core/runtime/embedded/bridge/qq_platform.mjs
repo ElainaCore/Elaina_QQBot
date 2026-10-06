@@ -2,66 +2,56 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-export const BUILTIN_QQ_VERSION = "3.2.32-52194";
-export const WINDOWS_QQ_APPID_TABLE = Object.fromEntries(
-  Object.entries(JSON.parse(
-    fs.readFileSync(new URL("./qq_windows_appid.json", import.meta.url), "utf8")
-  )).map(([version, info]) => [version, { appid: String(info.appid), qua: String(info.qua) }])
-);
-export const QQ_APPID_TABLE = {
-  "3.2.12-28060": { appid: "537246140", qua: "V1_LNX_NQ_3.2.12_28060_GW_B" },
-  "3.2.12-28131": { appid: "537246140", qua: "V1_LNX_NQ_3.2.12_28131_GW_B" },
-  "3.2.12-28327": { appid: "537249393", qua: "V1_LNX_NQ_3.2.12_28327_GW_B" },
-  "3.2.12-28418": { appid: "537249393", qua: "V1_LNX_NQ_3.2.12_28418_GW_B" },
-  "3.2.13-28788": { appid: "537249787", qua: "V1_LNX_NQ_3.2.13_28788_GW_B" },
-  "3.2.13-28971": { appid: "537249848", qua: "V1_LNX_NQ_3.2.13_28971_GW_B" },
-  "3.2.13-29271": { appid: "537249913", qua: "V1_LNX_NQ_3.2.13_29271_GW_B" },
-  "3.2.13-29456": { appid: "537249996", qua: "V1_LNX_NQ_3.2.13_29456_GW_B" },
-  "3.2.13-29927": { appid: "537255847", qua: "V1_LNX_NQ_3.2.13_29927_GW_B" },
-  "3.2.15-30366": { appid: "537258413", qua: "V1_LNX_NQ_3.2.15_30366_GW_B" },
-  "3.2.15-30483": { appid: "537258474", qua: "V1_LNX_NQ_3.2.15_30483_GW_B" },
-  "3.2.15-30594": { appid: "537258474", qua: "V1_LNX_NQ_3.2.15_30594_GW_B" },
-  "3.2.15-30851": { appid: "537263831", qua: "V1_LNX_NQ_3.2.15_30851_GW_B" },
-  "3.2.15-30899": { appid: "537263831", qua: "V1_LNX_NQ_3.2.15_30899_GW_B" },
-  "3.2.15-31245": { appid: "537266485", qua: "V1_LNX_NQ_3.2.15_31245_GW_B" },
-  "3.2.15-31363": { appid: "537266535", qua: "V1_LNX_NQ_3.2.15_31363_GW_B" },
-  "3.2.16-32690": { appid: "537271229", qua: "V1_LNX_NQ_3.2.16_32690_GW_B" },
-  "3.2.16-32721": { appid: "537271229", qua: "V1_LNX_NQ_3.2.16_32721_GW_B" },
-  "3.2.16-32793": { appid: "537271279", qua: "V1_LNX_NQ_3.2.16_32793_GW_B" },
-  "3.2.16-32869": { appid: "537271329", qua: "V1_LNX_NQ_3.2.16_32869_GW_B" },
-  "3.2.16-33139": { appid: "537273909", qua: "V1_LNX_NQ_3.2.16_33139_GW_B" },
-  "3.2.16-33800": { appid: "537274009", qua: "V1_LNX_NQ_3.2.16_33800_GW_B" },
-  "3.2.17-34231": { appid: "537279245", qua: "V1_LNX_NQ_3.2.17_34231_GW_B" },
-  "3.2.17-34362": { appid: "537279296", qua: "V1_LNX_NQ_3.2.17_34362_GW_B" },
-  "3.2.17-34467": { appid: "537282292", qua: "V1_LNX_NQ_3.2.17_34467_GW_B" },
-  "3.2.17-34566": { appid: "537282343", qua: "V1_LNX_NQ_3.2.17_34566_GW_B" },
-  "3.2.17-34606": { appid: "537282343", qua: "V1_LNX_NQ_3.2.17_34606_GW_B" },
-  "3.2.17-34740": { appid: "537290727", qua: "V1_LNX_NQ_3.2.17_34740_GW_B" },
-  "3.2.17-35184": { appid: "537291084", qua: "V1_LNX_NQ_3.2.17_35184_GW_B" },
-  "3.2.17-35341": { appid: "537291383", qua: "V1_LNX_NQ_3.2.17_35341_GW_B" },
-  "3.2.18-35951": { appid: "537296013", qua: "V1_LNX_NQ_3.2.18_35951_GW_B" },
-  "3.2.18-36580": { appid: "537298509", qua: "V1_LNX_NQ_3.2.18_36580_GW_B" },
-  "3.2.18-37012": { appid: "537304107", qua: "V1_LNX_NQ_3.2.18_37012_GW_B" },
-  "3.2.18-37051": { appid: "537304158", qua: "V1_LNX_NQ_3.2.18_37051_GW_B" },
-  "3.2.18-37475": { appid: "537304210", qua: "V1_LNX_NQ_3.2.18_37475_GW_B" },
-  "3.2.18-37625": { appid: "537304261", qua: "V1_LNX_NQ_3.2.18_37625_GW_B" },
-  "3.2.19-38503": { appid: "537307640", qua: "V1_LNX_NQ_3.2.19_38503_GW_B" },
-  "3.2.19-38626": { appid: "537307691", qua: "V1_LNX_NQ_3.2.19_38626_GW_B" },
-  "3.2.19-38960": { appid: "537313891", qua: "V1_LNX_NQ_3.2.19_38960_GW_B" },
-  "3.2.19-39038": { appid: "537313942", qua: "V1_LNX_NQ_3.2.19_39038_GW_B" },
-  "3.2.20-40768": { appid: "537319840", qua: "V1_LNX_NQ_3.2.20_40768_GW_B" },
-  "3.2.20-40824": { appid: "537319840", qua: "V1_LNX_NQ_3.2.20_40824_GW_B" },
-  "3.2.20-40990": { appid: "537319891", qua: "V1_LNX_NQ_3.2.20_40990_GW_B" },
-  "3.2.21-41857": { appid: "537320197", qua: "V1_LNX_NQ_3.2.21_41857_GW_B" },
-  "3.2.21-42086": { appid: "537320248", qua: "V1_LNX_NQ_3.2.21_42086_GW_B" },
-  "3.2.22-42941": { appid: "537328659", qua: "V1_LNX_NQ_3.2.22_42941_GW_B" },
-  "3.2.23-44343": { appid: "537336639", qua: "V1_LNX_NQ_3.2.23_44343_GW_B" },
-  "3.2.25-45758": { appid: "537340249", qua: "V1_LNX_NQ_3.2.25_45758_GW_B" },
-  "3.2.30-50828": { appid: "537358775", qua: "V1_LNX_NQ_3.2.30_50828_GW_B" },
-  "3.2.30-50969": { appid: "537376344", qua: "V1_LNX_NQ_3.2.30_50969_GW_B" },
-  "3.2.32-52194": { appid: "537379447", qua: "V1_LNX_NQ_3.2.32_52194_GW_B" },
-  ...WINDOWS_QQ_APPID_TABLE
-};
+// 应用 ID / QUA 与内置版本跟随 NapCat (napcat-core/external/appid.json)。
+// 表按平台分前缀: 9.9.* 为 Windows, 3.2.* 为 Linux, 6.9.* 为 macOS。
+function loadQQAppidTable() {
+  const raw = JSON.parse(
+    fs.readFileSync(new URL("./qq_appid.json", import.meta.url), "utf8")
+  );
+  const table = {};
+  for (const [version, info] of Object.entries(raw)) {
+    // 跳过带 arch 后缀的键 (如 3.2.33-52892-arm64)，运行时按 <version>-<arch> 另行解析。
+    if (version.split("-").length > 2) continue;
+    if (!info || info.appid == null) continue;
+    table[version] = { appid: String(info.appid), qua: String(info.qua) };
+  }
+  return table;
+}
+
+export const QQ_APPID_TABLE = loadQQAppidTable();
+
+function platformAppidTable(prefixes) {
+  return Object.fromEntries(
+    Object.entries(QQ_APPID_TABLE).filter(([version]) =>
+      prefixes.some((prefix) => version.startsWith(prefix))
+    )
+  );
+}
+
+export const WINDOWS_QQ_APPID_TABLE = platformAppidTable(["9.9"]);
+export const LINUX_QQ_APPID_TABLE = platformAppidTable(["3.2"]);
+export const MACOS_QQ_APPID_TABLE = platformAppidTable(["6.9"]);
+
+function platformVersionPrefixes() {
+  if (os.platform() === "win32") return ["9.9"];
+  if (os.platform() === "darwin") return ["6.9"];
+  return ["3.2"];
+}
+
+function latestBuiltinVersion() {
+  const prefixes = platformVersionPrefixes();
+  const versions = Object.keys(QQ_APPID_TABLE).filter((version) =>
+    prefixes.some((prefix) => version.startsWith(prefix))
+  );
+  if (!versions.length) return "";
+  versions.sort(
+    (a, b) => (Number(a.split("-")[1]) || 0) - (Number(b.split("-")[1]) || 0)
+  );
+  return versions[versions.length - 1];
+}
+
+// 无法从 QQ 安装目录读取版本时的兜底版本，取当前平台表中构建号最大者。
+export const BUILTIN_QQ_VERSION = latestBuiltinVersion() || "9.9.36-53489";
 export function findQQPath() {
   if (process.env["QQ_PATH"]) return process.env["QQ_PATH"];
   if (os.platform() === "linux") {

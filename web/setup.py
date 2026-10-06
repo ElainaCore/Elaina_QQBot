@@ -89,7 +89,8 @@ def setup_web(app: web.Application, bot_manager, base_dir: str):
             )
             svc = getattr(bot_manager, '_log_service', None)
             if svc:
-                svc.add(
+                # on_error 是同步回调，不能用 async 的 svc.add（会被静默丢弃）。
+                svc.add_nowait(
                     'error',
                     {
                         'timestamp': error_data.get('timestamp', ''),
