@@ -97,22 +97,26 @@ def _text(value: bytes) -> str:
 
 
 def _button_id(fields: list[tuple[int, int, Any]]) -> str:
+    """从一层 protobuf 字段中取出按钮 ID。
+
+    ``Button.id`` 在 QQNT 定义里是 STRING（wire type 2），因此只接受字段 1
+    的字符串值。同一字段号在其它层级含义完全不同：``Elem.commonElem`` 的
+    字段 1 是 ``serviceType``（变长整数，内联键盘为 46），把它当成按钮 ID
+    会得到 ``button_id="46"``，QQ 会以原生错误 10022 拒绝点击。
+    """
     for tag, wire_type, value in fields:
-        if tag != 1:
+        if tag != 1 or wire_type != 2:
             continue
-        if wire_type == 2:
-            candidate = _text(value).strip()
-            # ButtonExtra/KeyboardData/Row 的 field 1 是嵌套 protobuf，
-            # 不能把其二进制内容误当成按钮 ID。真实 ID 必须是可打印文本。
-            if (
-                candidate
-                and not candidate.startswith('BOT1.0_')
-                and candidate.isprintable()
-                and len(candidate) <= 128
-            ):
-                return candidate
-        elif wire_type in {0, 1, 5}:
-            return str(value)
+        candidate = _text(value).strip()
+        # ButtonExtra/KeyboardData/Row 的 field 1 是嵌套 protobuf，
+        # 不能把其二进制内容误当成按钮 ID。真实 ID 必须是可打印文本。
+        if (
+            candidate
+            and not candidate.startswith('BOT1.0_')
+            and candidate.isprintable()
+            and len(candidate) <= 128
+        ):
+            return candidate
     return ''
 
 
@@ -136,10 +140,11 @@ def _collect_buttons(
         return
 
     local_button_id = _button_id(fields)
-    # ButtonExtra 的结构是 Button(id=1, action=3)，而 callback_data 位于
-    # action.data 的更深层字段。递归时携带最近一层的字符串 id，避免
-    # 进入 action 后把 type(=1/2) 误当成按钮 id。
-    if not local_button_id or (local_button_id.isdigit() and inherited_button_id):
+    # callback_data 位于 action.data（Button 的更深层），而 action.permission
+    # 等同一字段号在不同层级另有含义。只有 Button 一层的字段 1 是真正的
+    # 按钮 ID，其余层级取不到 ID 时沿用最近一层已知的 ID，避免把 type、
+    # serviceType 之类的数值误当成按钮 ID。
+    if not local_button_id:
         local_button_id = inherited_button_id
 
     for _tag, wire_type, value in fields:
